@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState, type FormEvent } from "react"
 import type { Session } from "@supabase/supabase-js";
 import {
   ArrowLeftRight,
+  Bug,
   CircleAlert,
   Download,
   ExternalLink,
@@ -10,15 +11,19 @@ import {
   PlusCircle,
   RefreshCw,
   Search,
+  Trash2,
   X,
 } from "lucide-react";
 import { AccessibleDialog } from "./AccessibleDialog";
 import {
   attachSourceToTransaction,
   createTransactionFromSource,
+  deleteRawSource,
+  getExactSourceDebugField,
   getOwnedTransactionCandidate,
   getSanitizedEmail,
   getSourceAttachments,
+  getSourceParseDebug,
   listOwnedAccounts,
   listTransactionsForAccount,
   retrySource,
@@ -28,8 +33,12 @@ import { AccountSelect } from "./TransactionForms";
 import {
   formatAmount,
   formatDateTime,
+  type ExactSourceDebugField,
   type OwnedAccountOption,
   type SourceAttachment,
+  type SourceParseDebug,
+  type SourceParseDebugAttempt,
+  type SourceDebugField,
   type SourceSummary,
   type TransferSourceRole,
   type TransactionListItem,
@@ -82,6 +91,93 @@ function AttachmentPreview({ attachment }: { attachment: SourceAttachment }) {
   return <p className="muted">Use “Open” to view this attachment in a compatible application.</p>;
 }
 
+function exactDebugKey(attemptID: string, field: SourceDebugField): string {
+  return `${attemptID}:${field}`;
+}
+
+function DebugValue({
+  attemptID,
+  exactError,
+  exactLoadingKey,
+  exactResult,
+  field,
+  label,
+  loadExact,
+  releaseExact,
+  truncated,
+  value,
+}: {
+  attemptID: string;
+  exactError: { key: string; message: string } | null;
+  exactLoadingKey: string | null;
+  exactResult: ExactSourceDebugField | null;
+  field: SourceDebugField;
+  label: string;
+  loadExact: (attemptID: string, field: SourceDebugField) => void;
+  releaseExact: (key: string) => void;
+  truncated: boolean;
+  value: unknown;
+}) {
+  const [open, setOpen] = useState(false);
+  const key = exactDebugKey(attemptID, field);
+  const matchingExactResult = exactResult && exactDebugKey(exactResult.attempt_id, exactResult.field) === key
+    ? exactResult
+    : null;
+  const displayedValue = matchingExactResult ? matchingExactResult.value : value;
+  const content = open
+    ? typeof displayedValue === "string"
+      ? displayedValue
+      : JSON.stringify(displayedValue, null, 2)
+    : null;
+  return (
+    <details
+      className="source-debug-value"
+      onToggle={(event) => {
+        const nextOpen = event.currentTarget.open;
+        setOpen(nextOpen);
+        if (!nextOpen) releaseExact(key);
+      }}
+    >
+      <summary>
+        {label}
+        {truncated && <span className="source-debug-shortened">Shortened</span>}
+      </summary>
+      {open && (
+        <>
+          <pre>{content ?? "Not recorded"}</pre>
+          {truncated && (
+            <div className="source-debug-exact-action">
+              {matchingExactResult ? (
+                <>
+                  <p role="status">
+                    Exact stored value loaded independently (maximum {bytesLabel(matchingExactResult.max_bytes)}).
+                  </p>
+                  <button className="text-button" onClick={() => releaseExact(key)} type="button">
+                    Return to shortened preview
+                  </button>
+                </>
+              ) : (
+                <>
+                  <p>The preview is shortened. Load only this field to inspect its exact stored text.</p>
+                  {exactError?.key === key && <p className="form-error" role="alert">{exactError.message}</p>}
+                  <button
+                    className="button button-secondary button-compact"
+                    disabled={exactLoadingKey === key}
+                    onClick={() => loadExact(attemptID, field)}
+                    type="button"
+                  >
+                    {exactLoadingKey === key ? "Loading exact field…" : `Load exact ${label.toLowerCase()}`}
+                  </button>
+                </>
+              )}
+            </div>
+          )}
+        </>
+      )}
+    </details>
+  );
+}
+
 export function SourceInspector({
   session,
   source,
@@ -127,8 +223,20 @@ export function SourceInspector({
   const [actionError, setActionError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [retrying, setRetrying] = useState(false);
+  const [debugOpen, setDebugOpen] = useState(false);
+  const [debug, setDebug] = useState<SourceParseDebug | null>(null);
+  const [debugLoading, setDebugLoading] = useState(false);
+  const [debugError, setDebugError] = useState<string | null>(null);
+  const [exactDebugResult, setExactDebugResult] = useState<ExactSourceDebugField | null>(null);
+  const [exactDebugLoadingKey, setExactDebugLoadingKey] = useState<string | null>(null);
+  const [exactDebugError, setExactDebugError] = useState<{ key: string; message: string } | null>(null);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const candidateGeneration = useRef(0);
   const candidateLoadMoreController = useRef<AbortController | null>(null);
+  const debugController = useRef<AbortController | null>(null);
+  const exactDebugController = useRef<{ key: string; controller: AbortController } | null>(null);
   const selectedAccountIsActive = accounts.some(({ id }) => id === accountId);
   const suggestedAccountUnavailable =
     !accountsLoading &&
@@ -373,6 +481,128 @@ export function SourceInspector({
     }
   }
 
+  async function deleteSource() {
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      const result = await deleteRawSource(session, source.id);
+      resolved(
+        result.cleanup_pending
+          ? "Raw source deleted. Stored attachment cleanup is queued and will continue in the background."
+          : "Raw source deletion completed.",
+      );
+      close();
+    } catch (error: unknown) {
+      setDeleteError(error instanceof Error ? error.message : "Couldn’t delete this raw source.");
+    } finally {
+      setDeleting(false);
+    }
+  }
+
+  const loadDebug = useCallback(async () => {
+    debugController.current?.abort();
+    const controller = new AbortController();
+    debugController.current = controller;
+    setDebugOpen(true);
+    setDebugLoading(true);
+    setDebugError(null);
+    try {
+      const result = await getSourceParseDebug(session, source.id, controller.signal);
+      if (!controller.signal.aborted) setDebug(result);
+    } catch (error: unknown) {
+      if (!controller.signal.aborted) {
+        setDebugError(error instanceof Error ? error.message : "Couldn’t load parser debug data.");
+      }
+    } finally {
+      if (!controller.signal.aborted) setDebugLoading(false);
+      if (debugController.current === controller) debugController.current = null;
+    }
+  }, [session, source.id]);
+
+  const releaseExactDebug = useCallback((key: string) => {
+    if (exactDebugController.current?.key === key) {
+      exactDebugController.current.controller.abort();
+      exactDebugController.current = null;
+    }
+    setExactDebugLoadingKey((current) => (current === key ? null : current));
+    setExactDebugError((current) => (current?.key === key ? null : current));
+    setExactDebugResult((current) =>
+      current && exactDebugKey(current.attempt_id, current.field) === key ? null : current,
+    );
+  }, []);
+
+  const loadExactDebug = useCallback((attemptID: string, field: SourceDebugField) => {
+    exactDebugController.current?.controller.abort();
+    const key = exactDebugKey(attemptID, field);
+    const controller = new AbortController();
+    exactDebugController.current = { key, controller };
+    // Keep at most one exact field in browser memory. Selecting another field
+    // immediately releases the previous potentially large value.
+    setExactDebugResult(null);
+    setExactDebugLoadingKey(key);
+    setExactDebugError(null);
+    void getExactSourceDebugField(session, source.id, attemptID, field, controller.signal)
+      .then((result) => {
+        if (!controller.signal.aborted) setExactDebugResult(result);
+      })
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) {
+          setExactDebugError({
+            key,
+            message: error instanceof Error ? error.message : "Couldn’t load the exact debug field.",
+          });
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setExactDebugLoadingKey(null);
+        if (exactDebugController.current?.controller === controller) {
+          exactDebugController.current = null;
+        }
+      });
+  }, [session, source.id]);
+
+  useEffect(() => () => {
+    debugController.current?.abort();
+    exactDebugController.current?.controller.abort();
+  }, []);
+
+  function toggleDebug() {
+    if (!debug && !debugLoading) {
+      void loadDebug();
+      return;
+    }
+    if (debugOpen) {
+      exactDebugController.current?.controller.abort();
+      exactDebugController.current = null;
+      setExactDebugLoadingKey(null);
+      setExactDebugError(null);
+      setExactDebugResult(null);
+    }
+    setDebugOpen(!debugOpen);
+  }
+
+  function renderDebugValue(
+    attempt: SourceParseDebugAttempt,
+    field: SourceDebugField,
+    label: string,
+    value: unknown,
+  ) {
+    return (
+      <DebugValue
+        attemptID={attempt.id}
+        exactError={exactDebugError}
+        exactLoadingKey={exactDebugLoadingKey}
+        exactResult={exactDebugResult}
+        field={field}
+        label={label}
+        loadExact={loadExactDebug}
+        releaseExact={releaseExactDebug}
+        truncated={attempt.truncated_fields.includes(field)}
+        value={value}
+      />
+    );
+  }
+
   return (
     <AccessibleDialog
       className="source-inspector"
@@ -400,8 +630,23 @@ export function SourceInspector({
       </header>
 
       <section aria-labelledby="source-parse-facts-title" className="source-parse-facts">
-        <p className="eyebrow">PARSED FACTS</p>
-        <h3 id="source-parse-facts-title">What the importer detected</h3>
+        <div className="section-heading-inline">
+          <div>
+            <p className="eyebrow">PARSED FACTS</p>
+            <h3 id="source-parse-facts-title">What the importer detected</h3>
+          </div>
+          <button
+            aria-controls="source-debug-panel"
+            aria-expanded={debugOpen}
+            className="button button-secondary button-compact"
+            disabled={debugLoading}
+            onClick={toggleDebug}
+            type="button"
+          >
+            <Bug aria-hidden="true" size={15} />
+            {debugLoading ? "Loading…" : debugOpen ? "Hide debug" : "Debug"}
+          </button>
+        </div>
         <dl className="source-facts">
           <div><dt>Status</dt><dd>{parseStatusLabel(source.parse_status)}</dd></div>
           <div>
@@ -431,6 +676,92 @@ export function SourceInspector({
           </div>
         </dl>
       </section>
+
+      {debugOpen && (
+        <section aria-labelledby="source-debug-title" className="source-debug" id="source-debug-panel">
+          <div className="section-heading-inline">
+            <div>
+              <p className="eyebrow">OWNER DEBUG</p>
+              <h3 id="source-debug-title">Parser attempts</h3>
+            </div>
+            {debugError && (
+              <button className="button button-secondary button-compact" onClick={() => void loadDebug()} type="button">
+                <RefreshCw aria-hidden="true" size={15} /> Retry
+              </button>
+            )}
+          </div>
+          <p className="source-debug-warning">
+            Private diagnostic data can include the complete normalized source and provider payloads.
+          </p>
+          {debug?.has_more && (
+            <p className="source-debug-limit" role="status">
+              Only the latest {debug.attempts.length} parser attempts are shown.
+            </p>
+          )}
+          {debug?.truncated && (
+            <p className="source-debug-limit" role="status">
+              Some large fields were shortened to keep this debug response safe to load.
+            </p>
+          )}
+          {debugLoading ? (
+            <p aria-live="polite" className="muted" role="status">Loading parser attempts…</p>
+          ) : debugError ? (
+            <p className="form-error" role="alert">{debugError}</p>
+          ) : debug?.attempts.length === 0 ? (
+            <p className="muted" role="status">No parser attempts have been recorded for this source.</p>
+          ) : (
+            <div className="source-debug-attempts">
+              {debug?.attempts.map((attempt, index) => (
+                <article className="source-debug-attempt" key={attempt.id}>
+                  <header>
+                    <div>
+                      <strong>Attempt {debug.attempts.length - index}</strong>
+                      <p>{formatDateTime(attempt.created_at)} · {attempt.model_name ?? "No model recorded"}</p>
+                    </div>
+                    <span className={`status-pill ${attempt.validation_status === "valid" ? "transfer" : attempt.validation_status === "pending" ? "review" : "failed"}`}>
+                      {attempt.validation_status}
+                    </span>
+                  </header>
+                  <dl className="source-debug-provenance">
+                    <div>
+                      <dt>Global rule</dt>
+                      <dd>{attempt.parser_rule_id ? `${attempt.parser_rule_id} · v${attempt.parser_rule_version}` : "None"}</dd>
+                    </div>
+                    <div>
+                      <dt>Personal rule</dt>
+                      <dd>{attempt.user_parser_rule_id ? `${attempt.user_parser_rule_id} · v${attempt.user_parser_rule_version}` : "None"}</dd>
+                    </div>
+                    <div>
+                      <dt>Started</dt>
+                      <dd>{attempt.started_at ? formatDateTime(attempt.started_at) : "Not recorded"}</dd>
+                    </div>
+                    <div>
+                      <dt>Completed</dt>
+                      <dd>{attempt.completed_at ? formatDateTime(attempt.completed_at) : "Not recorded"}</dd>
+                    </div>
+                  </dl>
+                  {attempt.error_summary && <p className="source-debug-error" role="status"><strong>Error:</strong> {attempt.error_summary}</p>}
+                  {attempt.truncated_fields.length > 0 && (
+                    <p className="source-debug-truncated" role="status">
+                      Shortened fields: {attempt.truncated_fields.join(", ")}
+                    </p>
+                  )}
+                  <div className="source-debug-values">
+                    {renderDebugValue(attempt, "assembled_system_prompt", "Assembled system prompt", attempt.assembled_system_prompt)}
+                    {renderDebugValue(attempt, "normalized_input", "Normalized input", attempt.normalized_input)}
+                    {renderDebugValue(attempt, "prompt_components", "Prompt components", attempt.prompt_components)}
+                    {renderDebugValue(attempt, "provider_request", "Provider request", attempt.provider_request)}
+                    {renderDebugValue(attempt, "provider_response", "Provider response", attempt.provider_response)}
+                    {renderDebugValue(attempt, "model_output", "Raw model output", attempt.model_output)}
+                    {renderDebugValue(attempt, "parsed_candidate", "Validated candidate", attempt.parsed_candidate)}
+                    {renderDebugValue(attempt, "request_metadata", "Request metadata", attempt.request_metadata)}
+                  </div>
+                </article>
+              ))}
+            </div>
+          )}
+        </section>
+      )}
 
       {(source.reconciliation_reason || source.suggested_category_leaf_name) && (
         <section aria-label="Source recommendation" className="source-recommendation">
@@ -644,6 +975,45 @@ export function SourceInspector({
           )}
         </section>
       )}
+
+      <section aria-labelledby="source-delete-title" className="source-danger-zone">
+        <div>
+          <p className="eyebrow">RAW SOURCE</p>
+          <h3 id="source-delete-title">Permanently delete this evidence</h3>
+          <p className="muted">Use this only when the imported source should not be retained.</p>
+        </div>
+        {!confirmingDelete ? (
+          <button className="button button-secondary" onClick={() => {
+            setConfirmingDelete(true);
+            setDeleteError(null);
+          }} type="button">
+            <Trash2 aria-hidden="true" size={17} /> Delete raw source
+          </button>
+        ) : (
+          <div aria-labelledby="source-delete-confirmation-title" className="source-delete-confirmation" role="group">
+            <strong id="source-delete-confirmation-title">Delete this raw source permanently?</strong>
+            <p>
+              Deleting this raw source permanently removes the email record, stored attachments,
+              parser attempts/debug data, queued jobs, and evidence links. A transaction remains if
+              it has another source or was created/edited by you. An automatically created,
+              never-edited transaction is also deleted when this was its last source, including its
+              line items. Stored attachment cleanup may continue safely in the background after the
+              database record is gone.
+            </p>
+            {deleteError && <p className="form-error" role="alert">{deleteError}</p>}
+            <div className="confirm-actions">
+              <button className="button button-secondary" disabled={deleting} onClick={() => {
+                setConfirmingDelete(false);
+                setDeleteError(null);
+              }} type="button">Keep source</button>
+              <button className="button button-danger" disabled={deleting} onClick={() => void deleteSource()} type="button">
+                <Trash2 aria-hidden="true" size={17} /> {deleting ? "Deleting…" : "Delete permanently"}
+              </button>
+            </div>
+          </div>
+        )}
+        {deleteError && !confirmingDelete && <p className="form-error" role="alert">{deleteError}</p>}
+      </section>
     </AccessibleDialog>
   );
 }

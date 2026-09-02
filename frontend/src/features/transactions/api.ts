@@ -1,12 +1,22 @@
 import type { Session } from "@supabase/supabase-js";
 import type {
+  AccountMatchingKey,
+  AccountMatchingKeyInput,
   CursorPage,
+  DefaultParserInstructions,
+  ExactSourceDebugField,
   GmailConnection,
   InternalTransferInput,
   JsonValue,
   MinorUnitAmount,
   OwnedAccountOption,
   SourceAttachment,
+  SourceParserRule,
+  SourceParserRuleInput,
+  SourceParseDebug,
+  SourceParseDebugAttempt,
+  SourceDeletionResult,
+  SourceDebugField,
   SourceQueue,
   SourceStatus,
   SourceSummary,
@@ -18,6 +28,7 @@ import type {
   TransactionListItem,
   TransactionPatch,
   TransactionReviewStatus,
+  TransactionSettings,
   TransactionSyncRun,
 } from "./model";
 import { isISO4217Currency } from "./model";
@@ -71,8 +82,19 @@ function requiredString(value: unknown, field: string): string {
   return value;
 }
 
+function stringValue(value: unknown, field: string): string {
+  if (typeof value !== "string") contractError(`${field} must be a string`);
+  return value;
+}
+
 function optionalString(value: unknown, field: string): string | null {
   if (value === undefined || value === null || value === "") return null;
+  if (typeof value !== "string") contractError(`${field} must be a string or null`);
+  return value;
+}
+
+function nullableStringValue(value: unknown, field: string): string | null {
+  if (value === null) return null;
   if (typeof value !== "string") contractError(`${field} must be a string or null`);
   return value;
 }
@@ -80,6 +102,24 @@ function optionalString(value: unknown, field: string): string | null {
 function requiredBoolean(value: unknown, field: string): boolean {
   if (typeof value !== "boolean") contractError(`${field} must be a boolean`);
   return value;
+}
+
+const sourceDebugFields = [
+  "request_metadata",
+  "parsed_candidate",
+  "assembled_system_prompt",
+  "normalized_input",
+  "provider_request",
+  "provider_response",
+  "model_output",
+  "prompt_components",
+] as const satisfies readonly SourceDebugField[];
+
+function sourceDebugFieldArray(value: unknown, field: string): SourceDebugField[] {
+  if (!Array.isArray(value)) contractError(`${field} must be an array`);
+  return value.map((item, index) =>
+    enumValue(item, sourceDebugFields, `${field}[${index}]`),
+  );
 }
 
 function requiredInteger(value: unknown, field: string, minimum = 0): number {
@@ -92,6 +132,13 @@ function requiredInteger(value: unknown, field: string, minimum = 0): number {
 function optionalInteger(value: unknown, field: string, minimum = 0): number | null {
   if (value === undefined || value === null) return null;
   return requiredInteger(value, field, minimum);
+}
+
+function requiredInt32(value: unknown, field: string): number {
+  if (!Number.isSafeInteger(value) || (value as number) < -2147483648 || (value as number) > 2147483647) {
+    contractError(`${field} must be a 32-bit integer`);
+  }
+  return value as number;
 }
 
 function optionalPercentage(value: unknown, field: string): number | null {
@@ -181,6 +228,20 @@ function jsonValue(value: unknown, field: string): JsonValue {
     );
   }
   contractError(`${field} is not valid JSON`);
+}
+
+function jsonObject(value: unknown, field: string): { [key: string]: JsonValue } {
+  const parsed = jsonValue(value, field);
+  if (!isRecord(parsed)) contractError(`${field} must be a JSON object`);
+  return parsed as { [key: string]: JsonValue };
+}
+
+function optionalJsonObject(
+  value: unknown,
+  field: string,
+): { [key: string]: JsonValue } | null {
+  if (value === undefined || value === null) return null;
+  return jsonObject(value, field);
 }
 
 function relation(value: unknown): JsonRecord | null {
@@ -403,6 +464,130 @@ export function parseSyncRunResponse(value: unknown): TransactionSyncRun {
       "sync_run.ingestion_completed_at",
     ),
     completed_at: optionalDate(run.completed_at, "sync_run.completed_at"),
+  };
+}
+
+function parseAccountMatchingKey(value: unknown, field = "matching_key"): AccountMatchingKey {
+  const item = requiredRecord(value, field);
+  return {
+    id: requiredString(item.id, `${field}.id`),
+    account_id: requiredString(item.account_id, `${field}.account_id`),
+    account_name: requiredString(item.account_name, `${field}.account_name`),
+    key_type: enumValue(item.key_type, ["card_last_four", "bank_account_suffix"], `${field}.key_type`),
+    display_value: requiredString(item.display_value, `${field}.display_value`),
+    normalized_value: requiredString(item.normalized_value, `${field}.normalized_value`),
+    active: requiredBoolean(item.active, `${field}.active`),
+    retired_at: optionalDate(item.retired_at, `${field}.retired_at`),
+    created_at: requiredDate(item.created_at, `${field}.created_at`),
+    updated_at: requiredDate(item.updated_at, `${field}.updated_at`),
+  };
+}
+
+function parseSourceParserRule(value: unknown, field = "source_rule"): SourceParserRule {
+  const item = requiredRecord(value, field);
+  return {
+    id: requiredString(item.id, `${field}.id`),
+    name: requiredString(item.name, `${field}.name`),
+    provider: enumValue(item.provider, ["gmail"], `${field}.provider`),
+    sender_match_type: enumValue(
+      item.sender_match_type,
+      ["exact", "domain", "regex"],
+      `${field}.sender_match_type`,
+    ),
+    sender_match_value: requiredString(item.sender_match_value, `${field}.sender_match_value`),
+    subject_matcher: optionalString(item.subject_matcher, `${field}.subject_matcher`),
+    content_matcher: optionalString(item.content_matcher, `${field}.content_matcher`),
+    prompt_fragment: stringValue(item.prompt_fragment, `${field}.prompt_fragment`),
+    priority: requiredInt32(item.priority, `${field}.priority`),
+    active: requiredBoolean(item.active, `${field}.active`),
+    version: requiredInteger(item.version, `${field}.version`, 1),
+    created_at: requiredDate(item.created_at, `${field}.created_at`),
+    updated_at: requiredDate(item.updated_at, `${field}.updated_at`),
+  };
+}
+
+export function parseTransactionSettings(value: unknown): TransactionSettings {
+  const settings = requiredRecord(unwrapData(value), "transaction_settings");
+  if (!Array.isArray(settings.source_rules)) {
+    contractError("transaction_settings.source_rules must be an array");
+  }
+  if (!Array.isArray(settings.matching_keys)) {
+    contractError("transaction_settings.matching_keys must be an array");
+  }
+  return {
+    default_instructions: stringValue(
+      settings.default_instructions,
+      "transaction_settings.default_instructions",
+    ),
+    default_instructions_version: requiredInteger(
+      settings.default_instructions_version,
+      "transaction_settings.default_instructions_version",
+    ),
+    source_rules: settings.source_rules.map((item, index) =>
+      parseSourceParserRule(item, `transaction_settings.source_rules[${index}]`),
+    ),
+    matching_keys: settings.matching_keys.map((item, index) =>
+      parseAccountMatchingKey(item, `transaction_settings.matching_keys[${index}]`),
+    ),
+  };
+}
+
+function parseSourceDebugAttempt(value: unknown, index: number): SourceParseDebugAttempt {
+  const field = `source_debug.attempts[${index}]`;
+  const item = requiredRecord(value, field);
+  return {
+    id: requiredString(item.id, `${field}.id`),
+    parser_rule_id: optionalString(item.parser_rule_id, `${field}.parser_rule_id`),
+    parser_rule_version: optionalInteger(
+      item.parser_rule_version,
+      `${field}.parser_rule_version`,
+      1,
+    ),
+    user_parser_rule_id: optionalString(
+      item.user_parser_rule_id,
+      `${field}.user_parser_rule_id`,
+    ),
+    user_parser_rule_version: optionalInteger(
+      item.user_parser_rule_version,
+      `${field}.user_parser_rule_version`,
+      1,
+    ),
+    model_name: optionalString(item.model_name, `${field}.model_name`),
+    request_metadata: jsonObject(item.request_metadata, `${field}.request_metadata`),
+    parsed_candidate: optionalJsonObject(item.parsed_candidate, `${field}.parsed_candidate`),
+    assembled_system_prompt: optionalString(
+      item.assembled_system_prompt,
+      `${field}.assembled_system_prompt`,
+    ),
+    normalized_input: optionalString(item.normalized_input, `${field}.normalized_input`),
+    provider_request: optionalString(item.provider_request, `${field}.provider_request`),
+    provider_response: optionalString(item.provider_response, `${field}.provider_response`),
+    model_output: optionalString(item.model_output, `${field}.model_output`),
+    prompt_components: jsonObject(item.prompt_components, `${field}.prompt_components`),
+    validation_status: enumValue(
+      item.validation_status,
+      ["pending", "valid", "invalid", "failed"],
+      `${field}.validation_status`,
+    ),
+    error_summary: optionalString(item.error_summary, `${field}.error_summary`),
+    started_at: optionalDate(item.started_at, `${field}.started_at`),
+    completed_at: optionalDate(item.completed_at, `${field}.completed_at`),
+    created_at: requiredDate(item.created_at, `${field}.created_at`),
+    truncated_fields: sourceDebugFieldArray(
+      item.truncated_fields,
+      `${field}.truncated_fields`,
+    ),
+  };
+}
+
+export function parseSourceParseDebug(value: unknown): SourceParseDebug {
+  const debug = requiredRecord(unwrapData(value), "source_debug");
+  if (!Array.isArray(debug.attempts)) contractError("source_debug.attempts must be an array");
+  return {
+    source_id: requiredString(debug.source_id, "source_debug.source_id"),
+    attempts: debug.attempts.map(parseSourceDebugAttempt),
+    has_more: requiredBoolean(debug.has_more, "source_debug.has_more"),
+    truncated: requiredBoolean(debug.truncated, "source_debug.truncated"),
   };
 }
 
@@ -834,4 +1019,196 @@ export async function createInternalTransfer(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),
   });
+}
+
+export async function getTransactionSettings(
+  session: Session,
+  signal?: AbortSignal,
+): Promise<TransactionSettings> {
+  return parseTransactionSettings(
+    await request(session, "/v1/transactions/settings", { signal }),
+  );
+}
+
+export async function putDefaultParserInstructions(
+  session: Session,
+  defaultInstructions: string,
+): Promise<DefaultParserInstructions> {
+  const response = requiredRecord(
+    unwrapData(
+      await request(session, "/v1/transactions/settings/default-instructions", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ default_instructions: defaultInstructions }),
+      }),
+    ),
+    "default_instructions",
+  );
+  return {
+    default_instructions: stringValue(
+      response.default_instructions,
+      "default_instructions.default_instructions",
+    ),
+    default_instructions_version: requiredInteger(
+      response.default_instructions_version,
+      "default_instructions.default_instructions_version",
+      1,
+    ),
+  };
+}
+
+export async function createSourceParserRule(
+  session: Session,
+  input: SourceParserRuleInput,
+): Promise<SourceParserRule> {
+  return parseSourceParserRule(
+    unwrapData(
+      await request(session, "/v1/transactions/settings/source-rules", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(input),
+      }),
+    ),
+  );
+}
+
+export async function updateSourceParserRule(
+  session: Session,
+  ruleId: string,
+  input: SourceParserRuleInput,
+): Promise<SourceParserRule> {
+  return parseSourceParserRule(
+    unwrapData(
+      await request(
+        session,
+        `/v1/transactions/settings/source-rules/${encodeURIComponent(ruleId)}`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(input),
+        },
+      ),
+    ),
+  );
+}
+
+export async function retireSourceParserRule(
+  session: Session,
+  ruleId: string,
+): Promise<void> {
+  await request(
+    session,
+    `/v1/transactions/settings/source-rules/${encodeURIComponent(ruleId)}`,
+    { method: "DELETE" },
+  );
+}
+
+export async function createAccountMatchingKey(
+  session: Session,
+  input: AccountMatchingKeyInput,
+): Promise<AccountMatchingKey> {
+  return parseAccountMatchingKey(
+    unwrapData(
+      await request(session, "/v1/transactions/settings/matching-keys", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(input),
+      }),
+    ),
+  );
+}
+
+export async function setAccountMatchingKeyActive(
+  session: Session,
+  keyId: string,
+  active: boolean,
+): Promise<AccountMatchingKey> {
+  return parseAccountMatchingKey(
+    unwrapData(
+      await request(
+        session,
+        `/v1/transactions/settings/matching-keys/${encodeURIComponent(keyId)}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ active }),
+        },
+      ),
+    ),
+  );
+}
+
+export async function deleteRawSource(
+  session: Session,
+  sourceId: string,
+): Promise<SourceDeletionResult> {
+  const response = requiredRecord(
+    unwrapData(
+      await request(session, `/v1/transactions/sources/${encodeURIComponent(sourceId)}`, {
+        method: "DELETE",
+      }),
+    ),
+    "source_deletion",
+  );
+  const status = enumValue(
+    response.status,
+    ["completed", "cleanup_pending"],
+    "source_deletion.status",
+  );
+  const cleanupPending = requiredBoolean(
+    response.cleanup_pending,
+    "source_deletion.cleanup_pending",
+  );
+  if ((status === "cleanup_pending") !== cleanupPending) {
+    contractError("source_deletion status and cleanup_pending disagree");
+  }
+  return { status, cleanup_pending: cleanupPending };
+}
+
+export async function getSourceParseDebug(
+  session: Session,
+  sourceId: string,
+  signal?: AbortSignal,
+): Promise<SourceParseDebug> {
+  return parseSourceParseDebug(
+    await request(
+      session,
+      `/v1/transactions/sources/${encodeURIComponent(sourceId)}/debug`,
+      { signal },
+    ),
+  );
+}
+
+export async function getExactSourceDebugField(
+  session: Session,
+  sourceId: string,
+  attemptId: string,
+  field: SourceDebugField,
+  signal?: AbortSignal,
+): Promise<ExactSourceDebugField> {
+  const response = requiredRecord(
+    unwrapData(
+      await request(
+        session,
+        `/v1/transactions/sources/${encodeURIComponent(sourceId)}/debug/attempts/${encodeURIComponent(attemptId)}/fields/${encodeURIComponent(field)}`,
+        { signal },
+      ),
+    ),
+    "source_debug_field",
+  );
+  const result: ExactSourceDebugField = {
+    source_id: requiredString(response.source_id, "source_debug_field.source_id"),
+    attempt_id: requiredString(response.attempt_id, "source_debug_field.attempt_id"),
+    field: enumValue(response.field, sourceDebugFields, "source_debug_field.field"),
+    value: nullableStringValue(response.value, "source_debug_field.value"),
+    max_bytes: requiredInteger(response.max_bytes, "source_debug_field.max_bytes", 1),
+  };
+  if (
+    result.source_id !== sourceId ||
+    result.attempt_id !== attemptId ||
+    result.field !== field
+  ) {
+    contractError("source_debug_field identity does not match the requested field");
+  }
+  return result;
 }

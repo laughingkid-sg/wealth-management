@@ -168,6 +168,122 @@ export interface InternalTransferInput {
 
 export type TransferSourceRole = "debit" | "credit" | "both";
 
+export type MatchingKeyType = "card_last_four" | "bank_account_suffix";
+export type SenderMatchType = "exact" | "domain" | "regex";
+
+export interface AccountMatchingKey {
+  id: string;
+  account_id: string;
+  account_name: string;
+  key_type: MatchingKeyType;
+  display_value: string;
+  normalized_value: string;
+  active: boolean;
+  retired_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SourceParserRule {
+  id: string;
+  name: string;
+  provider: "gmail";
+  sender_match_type: SenderMatchType;
+  sender_match_value: string;
+  subject_matcher: string | null;
+  content_matcher: string | null;
+  prompt_fragment: string;
+  priority: number;
+  active: boolean;
+  version: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TransactionSettings {
+  default_instructions: string;
+  default_instructions_version: number;
+  source_rules: SourceParserRule[];
+  matching_keys: AccountMatchingKey[];
+}
+
+export interface DefaultParserInstructions {
+  default_instructions: string;
+  default_instructions_version: number;
+}
+
+export interface AccountMatchingKeyInput {
+  account_id: string;
+  key_type: MatchingKeyType;
+  display_value: string;
+}
+
+export interface SourceParserRuleInput {
+  name: string;
+  provider: "gmail";
+  sender_match_type: SenderMatchType;
+  sender_match_value: string;
+  subject_matcher: string | null;
+  content_matcher: string | null;
+  prompt_fragment: string;
+  priority: number;
+  active: boolean;
+}
+
+export type ParseValidationStatus = "pending" | "valid" | "invalid" | "failed";
+export type SourceDebugField =
+  | "request_metadata"
+  | "parsed_candidate"
+  | "assembled_system_prompt"
+  | "normalized_input"
+  | "provider_request"
+  | "provider_response"
+  | "model_output"
+  | "prompt_components";
+
+export interface SourceParseDebugAttempt {
+  id: string;
+  parser_rule_id: string | null;
+  parser_rule_version: number | null;
+  user_parser_rule_id: string | null;
+  user_parser_rule_version: number | null;
+  model_name: string | null;
+  request_metadata: { [key: string]: JsonValue };
+  parsed_candidate: { [key: string]: JsonValue } | null;
+  assembled_system_prompt: string | null;
+  normalized_input: string | null;
+  provider_request: string | null;
+  provider_response: string | null;
+  model_output: string | null;
+  prompt_components: { [key: string]: JsonValue };
+  validation_status: ParseValidationStatus;
+  error_summary: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  created_at: string;
+  truncated_fields: SourceDebugField[];
+}
+
+export interface SourceParseDebug {
+  source_id: string;
+  attempts: SourceParseDebugAttempt[];
+  has_more: boolean;
+  truncated: boolean;
+}
+
+export interface SourceDeletionResult {
+  status: "completed" | "cleanup_pending";
+  cleanup_pending: boolean;
+}
+
+export interface ExactSourceDebugField {
+  source_id: string;
+  attempt_id: string;
+  field: SourceDebugField;
+  value: string | null;
+  max_bytes: number;
+}
+
 export interface InternalTransferSourceSeed {
   id: string;
   title: string;

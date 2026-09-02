@@ -49,8 +49,13 @@ const TransactionsPage = lazy(() =>
     default: Page,
   })),
 );
+const TransactionSettingsPage = lazy(() =>
+  import("./features/transactions/TransactionSettingsPage").then(
+    ({ TransactionSettingsPage: Page }) => ({ default: Page }),
+  ),
+);
 
-type WorkspacePage = "accounts" | "transactions";
+type WorkspacePage = "accounts" | "transactions" | "transaction-settings";
 
 const newDraft = (): AccountDraft => ({
   side: "asset",
@@ -437,9 +442,13 @@ function AccountForm({
 const navigation = [
   { label: "Dashboard", icon: LayoutDashboard },
   { label: "Accounts", icon: Landmark, page: "accounts" as const },
-  { label: "Transactions", icon: ArrowLeftRight, page: "transactions" as const },
   { label: "Investments", icon: ChartColumn },
   { label: "Goals", icon: WalletCards },
+];
+
+const transactionNavigation = [
+  { label: "Transactions", icon: ArrowLeftRight, page: "transactions" as const },
+  { label: "Settings", icon: SlidersHorizontal, page: "transaction-settings" as const },
 ];
 
 function SideNav({
@@ -476,7 +485,7 @@ function SideNav({
         </button>
       </div>
       <nav aria-label="Primary navigation">
-        {navigation.map(({ label, icon: Icon, page }) => {
+        {navigation.slice(0, 2).map(({ label, icon: Icon, page }) => {
           const active = page === activePage;
           return (
           <button
@@ -496,6 +505,50 @@ function SideNav({
             <span>{label}</span>
             {!page && <small>Soon</small>}
           </button>
+          );
+        })}
+        <section aria-labelledby="transactions-navigation-title" className="nav-section">
+          <p className="nav-section-title" id="transactions-navigation-title">Transactions</p>
+          {transactionNavigation.map(({ label, icon: Icon, page }) => {
+            const active = page === activePage;
+            return (
+              <button
+                aria-current={active ? "page" : undefined}
+                aria-label={label === "Settings" ? "Transaction settings" : label}
+                className={`nav-item nav-item-nested${active ? " active" : ""}`}
+                key={label}
+                onClick={() => {
+                  onNavigate(page);
+                  onMobileClose();
+                }}
+                type="button"
+              >
+                <Icon aria-hidden="true" size={18} />
+                <span>{label}</span>
+              </button>
+            );
+          })}
+        </section>
+        {navigation.slice(2).map(({ label, icon: Icon, page }) => {
+          const active = page === activePage;
+          return (
+            <button
+              aria-current={active ? "page" : undefined}
+              aria-label={label}
+              className={`nav-item${active ? " active" : ""}`}
+              disabled={!page}
+              key={label}
+              onClick={page ? () => {
+                onNavigate(page);
+                onMobileClose();
+              } : undefined}
+              title={page ? label : `${label} (coming soon)`}
+              type="button"
+            >
+              <Icon aria-hidden="true" size={19} />
+              <span>{label}</span>
+              {!page && <small>Soon</small>}
+            </button>
           );
         })}
       </nav>
@@ -818,18 +871,22 @@ function AccountsPage({
           </div>
         </header>
         <main className="app-shell">
-          {activePage === "transactions" ? (
+          {activePage === "transactions" || activePage === "transaction-settings" ? (
             <Suspense
               fallback={(
-                <section aria-busy="true" aria-label="Loading transactions" className="transaction-panel" role="status">
-                  <span className="sr-only">Loading transactions…</span>
+                <section aria-busy="true" aria-label="Loading transaction workspace" className="transaction-panel" role="status">
+                  <span className="sr-only">Loading transaction workspace…</span>
                   <div className="skeleton-row" />
                   <div className="skeleton-row" />
                   <div className="skeleton-row" />
                 </section>
               )}
             >
-              <TransactionsPage session={session} />
+              {activePage === "transactions" ? (
+                <TransactionsPage session={session} />
+              ) : (
+                <TransactionSettingsPage session={session} />
+              )}
             </Suspense>
           ) : (
             <>
@@ -1022,7 +1079,9 @@ function AccountsPage({
 function workspacePageFromLocation(): WorkspacePage {
   const parameters = new URL(window.location.href).searchParams;
   if (parameters.get("gmail")) return "transactions";
-  return parameters.get("page") === "transactions" ? "transactions" : "accounts";
+  const page = parameters.get("page");
+  if (page === "transactions" || page === "transaction-settings") return page;
+  return "accounts";
 }
 
 export default function App() {
