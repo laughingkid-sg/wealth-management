@@ -21,6 +21,8 @@ var (
 	ErrSyncRunInProgress       = errors.New("a Gmail sync is already in progress")
 )
 
+const sourceCleanupRetryCooldown = 15 * time.Minute
+
 type Store struct {
 	pool *pgxpool.Pool
 }
@@ -512,25 +514,54 @@ func (s *Store) Complete(ctx context.Context, jobID uuid.UUID, workerID string) 
 	return tx.Commit(ctx)
 }
 
-func (s *Store) Retry(ctx context.Context, jobID uuid.UUID, workerID string, attempt int, retryAt time.Time, _ string) error {
+func (s *Store) Retry(ctx context.Context, jobID uuid.UUID, workerID string, _ int, retryAt time.Time, _ string) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	cleanupRecoveryAt := retryAt.Add(sourceCleanupRetryCooldown)
 	var userID uuid.UUID
 	var syncRunID, sourceID *uuid.UUID
 	var kind jobs.Kind
 	var status string
 	err = tx.QueryRow(ctx, `
 			update private.transaction_jobs set
-				status = case when $2 >= max_attempts then 'failed' else 'queued' end,
-			completed_at = case when $2 >= max_attempts then now() else null end,
-			run_after = case when $2 >= max_attempts then run_after else $3 end,
+				status = case
+					when job_type = $5 then 'queued'
+					when attempts >= max_attempts then 'failed'
+					else 'queued'
+				end,
+				attempts = case
+					when job_type = $5 and attempts >= max_attempts then 0
+					else attempts
+				end,
+				cleanup_failure_count = case
+					when job_type = $5 and cleanup_failure_count < 9223372036854775807
+						then cleanup_failure_count + 1
+					else cleanup_failure_count
+				end,
+				completed_at = case
+					when job_type = $5 then null
+					when attempts >= max_attempts then now()
+					else null
+				end,
+				run_after = case
+					when job_type = $5 and attempts >= max_attempts then $3
+					when job_type = $5 then $2
+					when attempts >= max_attempts then run_after
+					else $2
+				end,
 				leased_at = null, lease_expires_at = null, leased_by = null,
-				last_error = 'Job failed; retry or inspect the sync run.'
+				last_error = case
+					when job_type = $5
+						then 'Attachment cleanup failed; cleanup remains queued for automatic retry.'
+					else 'Job failed; retry or inspect the sync run.'
+				end
 			where id = $1 and status = 'running' and leased_by = $4 and lease_expires_at > now()
-			returning user_id, sync_run_id, data_source_id, job_type, status`, jobID, attempt, retryAt, workerID).Scan(&userID, &syncRunID, &sourceID, &kind, &status)
+			returning user_id, sync_run_id, data_source_id, job_type, status`,
+		jobID, retryAt, cleanupRecoveryAt, workerID, string(jobs.KindSourceAttachmentCleanup),
+	).Scan(&userID, &syncRunID, &sourceID, &kind, &status)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("%w: job %s is not running for this worker", jobs.ErrLeaseLost, jobID)
 	}
@@ -555,23 +586,39 @@ type expiredJob struct {
 	SyncRunID *uuid.UUID
 	SourceID  *uuid.UUID
 	Kind      jobs.Kind
+	Status    string
 }
 
 func reapExpiredFinalAttempts(ctx context.Context, tx pgx.Tx, now time.Time) error {
+	cleanupRecoveryAt := now.Add(sourceCleanupRetryCooldown)
 	rows, err := tx.Query(ctx, `
 		update private.transaction_jobs
-		set status = 'failed', completed_at = $1, leased_at = null,
-			lease_expires_at = null, leased_by = null,
-			last_error = 'Worker lease expired on the final attempt.'
-		where status = 'running' and lease_expires_at <= $1 and attempts >= max_attempts
-		returning user_id, sync_run_id, data_source_id, job_type`, now)
+		set status = case when job_type = $3 then 'queued' else 'failed' end,
+			attempts = case when job_type = $3 then 0 else attempts end,
+			cleanup_failure_count = case
+				when job_type = $3 and cleanup_failure_count < 9223372036854775807
+					then cleanup_failure_count + 1
+				else cleanup_failure_count
+			end,
+			completed_at = case when job_type = $3 then null else $1::timestamptz end,
+			run_after = case when job_type = $3 then $2::timestamptz else run_after end,
+			leased_at = null, lease_expires_at = null, leased_by = null,
+			last_error = case
+				when job_type = $3
+					then 'Attachment cleanup worker lease expired; cleanup remains queued for automatic retry.'
+				else 'Worker lease expired on the final attempt.'
+			end
+		where status = 'running' and lease_expires_at <= $1::timestamptz and attempts >= max_attempts
+		returning user_id, sync_run_id, data_source_id, job_type, status`,
+		now, cleanupRecoveryAt, string(jobs.KindSourceAttachmentCleanup),
+	)
 	if err != nil {
 		return err
 	}
 	expired := make([]expiredJob, 0)
 	for rows.Next() {
 		var job expiredJob
-		if err = rows.Scan(&job.UserID, &job.SyncRunID, &job.SourceID, &job.Kind); err != nil {
+		if err = rows.Scan(&job.UserID, &job.SyncRunID, &job.SourceID, &job.Kind, &job.Status); err != nil {
 			rows.Close()
 			return err
 		}
@@ -583,8 +630,10 @@ func reapExpiredFinalAttempts(ctx context.Context, tx pgx.Tx, now time.Time) err
 	}
 	rows.Close()
 	for _, job := range expired {
-		if err = markTerminalJobFailure(ctx, tx, job.UserID, job.SyncRunID, job.SourceID, job.Kind); err != nil {
-			return err
+		if job.Status == "failed" {
+			if err = markTerminalJobFailure(ctx, tx, job.UserID, job.SyncRunID, job.SourceID, job.Kind); err != nil {
+				return err
+			}
 		}
 		if job.SyncRunID != nil {
 			if err = refreshSyncRunProgress(ctx, tx, job.UserID, *job.SyncRunID); err != nil {

@@ -170,7 +170,7 @@ select ok(
 
 select has_index(
   'private', 'transaction_jobs', 'transaction_jobs_attachment_cleanup_recovery_idx',
-  'terminal cleanup failures have a narrow recovery index'
+  'cleanup failures have a narrow monitoring index'
 );
 
 insert into auth.users (id, email) values

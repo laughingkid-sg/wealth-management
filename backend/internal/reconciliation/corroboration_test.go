@@ -10,13 +10,49 @@ func TestDeriveAutoEligibilityRequiresDirectTextCorroboration(t *testing.T) {
 	if !DeriveAutoEligibility(candidate, "Card ending 1234 paid S$6.48 at DigitalOcean") {
 		t.Fatal("valid literal corroboration was rejected")
 	}
+	if !DeriveAutoEligibility(candidate, "DigitalOcean charged Mastercard (**** 1234) S$6.48") {
+		t.Fatal("masked-card corroboration was rejected")
+	}
 	if !DeriveAutoEligibility(candidate, "Card ending 1234 paid SGD 6.48 ref INV-42") {
 		t.Fatal("reference corroboration was rejected")
 	}
-	for _, source := range []string{"card ending 12345 paid S$6.48 at DigitalOcean", "card ending 1234 paid $6.48 at DigitalOcean", "card ending 1234 paid S$6.48 at Other"} {
+	for _, source := range []string{
+		"order 1234 paid S$6.48 at DigitalOcean",
+		"card ending 12345 paid S$6.48 at DigitalOcean",
+		"card ending 1234 paid $6.48 at DigitalOcean",
+		"card ending 1234 paid S$6.48 at Other",
+		"Mastercard (**** 1234) and Visa (**** 9876) paid S$6.48 at DigitalOcean",
+	} {
 		if DeriveAutoEligibility(candidate, source) {
 			t.Fatalf("unsafe source authorized: %q", source)
 		}
+	}
+}
+
+func TestSanitizeAccountEvidenceForMatchingRequiresOneContextualCardSuffix(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		source      string
+		wantCard    string
+		wantAudited bool
+	}{
+		{name: "masked card", source: "Mastercard\n(**** 2562)", wantCard: "2562"},
+		{name: "explicit suffix", source: "Card ending in 2562", wantCard: "2562"},
+		{name: "bare number beside corroborated card", source: "Order 9876 paid with Mastercard (**** 2562)", wantCard: "2562"},
+		{name: "unrelated bare digits", source: "Order number 2562", wantAudited: true},
+		{name: "different contextual suffix", source: "Mastercard (**** 9876)", wantAudited: true},
+		{name: "conflicting card contexts", source: "Mastercard (**** 2562), Visa (**** 9876)", wantAudited: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			evidence := SanitizeAccountEvidenceForMatching(AccountEvidence{CardLastFour: "2562"}, test.source)
+			if evidence.CardLastFour != test.wantCard {
+				t.Fatalf("card_last_four = %q, want %q", evidence.CardLastFour, test.wantCard)
+			}
+			audited := len(evidence.AdditionalIdentifiers) == 1 && evidence.AdditionalIdentifiers[0] == "2562"
+			if audited != test.wantAudited {
+				t.Fatalf("additional identifiers = %#v, want audited=%t", evidence.AdditionalIdentifiers, test.wantAudited)
+			}
+		})
 	}
 }
 

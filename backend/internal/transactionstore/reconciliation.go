@@ -461,7 +461,15 @@ func (s *Store) LoadReconciliationInput(ctx context.Context, userID, sourceID uu
 }
 
 func (s *Store) loadOwnedAccountIdentities(ctx context.Context, userID uuid.UUID) ([]reconciliation.AccountIdentity, error) {
-	rows, err := s.pool.Query(ctx, `
+	return loadOwnedAccountIdentities(ctx, s.pool, userID)
+}
+
+type reconciliationQuerier interface {
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+}
+
+func loadOwnedAccountIdentities(ctx context.Context, querier reconciliationQuerier, userID uuid.UUID) ([]reconciliation.AccountIdentity, error) {
+	rows, err := querier.Query(ctx, `
 		select account.id, matching_key.key_type, matching_key.normalized_value
 		from public.accounts account
 		join private.account_matching_keys matching_key
@@ -503,7 +511,11 @@ func (s *Store) loadOwnedAccountIdentities(ctx context.Context, userID uuid.UUID
 }
 
 func (s *Store) loadOwnedTransactions(ctx context.Context, userID uuid.UUID, occurredAt time.Time) ([]reconciliation.Transaction, error) {
-	rows, err := s.pool.Query(ctx, `
+	return loadOwnedTransactions(ctx, s.pool, userID, occurredAt)
+}
+
+func loadOwnedTransactions(ctx context.Context, querier reconciliationQuerier, userID uuid.UUID, occurredAt time.Time) ([]reconciliation.Transaction, error) {
+	rows, err := querier.Query(ctx, `
 		select id, account_id, transaction_kind, coalesce(merchant_name, ''), original_amount_minor,
 			original_currency, occurred_at, coalesce(details -> 'references', '[]'::jsonb)
 		from public.transactions
@@ -530,14 +542,25 @@ func (s *Store) loadOwnedTransactions(ctx context.Context, userID uuid.UUID, occ
 }
 
 // PersistReconciliation applies one domain decision after all external work
-// and matching reads have completed. It locks only the source row, verifies
-// ownership again, and updates the visible sync-run counters atomically.
+// and matching reads have completed. Automatic creates are serialized per
+// owner and reconciled again inside the write transaction before insertion.
+// Every outcome also locks the source, verifies ownership again, and updates
+// visible sync-run counters atomically.
 func (s *Store) PersistReconciliation(ctx context.Context, userID uuid.UUID, result ReconciliationResult) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	serializedCreate := result.Decision.Outcome == reconciliation.OutcomeCreate
+	if serializedCreate {
+		// Every automatic create for one owner takes the same transaction-scoped
+		// row lock. A worker that waited here will observe the winner's committed
+		// transaction when it repeats reconciliation below.
+		if err = lockTransactionUser(ctx, tx, userID); err != nil {
+			return err
+		}
+	}
 	var status string
 	if err = tx.QueryRow(ctx, `select parse_status from private.data_sources where id = $1 and user_id = $2 for update`, result.SourceID, userID).Scan(&status); err != nil {
 		return err
@@ -551,6 +574,21 @@ func (s *Store) PersistReconciliation(ctx context.Context, userID uuid.UUID, res
 	}
 	if linked {
 		return tx.Commit(ctx)
+	}
+	if serializedCreate {
+		accounts, loadErr := loadOwnedAccountIdentities(ctx, tx, userID)
+		if loadErr != nil {
+			return loadErr
+		}
+		transactions, loadErr := loadOwnedTransactions(ctx, tx, userID, result.Candidate.OccurredAt)
+		if loadErr != nil {
+			return loadErr
+		}
+		decision, reconcileErr := reconciliation.Reconcile(result.Candidate, accounts, transactions)
+		if reconcileErr != nil {
+			return fmt.Errorf("repeat serialized reconciliation: %w", reconcileErr)
+		}
+		result.Decision = decision
 	}
 	created, attached, dangling, review := 0, 0, 0, 0
 	confidence := confidencePercent(result.Candidate.Confidence)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"slices"
 	"strings"
@@ -768,6 +769,106 @@ func TestConcurrentOrdinaryAttachesLeaveExactlyOneActiveLink(t *testing.T) {
 	}
 	if auditLinks != 2 {
 		t.Fatalf("reattachment audit rows = %d, want 2", auditLinks)
+	}
+}
+
+func TestConcurrentStaleCreateDecisionsProduceOneCanonicalTransaction(t *testing.T) {
+	databaseURL := os.Getenv("TRANSACTIONSTORE_TEST_DB_URL")
+	if databaseURL == "" {
+		t.Skip("TRANSACTIONSTORE_TEST_DB_URL is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	pool, err := database.OpenTransactionPooler(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	userID, accountID := uuid.New(), uuid.New()
+	sourceIDs := []uuid.UUID{uuid.New(), uuid.New()}
+	if _, err = pool.Exec(ctx, `insert into auth.users (id, email) values ($1, $2)`, userID, "reconcile-race-"+userID.String()+"@example.test"); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		_, _ = pool.Exec(cleanupContext, `delete from auth.users where id = $1`, userID)
+	}()
+	if _, err = pool.Exec(ctx, `
+		insert into public.accounts (id, user_id, side, account_type, name, institution_name)
+		values ($1, $2, 'asset', 'bank_account', 'Concurrent card', 'Bank')`, accountID, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `
+		insert into private.account_matching_keys
+			(user_id, account_id, key_type, display_value, normalized_value)
+		values ($1, $2, 'card_last_four', '**** 2562', '2562')`, userID, accountID); err != nil {
+		t.Fatal(err)
+	}
+	for index, sourceID := range sourceIDs {
+		if _, err = pool.Exec(ctx, `
+			insert into private.data_sources (
+				id, user_id, source_type, provider, provider_message_id, received_at, raw_data, parse_status
+			) values ($1, $2, 'gmail_email', 'gmail', $3, now(), '{}', 'parsed')`,
+			sourceID, userID, fmt.Sprintf("concurrent-create-%d-%s", index, sourceID)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	occurredAt := time.Now().UTC().Truncate(time.Second)
+	candidate := reconciliation.Candidate{
+		UserID:              userID.String(),
+		Kind:                reconciliation.KindDebit,
+		Title:               "FairPrice purchase",
+		MerchantName:        "FairPrice",
+		OriginalAmountMinor: 301,
+		OriginalCurrency:    "SGD",
+		OccurredAt:          occurredAt,
+		References:          []string{},
+		AccountEvidence: reconciliation.AccountEvidence{
+			CardLastFour:          "2562",
+			AdditionalIdentifiers: []string{},
+		},
+		LineItems:    []reconciliation.LineItem{},
+		Confidence:   0.95,
+		AutoEligible: true,
+	}
+	staleDecision := reconciliation.Decision{
+		Outcome:   reconciliation.OutcomeCreate,
+		AccountID: accountID.String(),
+		Reason:    "reliable unmatched candidate",
+	}
+	store := New(pool)
+	results := make(chan error, len(sourceIDs))
+	start := make(chan struct{})
+	for _, sourceID := range sourceIDs {
+		go func(id uuid.UUID) {
+			<-start
+			results <- store.PersistReconciliation(ctx, userID, ReconciliationResult{
+				SourceID: id, Candidate: candidate, Decision: staleDecision,
+			})
+		}(sourceID)
+	}
+	close(start)
+	for range sourceIDs {
+		if persistErr := <-results; persistErr != nil {
+			t.Fatalf("PersistReconciliation() error = %v", persistErr)
+		}
+	}
+
+	var transactionCount, activeLinkCount, linkedSourceCount int
+	if err = pool.QueryRow(ctx, `select count(*) from public.transactions where user_id = $1`, userID).Scan(&transactionCount); err != nil {
+		t.Fatal(err)
+	}
+	if err = pool.QueryRow(ctx, `
+		select count(*), count(distinct data_source_id)
+		from private.transaction_data_sources
+		where user_id = $1 and detached_at is null`, userID).Scan(&activeLinkCount, &linkedSourceCount); err != nil {
+		t.Fatal(err)
+	}
+	if transactionCount != 1 || activeLinkCount != 2 || linkedSourceCount != 2 {
+		t.Fatalf("transactions=%d active_links=%d linked_sources=%d, want 1/2/2", transactionCount, activeLinkCount, linkedSourceCount)
 	}
 }
 

@@ -171,8 +171,9 @@ func (h Handler) handleSourceParse(ctx context.Context, job jobs.Job) error {
 		if hasRule {
 			err = applyDeterministicRule(&parsed.Candidate, &parsed.Evidence, matchedRule)
 		}
-		parsed.Candidate.AutoEligible = reconciliation.DeriveAutoEligibility(parsed.Candidate, input.NormalizedContent)
 		if err == nil {
+			parsed.Candidate.AccountEvidence = reconciliation.SanitizeAccountEvidenceForMatching(parsed.Candidate.AccountEvidence, input.NormalizedContent)
+			parsed.Candidate.AutoEligible = reconciliation.DeriveAutoEligibility(parsed.Candidate, input.NormalizedContent)
 			err = reconciliation.ValidateParsedResponseAfterRule(parsed)
 		}
 		parsed.Candidate.Confidence = reconciliation.AggregateConfidence(parsed.Evidence)

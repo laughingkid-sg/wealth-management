@@ -160,6 +160,40 @@ func TestHandlerPersistsValidatedResultAndQueuesReconciliation(t *testing.T) {
 	}
 }
 
+func TestHandlerDemotesBareLLMCardSuffixBeforeAccountMatching(t *testing.T) {
+	userID, sourceID := uuid.New(), uuid.New()
+	raw := validResponseJSON(userID)
+	repository := &repositoryStub{parseInput: transactionstore.SourceParseInput{
+		ID: sourceID, NormalizedContent: "subject: Order 1234\ntext: Cafe charged SGD 5.00",
+	}}
+	handler := Handler{Repository: repository, Parser: parserStub{result: providers.ParsedCandidate{JSON: raw, Model: "qwen3.8-flash"}}}
+	payload, _ := json.Marshal(map[string]string{"data_source_id": sourceID.String()})
+	if err := handler.Handle(context.Background(), jobs.Job{Kind: jobs.KindSourceParse, UserID: userID, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+
+	result := repository.parseResult
+	if repository.invalid || result == nil {
+		t.Fatalf("invalid=%t result=%#v", repository.invalid, result)
+	}
+	evidence := result.ParsedResponse.Candidate.AccountEvidence
+	if evidence.CardLastFour != "" || len(evidence.AdditionalIdentifiers) != 1 || evidence.AdditionalIdentifiers[0] != "1234" {
+		t.Fatalf("unsafe card evidence was not demoted: %#v", evidence)
+	}
+	if result.AutoEligible || string(result.ModelOutput) != string(raw) {
+		t.Fatalf("eligibility=%t model output changed=%t", result.AutoEligible, string(result.ModelOutput) != string(raw))
+	}
+	decision, err := reconciliation.Reconcile(result.ParsedResponse.Candidate, []reconciliation.AccountIdentity{{
+		ID: "account", UserID: userID.String(), MatchingKeys: []reconciliation.AccountMatchingKey{{KeyType: "card_last_four", NormalizedValue: "1234"}},
+	}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Outcome != reconciliation.OutcomeDangling {
+		t.Fatalf("demoted suffix participated in matching: %#v", decision)
+	}
+}
+
 func TestHandlerRecordsInvalidModelResultWithoutRetry(t *testing.T) {
 	userID, sourceID := uuid.New(), uuid.New()
 	repository := &repositoryStub{parseInput: transactionstore.SourceParseInput{ID: sourceID, NormalizedContent: "receipt"}}
@@ -294,7 +328,7 @@ func TestHandlerAssemblesSelectedPromptAndPersistsExactAudit(t *testing.T) {
 		t.Fatal("email source content was promoted into the system prompt")
 	}
 	result := repository.parseResult
-	if result == nil || result.ParsedResponse.Candidate.AccountEvidence.CardLastFour != "2562" {
+	if result == nil || result.ParsedResponse.Candidate.AccountEvidence.CardLastFour != "2562" || !result.AutoEligible {
 		t.Fatalf("deterministic rule did not run after Qwen: %#v", result)
 	}
 	if result.RuleID != globalID || result.RuleVersion != 2 || result.UserRuleID != userRuleID || result.UserRuleVersion != 4 {
