@@ -1,4 +1,4 @@
-import { type FormEvent, useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Session } from "@supabase/supabase-js";
 import {
   ArchiveRestore,
@@ -42,8 +42,13 @@ import {
   type MetadataEntry,
 } from "./features/accounts/validation";
 import { isSupabaseConfigured, supabase } from "./lib/supabase";
-import { TransactionsPage } from "./features/transactions/TransactionsPage";
 import "./App.css";
+
+const TransactionsPage = lazy(() =>
+  import("./features/transactions/TransactionsPage").then(({ TransactionsPage: Page }) => ({
+    default: Page,
+  })),
+);
 
 type WorkspacePage = "accounts" | "transactions";
 
@@ -82,7 +87,7 @@ function LoginPage({ onSignedIn }: { onSignedIn: (session: Session) => void }) {
         <p className="eyebrow">WEALTH BUILDER</p>
         <h1 id="sign-in-title">Welcome back</h1>
         <p className="muted">
-          Sign in to manage your private account directory.
+          Sign in to manage your private finances.
         </p>
         <form onSubmit={submit} className="form-stack">
           <label>
@@ -442,31 +447,52 @@ function SideNav({
   signOut,
   activePage,
   onNavigate,
+  mobileOpen,
+  onMobileClose,
 }: {
   email: string | undefined;
   signOut: () => Promise<void>;
   activePage: WorkspacePage;
   onNavigate: (page: WorkspacePage) => void;
+  mobileOpen: boolean;
+  onMobileClose: () => void;
 }) {
   return (
-    <aside className="side-nav">
+    <aside
+      aria-label="Workspace navigation"
+      className={`side-nav${mobileOpen ? " mobile-open" : ""}`}
+      id="workspace-navigation"
+    >
       <div className="brand">
         <span className="brand-mark">W</span>
         <span>Wealth Builder</span>
+        <button
+          aria-label="Close navigation"
+          className="icon-button mobile-nav-close"
+          onClick={onMobileClose}
+          type="button"
+        >
+          <X aria-hidden="true" size={18} />
+        </button>
       </div>
       <nav aria-label="Primary navigation">
         {navigation.map(({ label, icon: Icon, page }) => {
           const active = page === activePage;
           return (
           <button
+            aria-label={label}
             key={label}
             type="button"
             className={`nav-item${active ? " active" : ""}`}
             aria-current={active ? "page" : undefined}
             disabled={!page}
-            onClick={page ? () => onNavigate(page) : undefined}
+            onClick={page ? () => {
+              onNavigate(page);
+              onMobileClose();
+            } : undefined}
+            title={page ? label : `${label} (coming soon)`}
           >
-            <Icon size={19} />
+            <Icon aria-hidden="true" size={19} />
             <span>{label}</span>
             {!page && <small>Soon</small>}
           </button>
@@ -474,13 +500,13 @@ function SideNav({
         })}
       </nav>
       <div className="nav-bottom">
-        <button className="nav-item" type="button" disabled>
-          <Sparkles size={19} />
+        <button aria-label="AI assistant (coming soon)" className="nav-item" type="button" disabled>
+          <Sparkles aria-hidden="true" size={19} />
           <span>AI assistant</span>
           <small>Soon</small>
         </button>
-        <button className="nav-item" type="button" disabled>
-          <CircleHelp size={19} />
+        <button aria-label="Help and support (coming soon)" className="nav-item" type="button" disabled>
+          <CircleHelp aria-hidden="true" size={19} />
           <span>Help & support</span>
         </button>
         <div className="nav-user">
@@ -519,7 +545,47 @@ function AccountsPage({
   const [sort, setSort] = useState<SortOption>("name_asc");
   const [editing, setEditing] = useState<Account | null | undefined>(undefined);
   const [expandedAccountIds, setExpandedAccountIds] = useState<string[]>([]);
-  async function load() {
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const mobileNavToggleRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (!mobileNavOpen) return;
+    const mobileNavToggle = mobileNavToggleRef.current;
+    const appMain = document.querySelector<HTMLElement>(".app-main");
+    const wasInert = appMain?.inert ?? false;
+    if (appMain) appMain.inert = true;
+    const frame = window.requestAnimationFrame(() => {
+      document.querySelector<HTMLElement>("#workspace-navigation .mobile-nav-close")?.focus();
+    });
+    const handleNavigationKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setMobileNavOpen(false);
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const navigation = document.getElementById("workspace-navigation");
+      const focusable = navigation
+        ? [...navigation.querySelectorAll<HTMLElement>("button:not([disabled]), a[href]")]
+        : [];
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", handleNavigationKey);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      document.removeEventListener("keydown", handleNavigationKey);
+      if (appMain) appMain.inert = wasInert;
+      mobileNavToggle?.focus();
+    };
+  }, [mobileNavOpen]);
+  const load = useCallback(async () => {
     setLoading(true);
     setError(null);
     let query = supabase.from("accounts").select("*");
@@ -532,10 +598,11 @@ function AccountsPage({
     if (loadError) setError(loadError.message);
     else setAccounts(data);
     setLoading(false);
-  }
-  useEffect(() => {
-    void load();
   }, [deletedFilter]);
+  useEffect(() => {
+    const timer = window.setTimeout(() => void load(), 0);
+    return () => window.clearTimeout(timer);
+  }, [load]);
   const institutions = useMemo(
     () =>
       [...new Set(accounts.map((account) => account.institution_name))].sort(
@@ -705,13 +772,31 @@ function AccountsPage({
       <SideNav
         activePage={activePage}
         email={session.user.email}
+        mobileOpen={mobileNavOpen}
         onNavigate={onNavigate}
+        onMobileClose={() => setMobileNavOpen(false)}
         signOut={signOut}
       />
+      {mobileNavOpen && (
+        <button
+          aria-label="Close navigation"
+          className="mobile-nav-backdrop"
+          onClick={() => setMobileNavOpen(false)}
+          type="button"
+        />
+      )}
       <div className="app-main">
         <header className="top-bar">
           <div className="top-bar-title">
-            <button className="top-icon" type="button" aria-label="Navigation">
+            <button
+              aria-controls="workspace-navigation"
+              aria-expanded={mobileNavOpen}
+              aria-label={mobileNavOpen ? "Close navigation" : "Open navigation"}
+              className="top-icon"
+              onClick={() => setMobileNavOpen((open) => !open)}
+              ref={mobileNavToggleRef}
+              type="button"
+            >
               <PanelLeft size={20} />
             </button>
             <span>Personal finance</span>
@@ -734,7 +819,18 @@ function AccountsPage({
         </header>
         <main className="app-shell">
           {activePage === "transactions" ? (
-            <TransactionsPage session={session} />
+            <Suspense
+              fallback={(
+                <section aria-busy="true" aria-label="Loading transactions" className="transaction-panel" role="status">
+                  <span className="sr-only">Loading transactions…</span>
+                  <div className="skeleton-row" />
+                  <div className="skeleton-row" />
+                  <div className="skeleton-row" />
+                </section>
+              )}
+            >
+              <TransactionsPage session={session} />
+            </Suspense>
           ) : (
             <>
           <header className="page-header">
@@ -923,10 +1019,16 @@ function AccountsPage({
   );
 }
 
+function workspacePageFromLocation(): WorkspacePage {
+  const parameters = new URL(window.location.href).searchParams;
+  if (parameters.get("gmail")) return "transactions";
+  return parameters.get("page") === "transactions" ? "transactions" : "accounts";
+}
+
 export default function App() {
   const [session, setSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(true);
-  const [activePage, setActivePage] = useState<WorkspacePage>("accounts");
+  const [activePage, setActivePage] = useState<WorkspacePage>(workspacePageFromLocation);
   useEffect(() => {
     void supabase.auth.getSession().then(({ data }) => {
       setSession(data.session);
@@ -937,6 +1039,18 @@ export default function App() {
     );
     return () => listener.subscription.unsubscribe();
   }, []);
+  useEffect(() => {
+    const onPopState = () => setActivePage(workspacePageFromLocation());
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
+  const navigate = (page: WorkspacePage) => {
+    setActivePage(page);
+    const url = new URL(window.location.href);
+    url.searchParams.set("page", page);
+    url.searchParams.delete("gmail");
+    window.history.pushState({}, "", url);
+  };
   if (!isSupabaseConfigured)
     return (
       <main className="auth-shell">
@@ -960,7 +1074,7 @@ export default function App() {
   return session ? (
     <AccountsPage
       activePage={activePage}
-      onNavigate={setActivePage}
+      onNavigate={navigate}
       session={session}
       signOut={() => supabase.auth.signOut().then(() => undefined)}
     />
