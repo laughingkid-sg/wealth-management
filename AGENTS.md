@@ -4,6 +4,8 @@
 
 We are building a personal wealth-management platform as a single-page application (SPA). Build the product page by page: implement only the page, behaviour, and supporting API/data work currently requested. Do not begin deployment, infrastructure-as-code, or cloud-VM work unless explicitly asked.
 
+When a requirement changes, update the corresponding product and technical documentation in the same change. Keep feature documentation isolated so future work can read only the relevant feature folder plus any necessary cross-cutting product documentation.
+
 ## Agreed stack
 
 - Frontend: React + TypeScript, shadcn/ui, and the project's existing styling setup.
@@ -11,13 +13,15 @@ We are building a personal wealth-management platform as a single-page applicati
 - Data and authentication: hosted Supabase.
 - Authentication (initial release): one private user using email and password. Do not implement public self-registration or OAuth unless requested.
 
+Use the Supabase Data REST API with RLS for simple browser-accessible CRUD. Route every other backend request through the Go HTTP API, including sensitive business logic, cross-resource workflows, integrations, aggregations, and privileged operations.
+
 Keep the frontend, API, and database concerns separate. Browser code may use Supabase only for the user session and data explicitly intended for browser access; sensitive business logic belongs in the Go API.
 
 ## Frontend conventions
 
 - Use TypeScript strictly; avoid `any` and model external/API data explicitly.
 - Prefer small, focused components and accessible semantic HTML.
-- Use shadcn/ui components before creating a bespoke equivalent. Keep generated shadcn components local and customize them only when the design requires it.
+- Use the shadcn/ui MCP, when available, and shadcn/ui components before creating a bespoke equivalent. Keep generated shadcn components local and customize them only when the design requires it.
 - Design responsive layouts and include useful loading, empty, and error states for data-backed screens.
 - Do not introduce a global state library unless a concrete page requirement warrants it.
 
@@ -42,6 +46,14 @@ Keep the frontend, API, and database concerns separate. Browser code may use Sup
 - Never commit secrets, Supabase tokens, private keys, or populated `.env` files.
 - Avoid unrelated refactors and preserve existing user changes.
 - Run the narrowest relevant checks after changes (typecheck, lint, tests, or targeted API tests).
+
+## Documentation structure
+
+- `docs/README.md` is the documentation index and describes how to find the right layer.
+- `docs/product/` contains cross-feature product decisions. Read it only when a change depends on product-wide context.
+- `docs/features/<feature>/README.md` contains that feature's requirements and scope.
+- `docs/features/<feature>/technical.md` contains that feature's implementation, data, and verification details.
+- Update only the affected feature documents and any genuinely affected product-level document; do not require unrelated feature documents to be read or changed.
 
 ## Git workflow
 

@@ -62,7 +62,9 @@ npm run lint
 
 ## Documentation
 
-- [Accounts product requirements](docs/accounts-prd.md)
-- [Accounts technical implementation](docs/accounts-technical-implementation.md)
+- [Documentation index](docs/README.md)
+- [Product overview](docs/product/overview.md)
+- [Accounts requirements](docs/features/accounts/README.md)
+- [Accounts technical implementation](docs/features/accounts/technical.md)
 
 Future features will be added progressively after their product and technical scope is agreed.
