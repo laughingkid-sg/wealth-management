@@ -47,6 +47,7 @@ Keep the frontend, API, and database concerns separate. Browser code may use Sup
 - Never commit secrets, Supabase tokens, private keys, or populated `.env` files.
 - Avoid unrelated refactors and preserve existing user changes.
 - Run the narrowest relevant checks after changes (typecheck, lint, tests, or targeted API tests).
+- The hosted project is currently a development environment. Breaking schema changes and deletion or rebuilding of development feature data are allowed when they are part of the agreed scope; backward compatibility is not required unless the user asks for it. Preserve authentication users unless the user explicitly names them for deletion. Before any destructive change, resolve the exact database and Storage targets, and remove all dependent rows and objects so no orphaned data remains.
 
 ## Documentation structure
 

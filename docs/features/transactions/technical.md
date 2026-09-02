@@ -2,7 +2,7 @@
 
 ## Implementation status
 
-The React workspace, Go API, Go worker, database migrations, and automated-test fixtures described here are implemented and release-verified on `codex/feat-transaction`. The final additive migration is applied to the hosted project, migration histories match, automated database/Go/frontend checks pass, and the scoped live Gmail → Storage → Qwen → reconciliation, replay-idempotency, and signed-attachment checks pass. The only unexecuted manual checks were environment-limited: no available browser had an authenticated app session or supplied credentials, and the hosted project had no second user. Those checks are not claimed as live passes; signed-out browser/accessibility testing plus automated contract, owner, and RLS coverage passed.
+The React workspace, Go API, Go worker, database migrations, and automated-test fixtures described here are implemented on `codex/feat-transaction`. Migrations through `20260902230002` are applied to the hosted development project, migration histories match, hosted database lint and all 180 pgTAP assertions pass, the hosted transaction-store integration suite passes, and the final Go/frontend release checks pass. Earlier scoped Gmail → Storage → Qwen → reconciliation, replay-idempotency, and signed-attachment checks also passed. The current FairPrice/Citi `2562` reparse is recorded separately below because sending the retained source to Qwen requires an explicit outbound-data approval.
 
 ## Component boundary
 
@@ -10,9 +10,9 @@ Transactions uses four cooperating boundaries:
 
 | Component | Responsibility |
 | --- | --- |
-| React SPA | Supabase session, Transactions/Review/Dangling/Failed views, safe reference-data reads, progress monitoring, and user actions through Go. |
-| Go API (`backend/cmd/api`) | Authenticates the Supabase user, owns Gmail OAuth, starts sync runs, returns safe transaction/source projections, signs attachment access, and performs invariant-preserving mutations. |
-| Go worker (`backend/cmd/worker`) | Claims durable jobs, fetches Gmail, stores attachments, applies parser rules, calls Qwen, validates candidates, and reconciles sources. |
+| React SPA | Supabase session, Transactions/Review/Dangling/Failed views, an independent Transaction Settings page, owner-only parse debugging, safe reference-data reads, progress monitoring, and user actions through Go. |
+| Go API (`backend/cmd/api`) | Authenticates the Supabase user, owns Gmail OAuth, starts sync runs, returns safe transaction/source/settings/audit projections, signs attachment access, stages evidence deletion, and performs invariant-preserving mutations. |
+| Go worker (`backend/cmd/worker`) | Claims durable jobs, fetches Gmail, stores attachments, selects global and user parser rules, assembles Qwen prompts, stores the complete call audit, validates candidates, and reconciles sources. |
 | Hosted Supabase | Auth, Postgres, RLS-protected public projections, non-exposed private operational tables, Realtime sync updates, and private attachment Storage. |
 
 The browser uses Supabase Data REST only for the user’s active Account choices, the global category catalogue, and the existing Account-detail transaction lookup. The main Transactions/source listings and every privileged or multi-table operation go through Go. Gmail, Qwen, raw sources, evidence links, OAuth tokens, worker jobs, Storage service credentials, and attachment signing are never browser-side concerns.
@@ -34,13 +34,15 @@ React POST /gmail/sync-runs
   -> Gmail message saved idempotently in private.data_sources
   -> supported attachments uploaded to private Storage
   -> one source_parsing job queued for the stored source
-  -> rule application + Qwen call + strict response/evidence validation
+  -> global/user rule selection + immutable prompt assembly
+  -> Qwen call + exact audit + strict response/evidence validation
   -> one reconciliation job queued
+  -> typed source evidence matched to active Account matching keys
   -> attach existing transaction | create transaction | review | dangling
   -> sync progress recomputed; terminal run published through Realtime
 ```
 
-Only one `queued` or `running` sync run is allowed per user. Jobs support `gmail_ingestion`, `source_parsing`, and `reconciliation`, have a maximum of five attempts, use exponential retry delay, and are claimed with `FOR UPDATE SKIP LOCKED`. The worker records lease ownership and heartbeats/completes only its own lease. It does not hold a transaction while calling Gmail, Storage, or Qwen. A crashed worker’s expired lease can be reclaimed; a final expired lease is marked failed rather than leaving the run permanently active.
+Only one `queued` or `running` sync run is allowed per user. Jobs support `gmail_ingestion`, `source_parsing`, `reconciliation`, and `source_attachment_cleanup`, have a maximum of five attempts, use exponential retry delay, and are claimed with `FOR UPDATE SKIP LOCKED`. The worker records lease ownership and heartbeats/completes only its own lease. It does not hold a transaction while calling Gmail, Storage, or Qwen. A crashed worker’s expired lease can be reclaimed; a final expired lease is marked failed rather than leaving the run permanently active.
 
 Ingestion has its own completion timestamp. A run becomes terminal only after ingestion is complete and all child jobs are no longer queued/running. A terminal Gmail-ingestion failure sets the run to `failed`. Source-level terminal failures remain visible and can produce a completed run with a redacted error summary. The safe progress projection includes discovered messages, saved sources, parsed sources, failed sources, transactions created, sources linked, review count, dangling count, and lifecycle timestamps.
 
@@ -87,11 +89,21 @@ If `pdftoppm`/`sips` is unavailable, conversion fails, times out, or produces an
 
 ## Parser and rule contract
 
-The worker loads active global Gmail rules in priority order. Rules use Go’s RE2-compatible regular expressions and a typed JSON configuration containing constants and capture groups. Malformed or unsupported rules are ignored rather than blocking all email parsing. A conservative OCBC rule is seeded for explicit SGD debit/purchase mail and can supply debit/SGD constants plus a card-last-four capture; it does not attempt unsafe major-to-minor amount conversion.
+The platform prompt is immutable, versioned application code. Version 2 fixes the response schema, source-only evidence requirement, exact evidence-path grammar, no-invention rule, absence of Account data, and the rule that email/attachment content is evidence rather than instruction. Configured guidance is appended in this stable order and is explicitly subordinate to that contract:
+
+1. the single highest-priority matching global rule;
+2. the user's default instructions, when non-empty;
+3. the single highest-priority matching user source rule.
+
+Global rules live in `private.source_parser_rules`. They are system-managed, versioned, provider-specific RE2 matchers with optional deterministic constants/capture groups and a prompt fragment. The seeded OCBC v2 rule recognizes explicit SGD purchase/debit messages and may supply debit/SGD constants plus a card-last-four capture. A lower-priority generic masked-card rule captures source evidence such as line-broken `Mastercard (**** 2562)` without inferring issuer, owner, amount, or direction. Historical rule rows remain available for parse provenance.
+
+User defaults live in `private.user_parser_settings` and are capped at 4,000 characters. User source rules live in `private.user_source_parser_rules`. Each rule has a required Gmail sender condition (`exact`, `domain`, or RE2), optional subject and content RE2 conditions, a prompt fragment, active state, priority, and monotonically increasing version. Present conditions use AND semantics. Global and user winners are selected independently; if two matching rules share the highest priority within either class, parsing records a configuration failure instead of choosing by ID. Go validates every user-entered expression with its RE2-compatible regular-expression engine before storage.
 
 The worker calls Alibaba Cloud Token Plan at the configured OpenAI-compatible base URL using exactly `qwen3.8-flash`, `response_format: {"type":"json_object"}`, and `enable_thinking: false`. JSON Object mode is intentional for the Singapore endpoint because [Alibaba Cloud documents JSON Schema structured output as unsupported for Singapore](https://www.alibabacloud.com/help/en/model-studio/qwen-structured-output). Because JSON Object mode guarantees valid JSON but not an application schema, the prompt states the exact nested response shape and the Go decoder, evidence checks, and domain validation remain authoritative. Requests have bounded text, attachment, total-body, response, and time limits.
 
-The model response is treated as untrusted. Strict decoding rejects unknown fields and extra JSON values. The server—not the model—binds user ownership, auto-eligibility, and aggregate confidence. Populated decisive fields must cite `subject`, `sender`, `text`, `attachment`, or the exact `received_at` fallback path; only server-applied rules may add a `rule:<id>:v<version>` citation. `received_at` is used only as an occurred-at fallback when no explicit event timestamp exists. Aggregate confidence is the minimum valid confidence among decisive citations so a strong citation cannot hide a weak required fact.
+The model receives normalized source evidence and eligible attachment images, but no Account catalogue, Account metadata, configured matching keys, or other users' data. The model response is treated as untrusted. Strict decoding rejects unknown fields and extra JSON values. The server—not the model—binds user ownership, auto-eligibility, and aggregate confidence. Populated decisive fields, including generic additional identifiers, must cite the exact grammar `received_at` or a path rooted at `subject`, `sender`, `text`, or `attachment` with dot-name and numeric-index segments; a candidate field name or extracted value is never a source path. Only server-applied rules may add a `rule:<id>:v<version>` citation. `received_at` is used only as an occurred-at fallback when no explicit event timestamp exists. Aggregate confidence is the minimum valid confidence among decisive citations so a strong citation cannot hide a weak required fact.
+
+Every parse attempt stores bounded, owner-private audit data: the assembled system prompt, normalized user input, exact JSON request sent to Alibaba, exact JSON response returned by Alibaba, exact model-output object, server-validated candidate, selected rule IDs/versions, prompt components, attachment usage, validation state, and redacted error. Authentication headers and API keys are never stored. Failed and invalid attempts retain every boundary reached, so the Debug view can distinguish provider, schema, evidence, and configuration failures.
 
 The normalized candidate contains:
 
@@ -105,11 +117,13 @@ The normalized candidate contains:
 - versioned line items
 - optional category leaf name
 
-Missing Account evidence is a valid parse and becomes dangling at reconciliation. An unknown, absent, or ambiguous optional category suggestion does not fail parsing or transaction creation; it remains uncategorized. Automatic reconciliation and user-confirmed creation both preserve a suggested category only when exactly one active global leaf resolves. Invalid required transaction facts or unsupported evidence citations produce a stored failed source/parse attempt that the user can retry.
+Missing Account evidence is a valid parse and becomes dangling at reconciliation. An absent category citation or an invalid citation attached only to the optional category removes the category and all of its evidence before general validation, so the otherwise usable parse remains uncategorized. Unknown or ambiguous category names likewise remain uncategorized. Invalid required transaction facts and invalid citations for required or other populated optional fields produce a stored failed source/parse attempt that the user can retry. Automatic reconciliation and user-confirmed creation preserve a suggested category only when its citation is valid and exactly one active global leaf resolves.
 
 ## Reconciliation contract
 
-Reconciliation first resolves Account evidence against active Accounts owned by the job user. It compares normalized final four digits from the candidate with `accounts.account_identifier` and safe string/string-array metadata keys related to identifiers, cards, banks, or accounts.
+Reconciliation first resolves Account evidence against active, explicitly configured matching keys owned by the job user. Only `card_last_four` can match a `card_last_four` key, and only `masked_bank_reference` can match a `bank_account_suffix` key. Account names, `accounts.account_identifier`, arbitrary Account metadata, and candidate `additional_identifiers` are deliberately excluded.
+
+Card keys remove whitespace and common masking characters but must yield exactly four ASCII digits; the system never truncates a longer value. Bank suffix keys lowercase and remove Unicode whitespace plus `*`, `•`, and `-`, retaining other characters. Stored display values remain unchanged. `(user_id, key_type, normalized_value)` is permanently unique, including retired rows. Matching-key identity is immutable; retirement/reactivation changes lifecycle state only.
 
 - No Account evidence or no owned match → `dangling`.
 - More than one owned Account match → `review_required`.
@@ -128,7 +142,7 @@ All monetary columns use `bigint` integer minor units. Timestamps use `timestamp
 | Table | Purpose and important fields |
 | --- | --- |
 | `public.transaction_categories` | Global, system-managed category catalogue: `parent_name`, `name`, `emoji`, `sort_order`, `active`. Authenticated users can select only. |
-| `public.transactions` | Canonical records: required owner/Account, `transaction_kind`, title/merchant, original amount/currency, optional SGD, time, optional category, `line_items` array, `details` object, review/confidence, timestamps. Browser users can select only; Go performs writes. |
+| `public.transactions` | Canonical records: required owner/Account, `transaction_kind`, title/merchant, original amount/currency, optional SGD, time, optional category, `line_items` array, `details` object, review/confidence, `creation_method`, optional `user_modified_at`, and timestamps. Browser users can select only; Go performs writes. |
 | `public.transaction_sync_runs` | Owner-safe async projection: lifecycle state/timestamps, ingestion-complete marker, message/source/progress/outcome counts, redacted error summary. Owner-select only and published to Supabase Realtime. |
 
 `public.transactions` references an active Account owned by the same user; a trigger also blocks inserts/Account changes to soft-deleted Accounts. `transaction_kind` stores only `debit` or `credit`, and amounts remain positive. Where a transaction is linked as an internal-transfer leg, database integrity checks protect the pair from being made a same-Account transfer.
@@ -141,12 +155,19 @@ All monetary columns use `bigint` integer minor units. Timestamps use `timestamp
 | `private.gmail_oauth_states` | Single-use state digest and encrypted PKCE verifier with expiry/consumption protections. |
 | `private.data_sources` | Durable generic evidence, provider identity, JSON payload, parser provenance/state, Account/transaction suggestions, and reconciliation reason. Current allowed types: `gmail_email`, `phone_notification`. |
 | `private.source_parser_rules` | Versioned global regex/rule configuration and priority. |
-| `private.source_parse_attempts` | Model/rule audit metadata, validated candidate, validation state, and bounded errors. |
+| `private.user_parser_settings` | One versioned, bounded default parser-instruction value per user. |
+| `private.user_source_parser_rules` | Versioned owner-specific Gmail sender/subject/content matching plus prompt guidance and priority. |
+| `private.account_matching_keys` | Typed, immutable Account identities with permanent per-user uniqueness and retire/reactivate lifecycle. |
+| `private.source_parse_attempts` | Exact bounded prompt/input/provider/model audit, rule provenance, validated candidate, validation state, and errors. |
+| `private.transaction_user_locks` | Minimal per-user row-lock target that serializes Gmail sync creation/ingestion with raw-source deletion. |
+| `private.deleted_provider_messages` | SHA-256 provider-identity tombstones that prevent deliberate raw deletions from being recreated without retaining the source UUID, provider message ID, content, or paths. |
 | `private.transaction_data_sources` | Evidence junction with source role, confidence, matched-by provenance, and detachable audit fields. A source ordinarily has one active link; exactly two are allowed only when they are the debit and credit legs of the same internal-transfer pair. Unmatching soft-detaches evidence before reuse. |
 | `private.transaction_links` | Relationship junction; currently one `internal_transfer` debit/credit pair. Deferred trigger checks same owner, distinct rows and Accounts, correct kinds, and exclusive transfer membership. |
-| `private.transaction_jobs` | Durable queued/running/completed/failed/cancelled jobs with attempts, schedule, lease owner/expiry, payload references, and redacted error. |
+| `private.transaction_jobs` | Durable queued/running/completed/failed/cancelled jobs with attempts, schedule, lease owner/expiry, payload references, and redacted error. The source-attachment cleanup kind acts as an outbox with no source FK and is removed after successful object deletion. |
 
-The operational migration adds owner-scoped keyset indexes, active-run uniqueness, expired-lease recovery, source suggestions/reasons, the first OCBC rule, and `transaction_sync_runs` membership in the existing `supabase_realtime` publication. It does not modify objects inside the locked `realtime` schema.
+Migration `20260902230001_add_transaction_configuration_and_audit.sql` adds parser settings, source rules, typed Account matching keys, parse-call audit columns, transaction provenance, and raw-source deletion cascades. It backfills only recognized Account metadata aliases while preserving the original metadata, retires the original OCBC row in favor of a prompt-bearing v2, and seeds the generic masked-card rule. All new configuration tables remain in the non-exposed `private` schema with RLS enabled and browser grants revoked.
+
+Forward migration `20260902230002_add_durable_source_deletion.sql` adds the per-user coordination row, one-way deletion tombstones, and the cleanup outbox job kind. It intentionally follows the already-applied configuration migration instead of rewriting hosted migration history.
 
 ### Line-item JSON
 
@@ -194,22 +215,39 @@ Every route except the OAuth callback requires the authenticated Supabase bearer
 | `GET /v1/transactions/sources` | Keyset-paginated `dangling`, `review`, or `failed` source summaries with parsed suggestions/reasons. Defaults to dangling. |
 | `GET /v1/transactions/sources/{id}/email` | Owner-scoped sanitized HTML/plain text. |
 | `GET /v1/transactions/sources/{id}/attachments` | Owner-scoped stored metadata and five-minute signed URLs. |
+| `GET /v1/transactions/sources/{id}/debug` | Owner-scoped latest-ten attempt summaries with bounded field previews and explicit `has_more`, `truncated`, and `truncated_fields` markers. |
+| `GET /v1/transactions/sources/{id}/debug/attempts/{attempt_id}/fields/{field}` | Loads one whitelisted audit field in its exact stored lexical form on demand after source, attempt, and owner checks. |
+| `DELETE /v1/transactions/sources/{id}` | Atomically deletes database evidence, records a non-reversible provider tombstone, and queues exact Storage cleanup paths; returns `202 cleanup_pending` when object cleanup remains or `200 completed` when no objects exist. Active Gmail ingestion returns `409`. |
 | `POST /v1/transactions/sources/{id}/attach` | Attaches actionable evidence to an owned existing transaction. |
 | `POST /v1/transactions/sources/{id}/create-transaction` | Creates a confirmed transaction from the validated stored candidate and chosen active Account. |
 | `POST /v1/transactions/sources/{id}/retry` | Requeues a failed source without refetching Gmail; idempotent when already queued/running. |
 | `POST /v1/transactions/source-links/{id}/unmatch` | Soft-detaches evidence; an otherwise unattached source returns to Dangling. |
 
+### Transaction settings
+
+| Method and path | Behavior |
+| --- | --- |
+| `GET /v1/transactions/settings` | Returns the user's default instructions/version, all user source rules, and active or retired Account matching keys. |
+| `PUT /v1/transactions/settings/default-instructions` | Replaces the bounded default instructions and increments their version. |
+| `POST /v1/transactions/settings/source-rules` | Creates a validated, version-1 Gmail source rule. |
+| `PUT /v1/transactions/settings/source-rules/{id}` | Replaces an owned rule's editable fields and increments its version. |
+| `DELETE /v1/transactions/settings/source-rules/{id}` | Soft-retires an owned rule and increments its version so historical audit provenance remains valid. |
+| `POST /v1/transactions/settings/matching-keys` | Creates a normalized matching key for an owned active Account; conflicts return `409`. |
+| `PATCH /v1/transactions/settings/matching-keys/{id}` | Retires or reactivates an immutable owned matching key using `{ "active": boolean }`. |
+
 Transaction/source list cursors are versioned, scope-bound base64url values. Results sort newest first using `(timestamp, id)` keysets. Default frontend pages contain 50 items. Responses serialize monetary values as decimal strings and reject malformed service contracts in the TypeScript client.
 
 ## React implementation
 
-`frontend/src/features/transactions/TransactionsPage.tsx` is mounted from the main workspace navigation and handles four tab panels: Transactions, Review, Dangling, and Failed.
+The workspace navigation contains a Transactions section with two independent pages: the four-tab transaction workspace and `frontend/src/features/transactions/TransactionSettingsPage.tsx`.
 
 - Transactions supports title/merchant search, debit/credit and review filters, cursor “load more,” original/SGD display, Account/category labels, evidence counts, and transfer badges.
 - Sync startup restores the latest run. Active runs subscribe to owner-readable `transaction_sync_runs` changes and also poll every ten seconds when Realtime is ready or every three seconds when it is not. Monitoring pauses after 40 checks while server work continues and can be resumed.
 - Source inspection loads sanitized email and private signed attachments, previews PDF/images, and supports Failed retry with a safe error summary or Review/Dangling attach/create resolution.
+- Source inspection exposes an explicit Debug panel with bounded latest-attempt previews and on-demand exact-field loading for the complete owner-only Qwen audit. A separate destructive-confirmation flow reports whether durable raw-source Storage cleanup is pending.
 - Transaction detail edits canonical fields and versioned line items, displays the transfer counterpart and active evidence, and uses a confirmation step before unmatch.
 - Internal-transfer creation collects and validates both legs before one Go request, including outgoing, incoming, or both-leg evidence selection.
+- Transaction Settings edits the default parser instructions, versioned sender/subject/content rules, and immutable Account matching keys. It explains prompt precedence, RE2/AND semantics, normalized values, and retire/reactivate behavior.
 - Dialogs trap focus, close with Escape, restore focus, and block background interaction. Tabs support arrow/Home/End keys, and the workspace has a mobile navigation drawer.
 
 The frontend reads owned Account options and global categories from Data REST with the publishable key plus user bearer token. The source-resolution candidate picker uses the existing RLS-protected Account transaction query; every source, attachment, OAuth, sync, reconciliation, mutation, and main list operation goes through Go.
@@ -249,6 +287,9 @@ The API and worker are separate processes and both need the backend environment.
 - The `private` schema has no `anon`/`authenticated` grants. Its tables also enable RLS as defense in depth.
 - Browser roles are explicitly blocked from `transaction-attachments`; only Go’s server key can access the private bucket.
 - Source, transaction, Account, link, sync, and attachment paths are checked against the authenticated user before reads or writes.
+- Parser settings, source-rule changes, matching keys, Debug records, and deletion plans are owner-scoped in SQL as well as at the HTTP boundary.
+- Qwen never receives the Account catalogue or matching-key table. User guidance is appended beneath an immutable platform contract and email/attachment instructions are treated as untrusted content.
+- Raw deletion is database-first and owner-scoped. A per-user coordination lock prevents races with Gmail ingestion; database cascades clear source jobs, attempts, and links; transaction provenance limits automatic cleanup to a never-edited `automatic_source` record with no remaining active evidence or transfer link. Exact Storage paths are committed as leased cleanup work before any external call, and a one-way provider digest prevents reingestion of deliberately deleted evidence.
 - The model never chooses user ownership. Gmail/provider content, HTML, filenames, parser output, category names, and cursor values are validated before use.
 - Transactions and internal-transfer legs can reference only active same-user Accounts. Transfer pair integrity is enforced in both Go and a deferred database trigger.
 - OAuth state is expiring/single-use, PKCE is required, refresh tokens are encrypted at rest by the application, and secrets/errors are not returned to the browser.
@@ -285,15 +326,16 @@ For a future release rerun, also validate migrations in a disposable/local migra
 | Gate | Status |
 | --- | --- |
 | React/Go implementation and focused coverage | **Passed.** Go/frontend build and lint, Go race checks, and integration coverage passed in the completed verification runs. |
-| Local database validation | **Passed.** Local schema diff and database lint passed, as did all 88 configured pgTAP assertions. |
-| Hosted migration application/history | **Passed.** `20260902230000_complete_transaction_operations.sql` is applied and local/remote migration histories match. |
+| Hosted migration rehearsal/application/history | **Passed.** `20260902230002_add_durable_source_deletion.sql` passed dry run and transaction-wrapped rollback rehearsal, is applied after `20260902230001`, and local/remote histories match through `20260902230002`. No local Supabase or Docker instance was used. |
+| Hosted database validation | **Passed.** Database lint reports no schema errors; the existing 152 pgTAP assertions and the new 28 deletion/audit assertions all pass and roll back their fixtures. |
+| Hosted Go store integration | **Passed.** Transaction-store integration tests pass through the configured transaction pooler, including deletion staging/tombstones, cleanup retry/success, source reingestion prevention, and bounded/exact Debug behavior. |
 | Live Gmail → private Storage ingestion | **Passed.** The initial scoped run fetched and stored five unique `odin-finance` sources, including one private attachment. |
-| Live Qwen parsing and reconciliation | **Passed after corrective retries.** `qwen3.8-flash` was reached with thinking disabled. Three initial schema-shape drifts exposed missing nested prompt detail; the prompt was made exact and all three scoped retries then parsed and reconciled successfully. The terminal state was five Dangling sources, zero Failed sources, and no active work, as expected because no Account evidence matched. |
+| Live Qwen parsing and reconciliation | **Baseline passed; current targeted check awaiting explicit approval.** Earlier `qwen3.8-flash` checks reached the provider with thinking disabled and reconciled the five-source backfill. The exact FairPrice invalid-category response is now covered by a worker regression: optional category/citation is discarded while the trusted `2562` Account evidence remains; required or other populated-field citation failures still fail. A fresh retained-source call is not claimed until outbound-data approval is granted. |
 | Idempotent replay | **Passed.** Repeating the same five-message run created zero duplicate sources. |
 | Five-minute signed attachment access | **Passed.** A live ranged download through the signed URL succeeded within its five-minute lifetime. |
 | Hosted anonymous/private-schema denial | **Passed for the exercised surfaces.** Anonymous REST requests to Transactions and sync data returned `401`; requesting the private source schema returned `406`. |
 | Signed-out browser, mobile, and accessibility controls | **Passed.** Desktop and mobile signed-out views and accessibility controls were exercised with no console warnings. |
-| Authenticated browser workflow | **Environment-limited; not claimed as a live pass.** Neither available browser had an application session and no login credentials were supplied. The final contract/accessibility code audit found no P0/P1 issue. |
+| Authenticated browser workflow | **Passed for read-only acceptance paths.** Using the existing owner session, desktop and mobile navigation reached the independent Transaction Settings page; Account options, the active Citi `2562` matching key, Failed source inspection, sanitized email rendering, and the three-attempt Debug audit loaded without console errors or warnings. Destructive and configuration-save controls were deliberately not invoked during this read-only pass. |
 | Cross-user source/transaction/sync/attachment denial | **Passed in automated RLS/owner tests; live second-user attempt unavailable.** The hosted project has only one user, so no live cross-user claim is made. |
 
-The implemented Transactions scope is release-ready on the completed evidence above. The two environment-limited manual checks remain explicit coverage gaps rather than implied passes; repeat them when an authenticated browser session and a second hosted test user are available.
+The implementation is release-ready on the completed automated, hosted-schema, authenticated-browser, and prior provider evidence above, subject to the explicitly identified current-source approval and the unavailable live second-user check. Neither is implied as a pass.
