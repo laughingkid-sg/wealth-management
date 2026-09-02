@@ -8,7 +8,7 @@ Wealth Builder is a private personal-finance product being built incrementally. 
 
 Signed-in users can maintain their own account directory with:
 
-- Fixed account types: Bank Account, Brokerage, Crypto Wallet, Crypto Exchange, RSU, Credit Card, and Personal Loan.
+- Fixed account types: Bank Account, Brokerage, Digital Wallet, Crypto Wallet, Crypto Exchange, RSU, Credit Card, and Personal Loan.
 - Required account name and institution/platform; optional account identification, notes, and custom metadata.
 - A searchable, filterable, alphabetically sortable list grouped by Assets and Liabilities.
 - Expandable rows that reveal safe custom metadata.

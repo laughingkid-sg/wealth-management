@@ -24,7 +24,7 @@ The frontend uses only `VITE_SUPABASE_URL` and `VITE_SUPABASE_PUBLISHABLE_KEY`. 
 | Column | Notes |
 | --- | --- |
 | `id`, `user_id` | UUID primary key and required `auth.users(id)` owner. |
-| `side`, `account_type` | Constrained Asset/Liability and compatible fixed type. |
+| `side`, `account_type` | Constrained Asset/Liability and compatible fixed type. Assets are Bank Account, Brokerage, Digital Wallet, Crypto Wallet, Crypto Exchange, and RSU; liabilities are Credit Card and Personal Loan. |
 | `name`, `institution_name` | Required bounded text. |
 | `account_identifier`, `notes` | Optional bounded text. |
 | `metadata` | JSON object rendered as safe text. |
