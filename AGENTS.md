@@ -69,5 +69,7 @@ The completed Accounts feature may be captured as one initial commit because its
 
 ## Collaboration
 
-- Before a page is built, clarify its user goal, primary actions, data it needs, and success/empty/error states if they are not already evident.
+- Before any coding begins, clarify every relevant detail of the requested work and communicate the agreed scope clearly. This includes the user goal, primary actions, data model and ownership, validation and business rules, UI behaviour, loading/empty/error/success states, security and integration boundaries, documentation impact, and acceptance criteria. Do not make implementation assumptions where a detail could materially change the result; resolve it with the user first.
+- Do not request environment variables, credentials, OAuth setup, or other implementation configuration while drafting or agreeing a PRD and TD. Once the plan is confirmed, request all required setup inputs together, validate the integrations, and only then begin implementation.
+- Always use subagents for implementation work. Divide implementation into focused, non-overlapping subtasks, and retain coordination, integration, and verification responsibility in the primary task.
 - When parallel work is explicitly requested, divide it into independent, non-overlapping tasks and avoid concurrent edits to the same files.

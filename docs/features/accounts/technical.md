@@ -2,7 +2,7 @@
 
 ## Boundary
 
-This feature provides a user-owned account directory. It has no balances, currencies, positions, opening records, transactions, valuations, aggregate views, market data, or Go API endpoint.
+Accounts owns a user-owned account directory. It does not calculate balances, currencies, positions, opening records, valuations, aggregate views, or market data, and it has no Accounts-specific Go API endpoint. The separate Transactions feature references Accounts but does not change this directory-only responsibility.
 
 ## Frontend
 
@@ -13,13 +13,13 @@ This feature provides a user-owned account directory. It has no balances, curren
 - The Accounts page queries, inserts, and updates `accounts` directly.
 - Account rows are grouped by side and can expand to display metadata as safe text.
 - The visible sort options are name A–Z and Z–A. `sort_order` remains an internal stable database value and is not editable in the UI.
-- Sidebar entries beyond Accounts are visual placeholders only.
+- Other sidebar features are outside the Accounts boundary; Transactions is implemented and documented separately.
 
 The frontend uses only `VITE_SUPABASE_URL` and `VITE_SUPABASE_PUBLISHABLE_KEY`. Do not expose a secret or service-role key.
 
 ## Supabase data and RLS
 
-`public.accounts` is the only application table.
+`public.accounts` is the only table owned by the Accounts feature. [Transactions](../transactions/README.md) owns its own public/private tables and references an active, same-user Account from each canonical transaction; internal transfers use two distinct Accounts and remain a Transactions concern. Their evidence junction ordinarily links one source to one transaction, with the deliberate exception that the same source may support both legs of one internal-transfer pair.
 
 | Column | Notes |
 | --- | --- |
@@ -38,7 +38,6 @@ Migrations are stored in `supabase/migrations/`; RLS checks are in `supabase/tes
 
 ## Verification
 
-- Run `npm run build` and `npm run lint` in `frontend/`.
-- Test email/password sign-in against the configured remote project.
-- Verify create, edit, metadata expansion, soft-delete, and restore for the signed-in user.
-- Check RLS grants, policies, and Supabase security advisors after schema changes.
+For future changes, run `npm run build` and `npm run lint` in `frontend/`, exercise email/password sign-in and Account CRUD against the configured hosted project, and rerun the RLS/grant tests and Supabase advisors after schema changes.
+
+At this release checkpoint, frontend lint/build and the relevant automated RLS/owner coverage pass. The signed-out application was exercised at desktop and mobile sizes, including accessibility controls, with no console warnings. Authenticated Account CRUD was not manually rerun because neither available browser had an application session and no login credentials were supplied. The hosted project also contains only one user, so live second-user isolation could not be attempted; ownership remains covered by the RLS/owner test suite. These two environment-limited checks are not claimed as live passes.
