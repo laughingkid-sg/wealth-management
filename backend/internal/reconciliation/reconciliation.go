@@ -15,11 +15,15 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	textcurrency "golang.org/x/text/currency"
 )
 
-var ruleEvidencePath = regexp.MustCompile(`^rule:[^:\s]+:v[1-9][0-9]*$`)
+var (
+	ruleEvidencePath  = regexp.MustCompile(`^rule:[^:\s]+:v[1-9][0-9]*$`)
+	modelEvidencePath = regexp.MustCompile(`^(?:received_at|(?:subject|sender|text|attachment)(?:\.[A-Za-z0-9_-]+|\[[0-9]+\])*)$`)
+)
 
 const (
 	// MatchWindow is a supporting signal only; it can never create a match by itself.
@@ -80,15 +84,18 @@ type AccountEvidence struct {
 	AdditionalIdentifiers []string `json:"additional_identifiers"`
 }
 
-// AccountIdentity is the safe subset of Account data available to matching.
-// It is expected to be supplied only for accounts owned by the current user.
+// AccountIdentity contains only explicitly configured matching keys for an
+// account owned by the current user. Account names, generic identifiers and
+// metadata are deliberately excluded from automatic matching.
 type AccountIdentity struct {
-	ID                   string
-	UserID               string
-	CardLastFour         string
-	BankAccountReference string
-	AccountIdentifier    string
-	MetadataIdentifiers  []string
+	ID           string
+	UserID       string
+	MatchingKeys []AccountMatchingKey
+}
+
+type AccountMatchingKey struct {
+	KeyType         string
+	NormalizedValue string
 }
 
 // LineItem is the supported, versioned shape of one transaction line item.
@@ -260,6 +267,44 @@ func ValidateParsedResponse(response ParsedResponse) error {
 	return validateParsedResponse(response, false)
 }
 
+// DiscardInvalidOptionalCategoryCitation removes the optional category and all
+// of its citations unless every category citation is valid model evidence and
+// at least one is present. This recovery is deliberately category-only: bad
+// citations for required or other populated fields must still fail validation.
+func DiscardInvalidOptionalCategoryCitation(response *ParsedResponse) bool {
+	if response == nil {
+		return false
+	}
+	categoryPresent := strings.TrimSpace(response.Candidate.CategoryLeafName) != ""
+	citationPresent := false
+	citationsValid := true
+	for _, evidence := range response.Evidence {
+		if evidence.Field != "category_leaf_name" {
+			continue
+		}
+		citationPresent = true
+		if !validEvidenceSourcePath(evidence.SourcePath, false) || !validConfidence(evidence.Confidence) {
+			citationsValid = false
+		}
+	}
+	if categoryPresent && citationPresent && citationsValid {
+		return false
+	}
+
+	discarded := categoryPresent || citationPresent
+	response.Candidate.CategoryLeafName = ""
+	if citationPresent {
+		filtered := response.Evidence[:0]
+		for _, evidence := range response.Evidence {
+			if evidence.Field != "category_leaf_name" {
+				filtered = append(filtered, evidence)
+			}
+		}
+		response.Evidence = filtered
+	}
+	return discarded
+}
+
 // ValidateEvidenceEntries validates model-provided citations before any
 // trusted deterministic rule evidence is injected.
 func ValidateEvidenceEntries(response ParsedResponse) error {
@@ -360,15 +405,7 @@ func validEvidenceSourcePath(path string, allowRule bool) bool {
 	if allowRule && ruleEvidencePath.MatchString(path) {
 		return true
 	}
-	if path == "received_at" {
-		return true
-	}
-	for _, prefix := range []string{"subject", "sender", "text", "attachment"} {
-		if path == prefix || strings.HasPrefix(path, prefix+".") || strings.HasPrefix(path, prefix+"[") {
-			return true
-		}
-	}
-	return false
+	return modelEvidencePath.MatchString(path)
 }
 
 func hasAccountEvidence(evidence AccountEvidence) bool {
@@ -526,8 +563,8 @@ const (
 )
 
 func resolveAccount(userID string, evidence AccountEvidence, accounts []AccountIdentity) (string, accountResolution) {
-	identifiers := evidenceIdentifiers(evidence)
-	if len(identifiers) == 0 {
+	keys := evidenceMatchingKeys(evidence)
+	if len(keys) == 0 {
 		return "", accountMissing
 	}
 	matched := make(map[string]struct{})
@@ -535,9 +572,9 @@ func resolveAccount(userID string, evidence AccountEvidence, accounts []AccountI
 		if account.UserID != userID || strings.TrimSpace(account.ID) == "" {
 			continue
 		}
-		for _, sourceIdentifier := range identifiers {
-			for _, accountIdentifier := range accountIdentifiers(account) {
-				if sourceIdentifier == accountIdentifier {
+		for _, sourceKey := range keys {
+			for _, accountKey := range account.MatchingKeys {
+				if sourceKey.KeyType == accountKey.KeyType && sourceKey.NormalizedValue == accountKey.NormalizedValue {
 					matched[account.ID] = struct{}{}
 				}
 			}
@@ -555,43 +592,66 @@ func resolveAccount(userID string, evidence AccountEvidence, accounts []AccountI
 	return "", accountUnmatched
 }
 
-func evidenceIdentifiers(evidence AccountEvidence) []string {
-	values := append([]string{evidence.CardLastFour, evidence.MaskedBankReference}, evidence.AdditionalIdentifiers...)
-	return normalizeIdentifiers(values)
-}
-
-func accountIdentifiers(account AccountIdentity) []string {
-	values := append([]string{account.CardLastFour, account.BankAccountReference, account.AccountIdentifier}, account.MetadataIdentifiers...)
-	return normalizeIdentifiers(values)
-}
-
-func normalizeIdentifiers(values []string) []string {
-	seen := make(map[string]struct{})
+func evidenceMatchingKeys(evidence AccountEvidence) []AccountMatchingKey {
+	values := []struct {
+		keyType string
+		value   string
+	}{
+		{keyType: "card_last_four", value: evidence.CardLastFour},
+		{keyType: "bank_account_suffix", value: evidence.MaskedBankReference},
+	}
+	keys := make([]AccountMatchingKey, 0, len(values))
 	for _, value := range values {
-		lastFour := safeLastFour(value)
-		if lastFour != "" {
-			seen[lastFour] = struct{}{}
+		normalized, err := NormalizeAccountMatchingKey(value.keyType, value.value)
+		if err == nil {
+			keys = append(keys, AccountMatchingKey{KeyType: value.keyType, NormalizedValue: normalized})
 		}
 	}
-	result := make([]string, 0, len(seen))
-	for value := range seen {
-		result = append(result, value)
-	}
-	sort.Strings(result)
-	return result
+	return keys
 }
 
-func safeLastFour(value string) string {
-	digits := make([]rune, 0, 4)
-	for _, char := range value {
-		if unicode.IsDigit(char) {
-			digits = append(digits, char)
+// NormalizeAccountMatchingKey is shared by the settings API and automatic
+// reconciliation so stored keys and source evidence use exactly one contract.
+// Card input is never truncated: a full PAN is rejected rather than reduced to
+// its final four digits.
+func NormalizeAccountMatchingKey(keyType, value string) (string, error) {
+	value = strings.TrimSpace(value)
+	switch keyType {
+	case "card_last_four":
+		var digits strings.Builder
+		for _, character := range value {
+			switch {
+			case character >= '0' && character <= '9':
+				digits.WriteRune(character)
+			case unicode.IsSpace(character), character == '*', character == '•', character == '-', character == 'x', character == 'X':
+				// Common masking characters do not contribute to the key.
+			default:
+				return "", errors.New("card last four may contain only four digits and masking characters")
+			}
 		}
+		if digits.Len() != 4 {
+			return "", errors.New("card last four must contain exactly four digits")
+		}
+		return digits.String(), nil
+	case "bank_account_suffix":
+		var normalized strings.Builder
+		for _, character := range strings.ToLower(value) {
+			if unicode.IsSpace(character) || character == '*' || character == '•' || character == '-' {
+				continue
+			}
+			normalized.WriteRune(character)
+		}
+		result := normalized.String()
+		if result == "" {
+			return "", errors.New("bank account suffix is required")
+		}
+		if utf8.RuneCountInString(result) > 100 {
+			return "", errors.New("bank account suffix must be at most 100 characters")
+		}
+		return result, nil
+	default:
+		return "", errors.New("matching key type must be card_last_four or bank_account_suffix")
 	}
-	if len(digits) < 4 {
-		return ""
-	}
-	return string(digits[len(digits)-4:])
 }
 
 type scoredTransaction struct {

@@ -18,6 +18,7 @@ import (
 
 type repositoryStub struct {
 	source     transactionstore.IngestedSource
+	storeErr   error
 	complete   bool
 	sourceID   uuid.UUID
 	enqueued   bool
@@ -34,7 +35,7 @@ func (s *repositoryStub) GetGmailConnection(context.Context, uuid.UUID) (transac
 }
 func (s *repositoryStub) StoreIngestedSource(_ context.Context, source transactionstore.IngestedSource) (uuid.UUID, bool, error) {
 	s.source = source
-	return s.sourceID, true, nil
+	return s.sourceID, true, s.storeErr
 }
 func (s *repositoryStub) FindIngestedSourceID(context.Context, uuid.UUID, string) (uuid.UUID, error) {
 	return s.sourceID, nil
@@ -132,6 +133,29 @@ func TestGmailIngestionStoresSanitizedIdempotentSourceShape(t *testing.T) {
 	attachment := attachments[0].(map[string]any)
 	if attachment["storage_status"] != "stored" || attachment["object_path"] == nil || attachment["sha256"] != "stored-checksum" {
 		t.Fatalf("stored attachment metadata = %#v", attachment)
+	}
+}
+
+func TestGmailIngestionDoesNotRecreatePermanentlyDeletedProviderMessage(t *testing.T) {
+	cipher, err := secret.New(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &repositoryStub{storeErr: transactionstore.ErrSourcePermanentlyDeleted}
+	runID := uuid.New()
+	payload, _ := json.Marshal(map[string]string{"sync_run_id": runID.String()})
+	handler := GmailIngestionHandler{
+		Repository: store, Gmail: gmailStub{}, Tokens: tokenStub{}, Cipher: cipher,
+		Attachments: attachmentUploaderStub{}, Label: "odin-finance", InitialBackfillMax: 5,
+		DevelopmentRefreshToken: "refresh",
+	}
+	if err = handler.Handle(context.Background(), jobs.Job{
+		Kind: jobs.KindGmailIngest, UserID: uuid.New(), Payload: payload, Attempts: 1,
+	}); err != nil {
+		t.Fatalf("Handle() error = %v", err)
+	}
+	if !store.complete || store.enqueued || store.failures != 0 {
+		t.Fatalf("complete=%t enqueued=%t failures=%d", store.complete, store.enqueued, store.failures)
 	}
 }
 

@@ -98,6 +98,11 @@ func (h GmailIngestionHandler) Handle(ctx context.Context, job jobs.Job) error {
 			UserID: job.UserID, SyncRunID: runID, ProviderMessageID: message.ID, ProviderThreadID: message.ThreadID,
 			ReceivedAt: message.ReceivedAt, RawData: rawData,
 		})
+		if errors.Is(err, transactionstore.ErrSourcePermanentlyDeleted) {
+			// A user-requested permanent deletion wins over retries and initial
+			// backfill. The one-way tombstone deliberately suppresses recreation.
+			continue
+		}
 		if err != nil {
 			return h.fail(ctx, job, runID, err)
 		}

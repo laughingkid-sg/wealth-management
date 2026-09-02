@@ -3,10 +3,12 @@
 package transactionworker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/google/uuid"
@@ -21,8 +23,8 @@ import (
 type Repository interface {
 	LoadSourceParseInput(context.Context, uuid.UUID, uuid.UUID) (transactionstore.SourceParseInput, error)
 	SaveParsedSource(context.Context, uuid.UUID, transactionstore.ParsedSourceResult) error
-	RecordInvalidSourceParse(context.Context, uuid.UUID, uuid.UUID, string, json.RawMessage, error) error
-	RecordFailedSourceParse(context.Context, uuid.UUID, uuid.UUID, string, error) error
+	RecordInvalidSourceParse(context.Context, uuid.UUID, transactionstore.SourceParseAudit, error) error
+	RecordFailedSourceParse(context.Context, uuid.UUID, transactionstore.SourceParseAudit, error) error
 	LoadReconciliationInput(context.Context, uuid.UUID, uuid.UUID) (transactionstore.ReconciliationInput, error)
 	PersistReconciliation(context.Context, uuid.UUID, transactionstore.ReconciliationResult) error
 }
@@ -35,9 +37,16 @@ type Handler struct {
 	Attachments interface {
 		Download(context.Context, attachmentstorage.ObjectRequest) ([]byte, error)
 	}
+	CleanupAttachments interface {
+		Delete(context.Context, []attachmentstorage.ObjectRequest) error
+	}
 }
 
-const maxVisualAttachmentBytes = 5 * 1024 * 1024
+const (
+	maxVisualAttachmentBytes = 5 * 1024 * 1024
+	maxCleanupPayloadBytes   = 2 * 1024 * 1024
+	maxCleanupObjectPaths    = 1000
+)
 
 func (h Handler) Handle(ctx context.Context, job jobs.Job) error {
 	switch job.Kind {
@@ -45,9 +54,50 @@ func (h Handler) Handle(ctx context.Context, job jobs.Job) error {
 		return h.handleSourceParse(ctx, job)
 	case jobs.KindReconcile:
 		return h.handleReconciliation(ctx, job)
+	case jobs.KindSourceAttachmentCleanup:
+		return h.handleSourceAttachmentCleanup(ctx, job)
 	default:
 		return fmt.Errorf("unsupported transaction processing job kind %q", job.Kind)
 	}
+}
+
+func (h Handler) handleSourceAttachmentCleanup(ctx context.Context, job jobs.Job) error {
+	if h.CleanupAttachments == nil {
+		return errors.New("source attachment cleanup handler is not configured")
+	}
+	if len(job.Payload) == 0 || len(job.Payload) > maxCleanupPayloadBytes {
+		return errors.New("source attachment cleanup payload has invalid size")
+	}
+	var payload jobs.SourceAttachmentCleanupPayload
+	decoder := json.NewDecoder(bytes.NewReader(job.Payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
+		return errors.New("source attachment cleanup payload is invalid")
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return errors.New("source attachment cleanup payload has trailing data")
+	}
+	sourceID, err := uuid.Parse(payload.SourceID)
+	if err != nil || sourceID == uuid.Nil || len(payload.ObjectPaths) == 0 || len(payload.ObjectPaths) > maxCleanupObjectPaths {
+		return errors.New("source attachment cleanup payload is invalid")
+	}
+	seen := make(map[string]struct{}, len(payload.ObjectPaths))
+	requests := make([]attachmentstorage.ObjectRequest, 0, len(payload.ObjectPaths))
+	for _, objectPath := range payload.ObjectPaths {
+		if _, duplicate := seen[objectPath]; duplicate {
+			return errors.New("source attachment cleanup payload contains a duplicate path")
+		}
+		request := attachmentstorage.ObjectRequest{UserID: job.UserID, SourceID: sourceID, ObjectPath: objectPath}
+		if err := attachmentstorage.ValidateObjectRequest(request); err != nil {
+			return fmt.Errorf("validate source attachment cleanup path: %w", err)
+		}
+		seen[objectPath] = struct{}{}
+		requests = append(requests, request)
+	}
+	if err := h.CleanupAttachments.Delete(ctx, requests); err != nil {
+		return fmt.Errorf("delete source attachments: %w", err)
+	}
+	return nil
 }
 
 func (h Handler) handleSourceParse(ctx context.Context, job jobs.Job) error {
@@ -62,20 +112,53 @@ func (h Handler) handleSourceParse(ctx context.Context, job jobs.Job) error {
 	if err != nil {
 		return fmt.Errorf("load source for parsing: %w", err)
 	}
-	matchedRule, hasRule := parserrules.MatchAndApply(input.Sender, input.NormalizedContent, input.Rules)
+	matchedRule, hasRule, ruleErr := parserrules.MatchAndApply(input.Sender, input.NormalizedContent, input.Rules)
+	matchedUserRule, hasUserRule, userRuleErr := parserrules.MatchUserRule(input.Sender, input.Subject, input.Content, input.UserRules)
+	components := promptComponents(input.DefaultInstructions, input.DefaultInstructionsVersion, matchedRule, hasRule, matchedUserRule, hasUserRule)
+	encodedComponents, _ := json.Marshal(components)
+	assembledPrompt := providers.AssembleParserSystemPrompt(providers.ParserPromptFragments{
+		GlobalRule: matchedRule.PromptFragment, DefaultUser: input.DefaultInstructions,
+		UserSourceRule: matchedUserRule.PromptFragment,
+	})
+	audit := transactionstore.SourceParseAudit{
+		SourceID: sourceID, Model: "qwen3.8-flash", AssembledSystemPrompt: assembledPrompt,
+		NormalizedInput: input.NormalizedContent, PromptComponents: encodedComponents,
+		RuleID: ruleID(matchedRule, hasRule), RuleVersion: ruleVersion(matchedRule, hasRule),
+		UserRuleID: userRuleID(matchedUserRule, hasUserRule), UserRuleVersion: userRuleVersion(matchedUserRule, hasUserRule),
+	}
+	if ruleErr != nil || userRuleErr != nil {
+		configurationErr := errors.Join(ruleErr, userRuleErr)
+		if recordErr := h.Repository.RecordFailedSourceParse(ctx, job.UserID, audit, configurationErr); recordErr != nil {
+			return fmt.Errorf("record parser configuration failure: %w", recordErr)
+		}
+		// Retrying cannot help until the conflicting settings are changed.
+		return nil
+	}
 	attachments, usage, err := h.loadParseAttachments(ctx, job.UserID, sourceID, input.Attachments)
 	if err != nil {
+		audit.AttachmentUsage = usage
+		if recordErr := h.Repository.RecordFailedSourceParse(ctx, job.UserID, audit, err); recordErr != nil {
+			return fmt.Errorf("record attachment loading failure: %w", recordErr)
+		}
 		return fmt.Errorf("load parse attachments: %w", err)
 	}
-	modelResult, err := h.Parser.ParseTransactionEvidence(ctx, input.NormalizedContent, attachments)
+	audit.AttachmentUsage = usage
+	modelResult, err := h.Parser.ParseTransactionEvidence(ctx, assembledPrompt, input.NormalizedContent, attachments)
+	if modelResult.Model != "" {
+		audit.Model = modelResult.Model
+	}
+	audit.ProviderRequest = jsonObjectAudit(modelResult.ProviderRequest, "raw_request")
+	audit.ProviderResponse = jsonObjectAudit(modelResult.ProviderResponse, "raw_response")
+	audit.ModelOutput = jsonObjectAudit(modelResult.JSON, "raw_model_output")
 	if err != nil {
-		if recordErr := h.Repository.RecordFailedSourceParse(ctx, job.UserID, sourceID, "qwen3.8-flash", err); recordErr != nil {
+		if recordErr := h.Repository.RecordFailedSourceParse(ctx, job.UserID, audit, err); recordErr != nil {
 			return fmt.Errorf("record parser failure: %w", recordErr)
 		}
 		return fmt.Errorf("parse source: %w", err)
 	}
 	parsed, err := reconciliation.DecodeParsedResponseForRuleApplication(modelResult.JSON)
 	if err == nil {
+		reconciliation.DiscardInvalidOptionalCategoryCitation(&parsed)
 		// Model citations can only point at source content; rule: paths are
 		// introduced below by trusted server code.
 		err = reconciliation.ValidateEvidenceEntries(parsed)
@@ -101,20 +184,47 @@ func (h Handler) handleSourceParse(ctx context.Context, job jobs.Job) error {
 		}
 	}
 	if err != nil {
-		if recordErr := h.Repository.RecordInvalidSourceParse(ctx, job.UserID, sourceID, modelResult.Model, modelResult.JSON, err); recordErr != nil {
+		if recordErr := h.Repository.RecordInvalidSourceParse(ctx, job.UserID, audit, err); recordErr != nil {
 			return fmt.Errorf("record invalid parser result: %w", recordErr)
 		}
 		return nil
 	}
 	if err := h.Repository.SaveParsedSource(ctx, job.UserID, transactionstore.ParsedSourceResult{
-		SourceID: sourceID, SyncRunID: job.SyncRunID, Model: modelResult.Model,
-		ParsedResponse: parsed, RawResponse: canonicalParsedJSON(parsed), AttachmentUsage: usage,
+		SourceParseAudit: audit, SyncRunID: job.SyncRunID,
+		ParsedResponse: parsed, ParsedCandidate: canonicalParsedJSON(parsed),
 		AutoEligible: parsed.Candidate.AutoEligible,
-		RuleID:       ruleID(matchedRule, hasRule), RuleVersion: ruleVersion(matchedRule, hasRule),
 	}); err != nil {
 		return fmt.Errorf("persist parsed source: %w", err)
 	}
 	return nil
+}
+
+func promptComponents(defaultInstructions string, defaultVersion int, global parserrules.AppliedRule, hasGlobal bool, user parserrules.UserRule, hasUser bool) transactionstore.PromptComponents {
+	result := transactionstore.PromptComponents{Platform: transactionstore.PromptComponent{
+		ID: "wealth-builder-transaction-parser", Version: providers.ParserPlatformPromptVersion, Content: providers.ParserPlatformPrompt(),
+	}}
+	if hasGlobal {
+		result.GlobalRule = &transactionstore.PromptComponent{ID: global.ID, Version: global.Version, Content: global.PromptFragment}
+	}
+	if strings.TrimSpace(defaultInstructions) != "" {
+		result.UserDefault = &transactionstore.PromptComponent{ID: "user-parser-settings", Version: defaultVersion, Content: strings.TrimSpace(defaultInstructions)}
+	}
+	if hasUser {
+		result.UserSourceRule = &transactionstore.PromptComponent{ID: user.ID, Name: user.Name, Version: user.Version, Content: strings.TrimSpace(user.PromptFragment)}
+	}
+	return result
+}
+
+func jsonObjectAudit(raw []byte, fallbackField string) json.RawMessage {
+	if len(raw) == 0 {
+		return nil
+	}
+	var object map[string]json.RawMessage
+	if json.Unmarshal(raw, &object) == nil && object != nil {
+		return append(json.RawMessage(nil), raw...)
+	}
+	encoded, _ := json.Marshal(map[string]string{fallbackField: string(raw)})
+	return encoded
 }
 
 func (h Handler) loadParseAttachments(ctx context.Context, userID, sourceID uuid.UUID, metadata []transactionstore.SourceAttachment) ([]providers.AttachmentInput, []transactionstore.AttachmentUsage, error) {
@@ -172,6 +282,20 @@ func ruleID(rule parserrules.AppliedRule, present bool) string {
 	return rule.ID
 }
 func ruleVersion(rule parserrules.AppliedRule, present bool) int {
+	if !present {
+		return 0
+	}
+	return rule.Version
+}
+
+func userRuleID(rule parserrules.UserRule, present bool) string {
+	if !present {
+		return ""
+	}
+	return rule.ID
+}
+
+func userRuleVersion(rule parserrules.UserRule, present bool) int {
 	if !present {
 		return 0
 	}

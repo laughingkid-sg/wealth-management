@@ -3,10 +3,12 @@ package attachmentstorage
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"testing"
 
@@ -183,6 +185,49 @@ func TestClientDownloadsAndSignsOnlyOwnedAttachment(t *testing.T) {
 	request.ObjectPath = userID.String() + "/other-source/receipt.pdf"
 	if _, err := client.Download(context.Background(), request); err == nil {
 		t.Fatal("cross-source download was accepted")
+	}
+}
+
+func TestClientDeletesOwnedSourceObjectsInOneStorageRequest(t *testing.T) {
+	userID, sourceID := uuid.New(), uuid.New()
+	paths := []string{
+		userID.String() + "/" + sourceID.String() + "/a.png",
+		userID.String() + "/" + sourceID.String() + "/b.pdf",
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete || r.URL.Path != "/storage/v1/object/"+Bucket {
+			t.Fatalf("unexpected delete request %s %s", r.Method, r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer service-secret" || r.Header.Get("apikey") != "service-secret" {
+			t.Fatal("delete request omitted server-only authorization")
+		}
+		var body struct {
+			Prefixes []string `json:"prefixes"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(body.Prefixes, paths) {
+			t.Fatalf("prefixes = %#v, want %#v", body.Prefixes, paths)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	base, _ := url.Parse(server.URL)
+	client, err := New(server.Client(), base, "service-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	requests := make([]ObjectRequest, 0, len(paths))
+	for _, path := range paths {
+		requests = append(requests, ObjectRequest{UserID: userID, SourceID: sourceID, ObjectPath: path})
+	}
+	if err = client.Delete(context.Background(), requests); err != nil {
+		t.Fatal(err)
+	}
+	requests[1].SourceID = uuid.New()
+	if err = client.Delete(context.Background(), requests); err == nil {
+		t.Fatal("cross-source delete path was accepted")
 	}
 }
 

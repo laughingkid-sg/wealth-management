@@ -17,9 +17,10 @@ const DefaultLeaseHeartbeatInterval = time.Minute
 type Kind string
 
 const (
-	KindGmailIngest Kind = "gmail_ingestion"
-	KindSourceParse Kind = "source_parsing"
-	KindReconcile   Kind = "reconciliation"
+	KindGmailIngest             Kind = "gmail_ingestion"
+	KindSourceParse             Kind = "source_parsing"
+	KindReconcile               Kind = "reconciliation"
+	KindSourceAttachmentCleanup Kind = "source_attachment_cleanup"
 )
 
 type Job struct {
@@ -31,6 +32,14 @@ type Job struct {
 	Attempts   int
 	Available  time.Time
 	LeaseUntil *time.Time
+}
+
+// SourceAttachmentCleanupPayload is persisted in the durable job row before
+// its source is deleted. The row's UserID is the owner; SourceID plus these
+// exact paths are retained only until Storage cleanup succeeds.
+type SourceAttachmentCleanupPayload struct {
+	SourceID    string   `json:"source_id"`
+	ObjectPaths []string `json:"object_paths"`
 }
 
 // Store implementations must claim jobs atomically in a short SQL transaction using row locks.

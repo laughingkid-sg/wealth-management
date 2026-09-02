@@ -96,6 +96,9 @@ func (s *Store) CreateSyncRun(ctx context.Context, userID uuid.UUID, allowDevelo
 		return SyncRun{}, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if err = lockTransactionUser(ctx, tx, userID); err != nil {
+		return SyncRun{}, err
+	}
 	var activeRun bool
 	if err = tx.QueryRow(ctx, `select exists(select 1 from public.transaction_sync_runs where user_id = $1 and status in ('queued', 'running'))`, userID).Scan(&activeRun); err != nil {
 		return SyncRun{}, err
@@ -266,6 +269,22 @@ func (s *Store) StoreIngestedSource(ctx context.Context, source IngestedSource) 
 		return uuid.Nil, false, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if err = lockTransactionUser(ctx, tx, source.UserID); err != nil {
+		return uuid.Nil, false, err
+	}
+	digest := sourceProviderIdentityDigest("gmail_email", "gmail", source.ProviderMessageID)
+	var permanentlyDeleted bool
+	if err = tx.QueryRow(ctx, `
+		select exists(
+			select 1 from private.deleted_provider_messages
+			where user_id = $1 and source_type = 'gmail_email' and provider = 'gmail'
+				and provider_message_digest = $2
+		)`, source.UserID, digest[:]).Scan(&permanentlyDeleted); err != nil {
+		return uuid.Nil, false, err
+	}
+	if permanentlyDeleted {
+		return uuid.Nil, false, ErrSourcePermanentlyDeleted
+	}
 	var id uuid.UUID
 	err = tx.QueryRow(ctx, `
 			insert into private.data_sources (
@@ -447,6 +466,32 @@ func (s *Store) Complete(ctx context.Context, jobID uuid.UUID, workerID string) 
 	defer func() { _ = tx.Rollback(ctx) }()
 	var userID uuid.UUID
 	var syncRunID *uuid.UUID
+	var kind jobs.Kind
+	err = tx.QueryRow(ctx, `
+		select user_id, sync_run_id, job_type
+		from private.transaction_jobs
+		where id = $1 and status = 'running' and leased_by = $2
+			and lease_expires_at > now()
+		for update`, jobID, workerID).Scan(&userID, &syncRunID, &kind)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("%w: job %s is not running for this worker", jobs.ErrLeaseLost, jobID)
+	}
+	if err != nil {
+		return err
+	}
+	if kind == jobs.KindSourceAttachmentCleanup {
+		command, deleteErr := tx.Exec(ctx, `
+			delete from private.transaction_jobs
+			where id = $1 and status = 'running' and leased_by = $2
+				and lease_expires_at > now()`, jobID, workerID)
+		if deleteErr != nil {
+			return deleteErr
+		}
+		if command.RowsAffected() != 1 {
+			return fmt.Errorf("%w: cleanup job %s is not running for this worker", jobs.ErrLeaseLost, jobID)
+		}
+		return tx.Commit(ctx)
+	}
 	err = tx.QueryRow(ctx, `
 		update private.transaction_jobs
 		set status = 'completed', completed_at = now(), leased_at = null,

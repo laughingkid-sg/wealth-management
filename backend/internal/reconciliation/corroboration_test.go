@@ -24,7 +24,7 @@ func TestReconcileBlocksAutomaticActionsWhenIneligible(t *testing.T) {
 	candidate := validCandidate(time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC))
 	candidate.AccountEvidence.CardLastFour = "1234"
 	candidate.AutoEligible = false
-	decision, err := Reconcile(candidate, []AccountIdentity{{ID: "account", UserID: "user-1", CardLastFour: "1234"}}, nil)
+	decision, err := Reconcile(candidate, []AccountIdentity{accountIdentity("account", "user-1", "card_last_four", "1234")}, nil)
 	if err != nil || decision.Outcome != OutcomeReview {
 		t.Fatalf("create gate = %#v, %v", decision, err)
 	}

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -87,6 +89,272 @@ func TestCreateSyncRunPersistsJSONWithProductionQueryMode(t *testing.T) {
 	}
 }
 
+func TestStageSourceDeletionQueuesCleanupPreventsReingestAndRemovesSuccessfulOutbox(t *testing.T) {
+	databaseURL := os.Getenv("TRANSACTIONSTORE_TEST_DB_URL")
+	if databaseURL == "" {
+		t.Skip("TRANSACTIONSTORE_TEST_DB_URL is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	pool, err := database.OpenTransactionPooler(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	userID, accountID, sourceID, transactionID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	providerMessageID := "permanently-deleted-" + sourceID.String()
+	objectPath := userID.String() + "/" + sourceID.String() + "/receipt.pdf"
+	if _, err = pool.Exec(ctx, `insert into auth.users (id, email) values ($1, $2)`, userID, "delete-"+userID.String()+"@example.test"); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		_, _ = pool.Exec(cleanupContext, `delete from auth.users where id = $1`, userID)
+	}()
+	if _, err = pool.Exec(ctx, `
+		insert into public.accounts (id, user_id, side, account_type, name, institution_name)
+		values ($1, $2, 'asset', 'bank_account', 'Current', 'Bank')`, accountID, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `
+		insert into public.transactions (
+			id, user_id, account_id, transaction_kind, title,
+			original_amount_minor, original_currency, occurred_at, creation_method
+		) values ($1, $2, $3, 'debit', 'Automatic receipt', 100, 'SGD', now(), 'automatic_source')`,
+		transactionID, userID, accountID); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(map[string]any{"attachments": []map[string]any{{
+		"object_path": objectPath, "storage_status": "stored", "filename": "receipt.pdf",
+	}}})
+	if _, err = pool.Exec(ctx, `
+		insert into private.data_sources (
+			id, user_id, source_type, provider, provider_message_id, received_at, raw_data, parse_status
+		) values ($1, $2, 'gmail_email', 'gmail', $3, now(), $4::jsonb, 'parsed')`,
+		sourceID, userID, providerMessageID, string(raw)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `
+		insert into private.transaction_data_sources
+			(user_id, transaction_id, data_source_id, role, matched_by)
+		values ($1, $2, $3, 'merchant_receipt', 'automatic')`, userID, transactionID, sourceID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `
+		insert into private.source_parse_attempts
+			(user_id, data_source_id, validation_status)
+		values ($1, $2, 'valid')`, userID, sourceID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `
+		insert into private.transaction_jobs (user_id, data_source_id, job_type)
+		values ($1, $2, 'reconciliation')`, userID, sourceID); err != nil {
+		t.Fatal(err)
+	}
+
+	store := New(pool)
+	result, err := store.StageSourceDeletion(ctx, userID, sourceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "cleanup_pending" || !result.CleanupPending {
+		t.Fatalf("deletion result = %#v", result)
+	}
+	for name, query := range map[string]string{
+		"source":      `select count(*) from private.data_sources where user_id = $1 and id = $2`,
+		"parse audit": `select count(*) from private.source_parse_attempts where user_id = $1 and data_source_id = $2`,
+		"source link": `select count(*) from private.transaction_data_sources where user_id = $1 and data_source_id = $2`,
+		"transaction": `select count(*) from public.transactions where user_id = $1 and id = $2`,
+	} {
+		var count int
+		identifier := sourceID
+		if name == "transaction" {
+			identifier = transactionID
+		}
+		if err = pool.QueryRow(ctx, query, userID, identifier).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Fatalf("%s count = %d, want 0", name, count)
+		}
+	}
+	var cleanupJobID uuid.UUID
+	var cleanupPayload []byte
+	if err = pool.QueryRow(ctx, `
+		select id, payload from private.transaction_jobs
+		where user_id = $1 and job_type = 'source_attachment_cleanup'`, userID).Scan(&cleanupJobID, &cleanupPayload); err != nil {
+		t.Fatal(err)
+	}
+	var payload jobs.SourceAttachmentCleanupPayload
+	if err = json.Unmarshal(cleanupPayload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.SourceID != sourceID.String() || len(payload.ObjectPaths) != 1 || payload.ObjectPaths[0] != objectPath {
+		t.Fatalf("cleanup payload = %#v", payload)
+	}
+	_, _, err = store.StoreIngestedSource(ctx, IngestedSource{
+		UserID: userID, SyncRunID: uuid.New(), ProviderMessageID: providerMessageID,
+		ReceivedAt: time.Now(), RawData: json.RawMessage(`{}`),
+	})
+	if !errors.Is(err, ErrSourcePermanentlyDeleted) {
+		t.Fatalf("reingest error = %v", err)
+	}
+	if _, err = pool.Exec(ctx, `
+		update private.transaction_jobs
+		set status = 'running', attempts = 1, leased_at = now(),
+			lease_expires_at = now() + interval '5 minutes', leased_by = 'cleanup-test'
+		where id = $1`, cleanupJobID); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Retry(ctx, cleanupJobID, "cleanup-test", 1, time.Now().Add(time.Second), "storage unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	var retryStatus string
+	var retainedPayload []byte
+	if err = pool.QueryRow(ctx, `
+		select status, payload from private.transaction_jobs where id = $1`, cleanupJobID).Scan(&retryStatus, &retainedPayload); err != nil {
+		t.Fatal(err)
+	}
+	if retryStatus != "queued" || string(retainedPayload) != string(cleanupPayload) {
+		t.Fatalf("retry status=%q payload retained=%t", retryStatus, string(retainedPayload) == string(cleanupPayload))
+	}
+	if _, err = pool.Exec(ctx, `
+		update private.transaction_jobs
+		set status = 'running', attempts = 2, leased_at = now(),
+			lease_expires_at = now() + interval '5 minutes', leased_by = 'cleanup-test'
+		where id = $1`, cleanupJobID); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Complete(ctx, cleanupJobID, "cleanup-test"); err != nil {
+		t.Fatal(err)
+	}
+	var cleanupRows int
+	if err = pool.QueryRow(ctx, `select count(*) from private.transaction_jobs where id = $1`, cleanupJobID).Scan(&cleanupRows); err != nil {
+		t.Fatal(err)
+	}
+	if cleanupRows != 0 {
+		t.Fatalf("successful cleanup retained %d outbox rows", cleanupRows)
+	}
+}
+
+func TestStageSourceDeletionConflictsWithActiveGmailIngestion(t *testing.T) {
+	databaseURL := os.Getenv("TRANSACTIONSTORE_TEST_DB_URL")
+	if databaseURL == "" {
+		t.Skip("TRANSACTIONSTORE_TEST_DB_URL is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	pool, err := database.OpenTransactionPooler(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	userID, sourceID := uuid.New(), uuid.New()
+	if _, err = pool.Exec(ctx, `insert into auth.users (id, email) values ($1, $2)`, userID, "delete-conflict-"+userID.String()+"@example.test"); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		_, _ = pool.Exec(cleanupContext, `delete from auth.users where id = $1`, userID)
+	}()
+	if _, err = pool.Exec(ctx, `
+		insert into private.data_sources
+			(id, user_id, source_type, provider, provider_message_id, received_at, raw_data)
+		values ($1, $2, 'gmail_email', 'gmail', $3, now(), '{}')`, sourceID, userID, "active-"+sourceID.String()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `
+		insert into private.transaction_jobs (user_id, job_type)
+		values ($1, 'gmail_ingestion')`, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = New(pool).StageSourceDeletion(ctx, userID, sourceID); !errors.Is(err, ErrSourceDeletionIngestionActive) {
+		t.Fatalf("StageSourceDeletion() error = %v", err)
+	}
+	var sourceRows int
+	if err = pool.QueryRow(ctx, `select count(*) from private.data_sources where user_id = $1 and id = $2`, userID, sourceID).Scan(&sourceRows); err != nil {
+		t.Fatal(err)
+	}
+	if sourceRows != 1 {
+		t.Fatalf("conflicting deletion changed source count to %d", sourceRows)
+	}
+}
+
+func TestSourceParseDebugCapsAttemptsAndLargeFields(t *testing.T) {
+	databaseURL := os.Getenv("TRANSACTIONSTORE_TEST_DB_URL")
+	if databaseURL == "" {
+		t.Skip("TRANSACTIONSTORE_TEST_DB_URL is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	pool, err := database.OpenTransactionPooler(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	userID, sourceID := uuid.New(), uuid.New()
+	if _, err = pool.Exec(ctx, `insert into auth.users (id, email) values ($1, $2)`, userID, "debug-cap-"+userID.String()+"@example.test"); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		_, _ = pool.Exec(cleanupContext, `delete from auth.users where id = $1`, userID)
+	}()
+	if _, err = pool.Exec(ctx, `
+		insert into private.data_sources
+			(id, user_id, source_type, provider, provider_message_id, received_at, raw_data)
+		values ($1, $2, 'gmail_email', 'gmail', $3, now(), '{}')`, sourceID, userID, "debug-"+sourceID.String()); err != nil {
+		t.Fatal(err)
+	}
+	largeJSON, _ := json.Marshal(map[string]string{"payload": strings.Repeat("x", sourceDebugFieldCharacterLimit+200)})
+	var newestAttemptID uuid.UUID
+	for index := 0; index < sourceDebugAttemptLimit+1; index++ {
+		attemptID := uuid.New()
+		if index == sourceDebugAttemptLimit {
+			newestAttemptID = attemptID
+		}
+		if _, err = pool.Exec(ctx, `
+			insert into private.source_parse_attempts
+				(id, user_id, data_source_id, provider_request, validation_status, created_at)
+			values ($1, $2, $3, $4::json, 'valid', $5)`, attemptID, userID, sourceID, string(largeJSON), time.Now().Add(time.Duration(index)*time.Millisecond)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	debug, err := New(pool).GetSourceParseDebug(ctx, userID, sourceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(debug.Attempts) != sourceDebugAttemptLimit || !debug.HasMore || !debug.Truncated {
+		t.Fatalf("debug bounds = attempts %d has_more %t truncated %t", len(debug.Attempts), debug.HasMore, debug.Truncated)
+	}
+	for _, attempt := range debug.Attempts {
+		if attempt.ProviderRequest == nil || len(*attempt.ProviderRequest) > sourceDebugFieldCharacterLimit ||
+			!slices.Contains(attempt.TruncatedFields, "provider_request") {
+			t.Fatalf("attempt was not safely truncated: %#v", attempt)
+		}
+	}
+	exact, err := New(pool).GetSourceParseAuditField(ctx, userID, sourceID, newestAttemptID, "provider_request")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exact.Value == nil || *exact.Value != string(largeJSON) || exact.MaxBytes != 10485760 {
+		t.Fatalf("exact field = value bytes %d max %d", len(valueOrEmpty(exact.Value)), exact.MaxBytes)
+	}
+	if _, err = New(pool).GetSourceParseAuditField(ctx, userID, sourceID, newestAttemptID, "account_catalog"); !errors.Is(err, ErrSourceDebugFieldUnsupported) {
+		t.Fatalf("unsupported exact field error = %v", err)
+	}
+}
+
+func valueOrEmpty(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
 func TestSourcePipelinePersistsJSONWithProductionQueryMode(t *testing.T) {
 	databaseURL := os.Getenv("TRANSACTIONSTORE_TEST_DB_URL")
 	if databaseURL == "" {
@@ -129,9 +397,10 @@ func TestSourcePipelinePersistsJSONWithProductionQueryMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err = store.SaveParsedSource(ctx, userID, ParsedSourceResult{
-		SourceID: sourceID, SyncRunID: &runID, Model: "test-model",
-		ParsedResponse: reconciliation.ParsedResponse{Candidate: reconciliation.Candidate{Confidence: 0.75}},
-		RawResponse:    json.RawMessage(`{"candidate":{},"evidence":[]}`), AutoEligible: true,
+		SourceParseAudit: SourceParseAudit{SourceID: sourceID, Model: "test-model", PromptComponents: json.RawMessage(`{}`)},
+		SyncRunID:        &runID,
+		ParsedResponse:   reconciliation.ParsedResponse{Candidate: reconciliation.Candidate{Confidence: 0.75}},
+		ParsedCandidate:  json.RawMessage(`{"candidate":{},"evidence":[]}`), AutoEligible: true,
 	}); err != nil {
 		t.Fatal(err)
 	}

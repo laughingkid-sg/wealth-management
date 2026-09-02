@@ -54,6 +54,46 @@ type ObjectRequest struct {
 	ObjectPath string
 }
 
+// Delete removes all supplied owned-source objects in one Storage API call.
+// A bulk call avoids committing a partially deleted attachment set client-side.
+func (c *Client) Delete(ctx context.Context, requests []ObjectRequest) error {
+	if len(requests) == 0 {
+		return nil
+	}
+	if len(requests) > 1000 {
+		return errors.New("too many attachment objects to delete")
+	}
+	paths := make([]string, 0, len(requests))
+	for _, request := range requests {
+		if err := c.validateObjectRequest(request); err != nil {
+			return err
+		}
+		paths = append(paths, request.ObjectPath)
+	}
+	body, err := json.Marshal(map[string][]string{"prefixes": paths})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.deleteURL(), bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("create attachment delete request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.serviceKey)
+	req.Header.Set("apikey", c.serviceKey)
+	req.Header.Set("Content-Type", "application/json")
+	response, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("send attachment delete request: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+		return &HTTPStatusError{operation: "deletion", StatusCode: response.StatusCode}
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+	return nil
+}
+
 // HTTPStatusError preserves only the safe HTTP status needed for operational
 // classification. Provider response bodies and object paths are never retained.
 type HTTPStatusError struct {
@@ -256,15 +296,30 @@ func (c *Client) signURL(objectPath string) string {
 	return base.String()
 }
 
+func (c *Client) deleteURL() string {
+	base := *c.baseURL
+	base.Path = strings.TrimRight(base.Path, "/") + "/storage/v1/object/" + Bucket
+	base.RawPath = ""
+	return base.String()
+}
+
 func (c *Client) validateObjectRequest(request ObjectRequest) error {
 	if c == nil || c.httpClient == nil || c.baseURL == nil || strings.TrimSpace(c.serviceKey) == "" {
 		return errors.New("attachment storage client is not configured")
 	}
+	return ValidateObjectRequest(request)
+}
+
+// ValidateObjectRequest enforces the owner/source prefix independently of a
+// configured client. Durable cleanup workers use it before making any Storage
+// request so a malformed outbox payload can never address another source.
+func ValidateObjectRequest(request ObjectRequest) error {
 	if request.UserID == uuid.Nil || request.SourceID == uuid.Nil {
 		return errors.New("attachment storage requires user and source IDs")
 	}
 	prefix := request.UserID.String() + "/" + request.SourceID.String() + "/"
-	if !strings.HasPrefix(request.ObjectPath, prefix) || strings.Contains(request.ObjectPath, "..") {
+	if !strings.HasPrefix(request.ObjectPath, prefix) || len(request.ObjectPath) <= len(prefix) ||
+		strings.Contains(request.ObjectPath, "..") || strings.ContainsAny(request.ObjectPath, "\r\n\x00") {
 		return errors.New("attachment object path is outside the owned source")
 	}
 	return nil

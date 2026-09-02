@@ -52,6 +52,22 @@ type repositoryStub struct {
 	retriedSourceID   uuid.UUID
 	patchedID         uuid.UUID
 	patch             transactionstore.TransactionPatch
+	settings          transactionstore.TransactionSettings
+	defaultSaved      transactionstore.DefaultParserInstructions
+	rule              transactionstore.UserSourceParserRule
+	ruleInput         transactionstore.UserSourceParserRuleInput
+	ruleID            uuid.UUID
+	matchingKey       transactionstore.AccountMatchingKey
+	matchingKeyInput  transactionstore.AccountMatchingKeyInput
+	matchingKeyID     uuid.UUID
+	matchingKeyActive bool
+	debug             transactionstore.SourceParseDebug
+	debugField        transactionstore.SourceParseAuditField
+	debugSourceID     uuid.UUID
+	debugAttemptID    uuid.UUID
+	debugFieldName    string
+	deletionResult    transactionstore.SourceDeletionResult
+	stagedSourceID    uuid.UUID
 }
 
 type attachmentSignerStub struct {
@@ -59,11 +75,17 @@ type attachmentSignerStub struct {
 	expires int
 	url     string
 	err     error
+	deleted []attachmentstorage.ObjectRequest
 }
 
 func (s *attachmentSignerStub) SignURL(_ context.Context, request attachmentstorage.ObjectRequest, expires int) (string, error) {
 	s.request, s.expires = request, expires
 	return s.url, s.err
+}
+
+func (s *attachmentSignerStub) Delete(_ context.Context, requests []attachmentstorage.ObjectRequest) error {
+	s.deleted = append([]attachmentstorage.ObjectRequest(nil), requests...)
+	return s.err
 }
 
 type oauthStub struct {
@@ -133,6 +155,44 @@ func (r *repositoryStub) PatchTransaction(_ context.Context, _ uuid.UUID, transa
 func (r *repositoryStub) CreateInternalTransfer(_ context.Context, _ uuid.UUID, input transactionstore.InternalTransferInput) (transactionstore.InternalTransfer, error) {
 	r.transferInput = input
 	return r.transfer, r.actionErr
+}
+func (r *repositoryStub) GetTransactionSettings(context.Context, uuid.UUID) (transactionstore.TransactionSettings, error) {
+	return r.settings, r.actionErr
+}
+func (r *repositoryStub) PutDefaultParserInstructions(_ context.Context, _ uuid.UUID, instructions string) (transactionstore.DefaultParserInstructions, error) {
+	r.defaultSaved.DefaultInstructions = instructions
+	return r.defaultSaved, r.actionErr
+}
+func (r *repositoryStub) CreateUserSourceParserRule(_ context.Context, _ uuid.UUID, input transactionstore.UserSourceParserRuleInput) (transactionstore.UserSourceParserRule, error) {
+	r.ruleInput = input
+	return r.rule, r.actionErr
+}
+func (r *repositoryStub) UpdateUserSourceParserRule(_ context.Context, _ uuid.UUID, ruleID uuid.UUID, input transactionstore.UserSourceParserRuleInput) (transactionstore.UserSourceParserRule, error) {
+	r.ruleID, r.ruleInput = ruleID, input
+	return r.rule, r.actionErr
+}
+func (r *repositoryStub) RetireUserSourceParserRule(_ context.Context, _ uuid.UUID, ruleID uuid.UUID) error {
+	r.ruleID = ruleID
+	return r.actionErr
+}
+func (r *repositoryStub) CreateAccountMatchingKey(_ context.Context, _ uuid.UUID, input transactionstore.AccountMatchingKeyInput) (transactionstore.AccountMatchingKey, error) {
+	r.matchingKeyInput = input
+	return r.matchingKey, r.actionErr
+}
+func (r *repositoryStub) SetAccountMatchingKeyActive(_ context.Context, _ uuid.UUID, keyID uuid.UUID, active bool) (transactionstore.AccountMatchingKey, error) {
+	r.matchingKeyID, r.matchingKeyActive = keyID, active
+	return r.matchingKey, r.actionErr
+}
+func (r *repositoryStub) GetSourceParseDebug(context.Context, uuid.UUID, uuid.UUID) (transactionstore.SourceParseDebug, error) {
+	return r.debug, r.actionErr
+}
+func (r *repositoryStub) GetSourceParseAuditField(_ context.Context, _ uuid.UUID, sourceID, attemptID uuid.UUID, field string) (transactionstore.SourceParseAuditField, error) {
+	r.debugSourceID, r.debugAttemptID, r.debugFieldName = sourceID, attemptID, field
+	return r.debugField, r.actionErr
+}
+func (r *repositoryStub) StageSourceDeletion(_ context.Context, _ uuid.UUID, sourceID uuid.UUID) (transactionstore.SourceDeletionResult, error) {
+	r.stagedSourceID = sourceID
+	return r.deletionResult, r.actionErr
 }
 
 func TestCreateSyncRunReturnsAcceptedForVerifiedUser(t *testing.T) {
@@ -643,7 +703,220 @@ func TestCreateInternalTransferRejectsSameAccountBeforeStore(t *testing.T) {
 	}
 }
 
-func authenticatedMux(t *testing.T, repository Repository, userID uuid.UUID, signers ...AttachmentSigner) *http.ServeMux {
+func TestTransactionSettingsCRUDUsesStrictValidatedContracts(t *testing.T) {
+	userID, ruleID, accountID, keyID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	active := true
+	repository := &repositoryStub{
+		settings:     transactionstore.TransactionSettings{DefaultInstructions: "existing", DefaultInstructionsVersion: 2},
+		defaultSaved: transactionstore.DefaultParserInstructions{DefaultInstructionsVersion: 3},
+		rule:         transactionstore.UserSourceParserRule{ID: ruleID, Name: "FairPrice", Provider: "gmail", SenderMatchType: "domain", SenderMatchValue: "fairprice.com.sg", Active: true, Version: 1},
+		matchingKey:  transactionstore.AccountMatchingKey{ID: keyID, AccountID: accountID, AccountName: "Card", KeyType: "card_last_four", DisplayValue: "•••• 2562", NormalizedValue: "2562", Active: true},
+	}
+	mux := authenticatedMux(t, repository, userID)
+
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/v1/transactions/settings", nil)
+	request.Header.Set("Authorization", "Bearer valid")
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"default_instructions_version":2`) {
+		t.Fatalf("settings response = %d %s", response.Code, response.Body.String())
+	}
+
+	response = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodPut, "/v1/transactions/settings/default-instructions", strings.NewReader(`{"default_instructions":" explicit facts "}`))
+	request.Header.Set("Authorization", "Bearer valid")
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || repository.defaultSaved.DefaultInstructions != "explicit facts" || !strings.Contains(response.Body.String(), `"default_instructions_version":3`) {
+		t.Fatalf("default response=%d %s saved=%#v", response.Code, response.Body.String(), repository.defaultSaved)
+	}
+
+	rulePayload, _ := json.Marshal(sourceRuleRequest{
+		Name: "FairPrice", Provider: "gmail", SenderMatchType: "domain",
+		SenderMatchValue: "@FairPrice.com.sg", SubjectMatcher: stringPointer(`(?i)app receipt`),
+		ContentMatcher: stringPointer(`Mastercard`), PromptFragment: "receipt guidance",
+		Priority: 100, Active: &active,
+	})
+	response = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodPost, "/v1/transactions/settings/source-rules", bytes.NewReader(rulePayload))
+	request.Header.Set("Authorization", "Bearer valid")
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated || repository.ruleInput.SenderMatchValue != "fairprice.com.sg" || repository.ruleInput.SubjectMatcher == nil {
+		t.Fatalf("source rule response=%d %s input=%#v", response.Code, response.Body.String(), repository.ruleInput)
+	}
+
+	response = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodPost, "/v1/transactions/settings/matching-keys", strings.NewReader(fmt.Sprintf(`{"account_id":%q,"key_type":"card_last_four","display_value":"•••• 2562"}`, accountID)))
+	request.Header.Set("Authorization", "Bearer valid")
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated || repository.matchingKeyInput.DisplayValue != "•••• 2562" {
+		t.Fatalf("matching key response=%d %s input=%#v", response.Code, response.Body.String(), repository.matchingKeyInput)
+	}
+
+	response = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodPatch, "/v1/transactions/settings/matching-keys/"+keyID.String(), strings.NewReader(`{"active":false}`))
+	request.Header.Set("Authorization", "Bearer valid")
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || repository.matchingKeyID != keyID || repository.matchingKeyActive {
+		t.Fatalf("matching key patch=%d %s id=%s active=%t", response.Code, response.Body.String(), repository.matchingKeyID, repository.matchingKeyActive)
+	}
+}
+
+func TestSourceRuleAndMatchingKeyValidationRejectUnsafeConfiguration(t *testing.T) {
+	tests := []struct {
+		name, method, path, body string
+	}{
+		{name: "invalid sender regex", method: http.MethodPost, path: "/v1/transactions/settings/source-rules", body: `{"name":"bad","provider":"gmail","sender_match_type":"regex","sender_match_value":"(","prompt_fragment":"","priority":0,"active":true}`},
+		{name: "invalid content regex", method: http.MethodPost, path: "/v1/transactions/settings/source-rules", body: `{"name":"bad","provider":"gmail","sender_match_type":"domain","sender_match_value":"example.test","content_matcher":"(?<=lookbehind)","prompt_fragment":"","priority":0,"active":true}`},
+		{name: "full PAN", method: http.MethodPost, path: "/v1/transactions/settings/matching-keys", body: fmt.Sprintf(`{"account_id":%q,"key_type":"card_last_four","display_value":"5555444433332562"}`, uuid.New())},
+		{name: "unknown key mutation", method: http.MethodPatch, path: "/v1/transactions/settings/matching-keys/" + uuid.NewString(), body: `{"active":true,"account_id":"` + uuid.NewString() + `"}`},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			mux := authenticatedMux(t, &repositoryStub{}, uuid.New())
+			request := httptest.NewRequest(testCase.method, testCase.path, strings.NewReader(testCase.body))
+			request.Header.Set("Authorization", "Bearer valid")
+			response := httptest.NewRecorder()
+			mux.ServeHTTP(response, request)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("response = %d %s", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestSourceDebugAndDeletionAreOwnerScopedWorkflows(t *testing.T) {
+	userID, sourceID := uuid.New(), uuid.New()
+	attemptID := uuid.New()
+	exactProviderRequest := "{\n  \"z\": 9007199254740993,\n  \"a\": true\n}"
+	exactProviderResponse := "{\"choices\": [{\"message\": {\"content\": \"{}\"}}]}"
+	exactModelOutput := "{ \"large_id\": 9007199254740993 }"
+	repository := &repositoryStub{
+		debug: transactionstore.SourceParseDebug{SourceID: sourceID, Attempts: []transactionstore.ParseAttemptDebug{{
+			ID: attemptID, ValidationStatus: "valid", PromptComponents: json.RawMessage(`{}`), CreatedAt: time.Now(),
+			ProviderRequest: &exactProviderRequest, ProviderResponse: &exactProviderResponse, ModelOutput: &exactModelOutput,
+		}}, HasMore: true, Truncated: true},
+		debugField: transactionstore.SourceParseAuditField{
+			SourceID: sourceID, AttemptID: attemptID, Field: "provider_request",
+			Value: &exactProviderRequest, MaxBytes: 10485760,
+		},
+		deletionResult: transactionstore.SourceDeletionResult{Status: "cleanup_pending", CleanupPending: true},
+	}
+	storage := &attachmentSignerStub{}
+	mux := authenticatedMux(t, repository, userID, storage)
+	request := httptest.NewRequest(http.MethodGet, "/v1/transactions/sources/"+sourceID.String()+"/debug", nil)
+	request.Header.Set("Authorization", "Bearer valid")
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "no-store" ||
+		!strings.Contains(response.Body.String(), `"attempts":[`) ||
+		!strings.Contains(response.Body.String(), `"has_more":true`) || !strings.Contains(response.Body.String(), `"truncated":true`) ||
+		strings.Contains(response.Body.String(), `"items"`) {
+		t.Fatalf("debug response = %d %s", response.Code, response.Body.String())
+	}
+	var debugResponse struct {
+		Attempts []struct {
+			ProviderRequest  *string `json:"provider_request"`
+			ProviderResponse *string `json:"provider_response"`
+			ModelOutput      *string `json:"model_output"`
+		} `json:"attempts"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &debugResponse); err != nil || len(debugResponse.Attempts) != 1 {
+		t.Fatalf("decode debug response: %v body=%s", err, response.Body.String())
+	}
+	attempt := debugResponse.Attempts[0]
+	if attempt.ProviderRequest == nil || *attempt.ProviderRequest != exactProviderRequest ||
+		attempt.ProviderResponse == nil || *attempt.ProviderResponse != exactProviderResponse ||
+		attempt.ModelOutput == nil || *attempt.ModelOutput != exactModelOutput {
+		t.Fatalf("exact audit JSON strings were not preserved: %#v", attempt)
+	}
+
+	request = httptest.NewRequest(http.MethodGet,
+		"/v1/transactions/sources/"+sourceID.String()+"/debug/attempts/"+attemptID.String()+"/fields/provider_request", nil)
+	request.Header.Set("Authorization", "Bearer valid")
+	response = httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "no-store" ||
+		repository.debugSourceID != sourceID || repository.debugAttemptID != attemptID ||
+		repository.debugFieldName != "provider_request" {
+		t.Fatalf("exact field response=%d source=%s attempt=%s field=%q body=%s", response.Code,
+			repository.debugSourceID, repository.debugAttemptID, repository.debugFieldName, response.Body.String())
+	}
+	var exactField struct {
+		Value    *string `json:"value"`
+		MaxBytes int     `json:"max_bytes"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &exactField); err != nil || exactField.Value == nil ||
+		*exactField.Value != exactProviderRequest || exactField.MaxBytes != 10485760 {
+		t.Fatalf("exact field decode error=%v field=%#v", err, exactField)
+	}
+
+	request = httptest.NewRequest(http.MethodDelete, "/v1/transactions/sources/"+sourceID.String(), nil)
+	request.Header.Set("Authorization", "Bearer valid")
+	response = httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusAccepted || repository.stagedSourceID != sourceID ||
+		!strings.Contains(response.Body.String(), `"status":"cleanup_pending"`) ||
+		!strings.Contains(response.Body.String(), `"cleanup_pending":true`) || len(storage.deleted) != 0 {
+		t.Fatalf("delete response=%d staged=%s body=%s storage=%#v", response.Code, repository.stagedSourceID, response.Body.String(), storage.deleted)
+	}
+}
+
+func TestSourceDebugFieldRejectsUnsupportedField(t *testing.T) {
+	userID, sourceID, attemptID := uuid.New(), uuid.New(), uuid.New()
+	repository := &repositoryStub{actionErr: transactionstore.ErrSourceDebugFieldUnsupported}
+	mux := authenticatedMux(t, repository, userID)
+	request := httptest.NewRequest(http.MethodGet,
+		"/v1/transactions/sources/"+sourceID.String()+"/debug/attempts/"+attemptID.String()+"/fields/account_catalog", nil)
+	request.Header.Set("Authorization", "Bearer valid")
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "Unsupported debug field") {
+		t.Fatalf("response=%d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestSourceDebugFieldDoesNotRevealMissingOrCrossOwnerAttempt(t *testing.T) {
+	userID, sourceID, attemptID := uuid.New(), uuid.New(), uuid.New()
+	repository := &repositoryStub{actionErr: transactionstore.ErrSourceNotFound}
+	mux := authenticatedMux(t, repository, userID)
+	request := httptest.NewRequest(http.MethodGet,
+		"/v1/transactions/sources/"+sourceID.String()+"/debug/attempts/"+attemptID.String()+"/fields/model_output", nil)
+	request.Header.Set("Authorization", "Bearer valid")
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound || !strings.Contains(response.Body.String(), "Debug field not found") {
+		t.Fatalf("response=%d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestSourceDeletionReturnsConflictDuringActiveGmailIngestion(t *testing.T) {
+	userID, sourceID := uuid.New(), uuid.New()
+	repository := &repositoryStub{actionErr: transactionstore.ErrSourceDeletionIngestionActive}
+	mux := authenticatedMux(t, repository, userID)
+	request := httptest.NewRequest(http.MethodDelete, "/v1/transactions/sources/"+sourceID.String(), nil)
+	request.Header.Set("Authorization", "Bearer valid")
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "Wait for Gmail sync") {
+		t.Fatalf("response=%d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestSourceDeletionWithoutAttachmentsCompletesImmediately(t *testing.T) {
+	userID, sourceID := uuid.New(), uuid.New()
+	repository := &repositoryStub{deletionResult: transactionstore.SourceDeletionResult{Status: "completed"}}
+	mux := authenticatedMux(t, repository, userID)
+	request := httptest.NewRequest(http.MethodDelete, "/v1/transactions/sources/"+sourceID.String(), nil)
+	request.Header.Set("Authorization", "Bearer valid")
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"status":"completed"`) ||
+		!strings.Contains(response.Body.String(), `"cleanup_pending":false`) {
+		t.Fatalf("response=%d %s", response.Code, response.Body.String())
+	}
+}
+
+func authenticatedMux(t *testing.T, repository Repository, userID uuid.UUID, signers ...AttachmentStorage) *http.ServeMux {
 	t.Helper()
 	mux := http.NewServeMux()
 	NewHandler(repository, false, nil, nil, signers...).Register(mux, verifierFunc(func(_ context.Context, token string) (auth.User, error) {
@@ -656,3 +929,4 @@ func authenticatedMux(t *testing.T, repository Repository, userID uuid.UUID, sig
 }
 
 func timePointer(value time.Time) *time.Time { return &value }
+func stringPointer(value string) *string     { return &value }

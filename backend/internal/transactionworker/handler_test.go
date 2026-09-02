@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/zhengteck/wealth-builder/backend/internal/attachmentstorage"
 	"github.com/zhengteck/wealth-builder/backend/internal/jobs"
+	"github.com/zhengteck/wealth-builder/backend/internal/parserrules"
 	"github.com/zhengteck/wealth-builder/backend/internal/providers"
 	"github.com/zhengteck/wealth-builder/backend/internal/reconciliation"
 	"github.com/zhengteck/wealth-builder/backend/internal/transactionstore"
@@ -21,6 +23,7 @@ type repositoryStub struct {
 	parseResult     *transactionstore.ParsedSourceResult
 	invalid         bool
 	failed          bool
+	audit           transactionstore.SourceParseAudit
 	reconcileInput  transactionstore.ReconciliationInput
 	reconcileResult *transactionstore.ReconciliationResult
 }
@@ -32,12 +35,14 @@ func (s *repositoryStub) SaveParsedSource(_ context.Context, _ uuid.UUID, result
 	s.parseResult = &result
 	return nil
 }
-func (s *repositoryStub) RecordInvalidSourceParse(context.Context, uuid.UUID, uuid.UUID, string, json.RawMessage, error) error {
+func (s *repositoryStub) RecordInvalidSourceParse(_ context.Context, _ uuid.UUID, audit transactionstore.SourceParseAudit, _ error) error {
 	s.invalid = true
+	s.audit = audit
 	return nil
 }
-func (s *repositoryStub) RecordFailedSourceParse(context.Context, uuid.UUID, uuid.UUID, string, error) error {
+func (s *repositoryStub) RecordFailedSourceParse(_ context.Context, _ uuid.UUID, audit transactionstore.SourceParseAudit, _ error) error {
 	s.failed = true
+	s.audit = audit
 	return nil
 }
 func (s *repositoryStub) LoadReconciliationInput(context.Context, uuid.UUID, uuid.UUID) (transactionstore.ReconciliationInput, error) {
@@ -63,8 +68,82 @@ func (s attachmentDownloadStub) Download(_ context.Context, request attachmentst
 	return content, nil
 }
 
-func (s parserStub) ParseTransactionEvidence(context.Context, string, []providers.AttachmentInput) (providers.ParsedCandidate, error) {
+type attachmentCleanupStub struct {
+	requests []attachmentstorage.ObjectRequest
+	err      error
+}
+
+func (s *attachmentCleanupStub) Delete(_ context.Context, requests []attachmentstorage.ObjectRequest) error {
+	s.requests = append([]attachmentstorage.ObjectRequest(nil), requests...)
+	return s.err
+}
+
+func (s parserStub) ParseTransactionEvidence(context.Context, string, string, []providers.AttachmentInput) (providers.ParsedCandidate, error) {
 	return s.result, s.err
+}
+
+func TestSourceAttachmentCleanupValidatesAndDeletesOneOwnedBatch(t *testing.T) {
+	userID, sourceID := uuid.New(), uuid.New()
+	paths := []string{
+		userID.String() + "/" + sourceID.String() + "/first.pdf",
+		userID.String() + "/" + sourceID.String() + "/second.png",
+	}
+	payload, err := json.Marshal(jobs.SourceAttachmentCleanupPayload{SourceID: sourceID.String(), ObjectPaths: paths})
+	if err != nil {
+		t.Fatal(err)
+	}
+	storage := &attachmentCleanupStub{}
+	handler := Handler{CleanupAttachments: storage}
+	if err = handler.Handle(context.Background(), jobs.Job{
+		Kind: jobs.KindSourceAttachmentCleanup, UserID: userID, Payload: payload,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(storage.requests) != 2 || storage.requests[0].ObjectPath != paths[0] || storage.requests[1].ObjectPath != paths[1] {
+		t.Fatalf("cleanup requests = %#v", storage.requests)
+	}
+}
+
+func TestSourceAttachmentCleanupFailureIsReturnedForBoundedJobRetry(t *testing.T) {
+	userID, sourceID := uuid.New(), uuid.New()
+	payload, _ := json.Marshal(jobs.SourceAttachmentCleanupPayload{
+		SourceID:    sourceID.String(),
+		ObjectPaths: []string{userID.String() + "/" + sourceID.String() + "/receipt.pdf"},
+	})
+	storage := &attachmentCleanupStub{err: errors.New("storage unavailable")}
+	err := (Handler{CleanupAttachments: storage}).Handle(context.Background(), jobs.Job{
+		Kind: jobs.KindSourceAttachmentCleanup, UserID: userID, Payload: payload,
+	})
+	if err == nil || !strings.Contains(err.Error(), "delete source attachments") || len(storage.requests) != 1 {
+		t.Fatalf("cleanup error = %v, requests = %#v", err, storage.requests)
+	}
+}
+
+func TestSourceAttachmentCleanupRejectsCrossSourcePathBeforeStorage(t *testing.T) {
+	userID, sourceID := uuid.New(), uuid.New()
+	payload, _ := json.Marshal(jobs.SourceAttachmentCleanupPayload{
+		SourceID:    sourceID.String(),
+		ObjectPaths: []string{userID.String() + "/" + uuid.NewString() + "/receipt.pdf"},
+	})
+	storage := &attachmentCleanupStub{}
+	err := (Handler{CleanupAttachments: storage}).Handle(context.Background(), jobs.Job{
+		Kind: jobs.KindSourceAttachmentCleanup, UserID: userID, Payload: payload,
+	})
+	if err == nil || len(storage.requests) != 0 {
+		t.Fatalf("cleanup error = %v, requests = %#v", err, storage.requests)
+	}
+}
+
+type parserCapture struct {
+	result          providers.ParsedCandidate
+	called          bool
+	systemPrompt    string
+	normalizedInput string
+}
+
+func (s *parserCapture) ParseTransactionEvidence(_ context.Context, systemPrompt, normalizedInput string, _ []providers.AttachmentInput) (providers.ParsedCandidate, error) {
+	s.called, s.systemPrompt, s.normalizedInput = true, systemPrompt, normalizedInput
+	return s.result, nil
 }
 
 func TestHandlerPersistsValidatedResultAndQueuesReconciliation(t *testing.T) {
@@ -92,6 +171,83 @@ func TestHandlerRecordsInvalidModelResultWithoutRetry(t *testing.T) {
 	if !repository.invalid || repository.parseResult != nil {
 		t.Fatalf("invalid=%v parseResult=%#v", repository.invalid, repository.parseResult)
 	}
+	if repository.audit.Model == "" || repository.audit.AssembledSystemPrompt == "" ||
+		repository.audit.NormalizedInput != "receipt" || len(repository.audit.PromptComponents) == 0 ||
+		len(repository.audit.ModelOutput) == 0 {
+		t.Fatalf("invalid attempt lost available audit data: %#v", repository.audit)
+	}
+}
+
+func TestHandlerRecoversOnlyInvalidOptionalCategoryCitation(t *testing.T) {
+	userID, sourceID := uuid.New(), uuid.New()
+	responseWithCategory := func(t *testing.T) []byte {
+		t.Helper()
+		var parsed reconciliation.ParsedResponse
+		if err := json.Unmarshal(validResponseJSON(userID), &parsed); err != nil {
+			t.Fatal(err)
+		}
+		parsed.Candidate.AccountEvidence.CardLastFour = "2562"
+		parsed.Candidate.CategoryLeafName = "Groceries"
+		parsed.Evidence = append(parsed.Evidence, reconciliation.FieldEvidence{
+			Field: "category_leaf_name", SourcePath: "merchant_name", Confidence: .9,
+		})
+		raw, err := json.Marshal(parsed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+
+	t.Run("invalid category path is discarded", func(t *testing.T) {
+		repository := &repositoryStub{parseInput: transactionstore.SourceParseInput{
+			ID: sourceID, NormalizedContent: "text: FairPrice Mastercard (**** 2562)",
+		}}
+		handler := Handler{Repository: repository, Parser: parserStub{result: providers.ParsedCandidate{
+			JSON: responseWithCategory(t), Model: "qwen3.8-flash",
+		}}}
+		payload, _ := json.Marshal(map[string]string{"data_source_id": sourceID.String()})
+		if err := handler.Handle(context.Background(), jobs.Job{Kind: jobs.KindSourceParse, UserID: userID, Payload: payload}); err != nil {
+			t.Fatal(err)
+		}
+		if repository.invalid || repository.parseResult == nil {
+			t.Fatalf("invalid=%t result=%#v", repository.invalid, repository.parseResult)
+		}
+		parsed := repository.parseResult.ParsedResponse
+		if parsed.Candidate.CategoryLeafName != "" || parsed.Candidate.AccountEvidence.CardLastFour != "2562" {
+			t.Fatalf("unexpected recovered candidate: %#v", parsed.Candidate)
+		}
+		for _, evidence := range parsed.Evidence {
+			if evidence.Field == "category_leaf_name" {
+				t.Fatalf("invalid category evidence remained: %#v", evidence)
+			}
+		}
+	})
+
+	t.Run("invalid required-field path still fails", func(t *testing.T) {
+		var parsed reconciliation.ParsedResponse
+		if err := json.Unmarshal(responseWithCategory(t), &parsed); err != nil {
+			t.Fatal(err)
+		}
+		for index := range parsed.Evidence {
+			if parsed.Evidence[index].Field == "original_currency" {
+				parsed.Evidence[index].SourcePath = "original_currency"
+			}
+		}
+		raw, _ := json.Marshal(parsed)
+		repository := &repositoryStub{parseInput: transactionstore.SourceParseInput{
+			ID: sourceID, NormalizedContent: "text: FairPrice Mastercard (**** 2562)",
+		}}
+		handler := Handler{Repository: repository, Parser: parserStub{result: providers.ParsedCandidate{
+			JSON: raw, Model: "qwen3.8-flash",
+		}}}
+		payload, _ := json.Marshal(map[string]string{"data_source_id": sourceID.String()})
+		if err := handler.Handle(context.Background(), jobs.Job{Kind: jobs.KindSourceParse, UserID: userID, Payload: payload}); err != nil {
+			t.Fatal(err)
+		}
+		if !repository.invalid || repository.parseResult != nil {
+			t.Fatalf("invalid=%t result=%#v", repository.invalid, repository.parseResult)
+		}
+	})
 }
 
 func TestHandlerRetriesProviderFailureAfterRecordingAttempt(t *testing.T) {
@@ -101,6 +257,74 @@ func TestHandlerRetriesProviderFailureAfterRecordingAttempt(t *testing.T) {
 	payload, _ := json.Marshal(map[string]string{"data_source_id": sourceID.String()})
 	if err := handler.Handle(context.Background(), jobs.Job{Kind: jobs.KindSourceParse, UserID: userID, Payload: payload}); err == nil || !repository.failed {
 		t.Fatalf("error=%v failed=%v", err, repository.failed)
+	}
+}
+
+func TestHandlerAssemblesSelectedPromptAndPersistsExactAudit(t *testing.T) {
+	userID, sourceID := uuid.New(), uuid.New()
+	raw := validResponseJSON(userID)
+	globalID, userRuleID := uuid.NewString(), uuid.NewString()
+	config := json.RawMessage(`{"extractors":{"card_last_four":{"pattern":"Mastercard\\s*\\(\\*{4}\\s*([0-9]{4})\\)","group":1}}}`)
+	normalized := "subject: Your FairPrice Group app receipt\nsender: FairPrice <no-reply@fairprice.com.sg>\ntext: Cafe Mastercard (**** 2562) SGD 5.00"
+	repository := &repositoryStub{parseInput: transactionstore.SourceParseInput{
+		ID: sourceID, Subject: "Your FairPrice Group app receipt",
+		Sender: "FairPrice <no-reply@fairprice.com.sg>", Content: "Cafe Mastercard (**** 2562) SGD 5.00",
+		NormalizedContent: normalized, DefaultInstructions: "prefer explicit receipt facts", DefaultInstructionsVersion: 3,
+		Rules:     []parserrules.Rule{{ID: globalID, Version: 2, Priority: 50, ContentMatcher: `FairPrice`, PromptFragment: "global guidance", ExtractionConfig: config}},
+		UserRules: []parserrules.UserRule{{ID: userRuleID, Name: "FairPrice receipts", Version: 4, Priority: 10, SenderMatchType: "domain", SenderMatchValue: "fairprice.com.sg", SubjectMatcher: `app receipt`, ContentMatcher: `Mastercard`, PromptFragment: "user rule guidance"}},
+	}}
+	parser := &parserCapture{result: providers.ParsedCandidate{
+		JSON: raw, Model: "qwen3.8-flash", ProviderRequest: json.RawMessage(`{"request":"exact"}`),
+		ProviderResponse: json.RawMessage(`{"response":"exact"}`),
+	}}
+	handler := Handler{Repository: repository, Parser: parser}
+	payload, _ := json.Marshal(map[string]string{"data_source_id": sourceID.String()})
+	if err := handler.Handle(context.Background(), jobs.Job{Kind: jobs.KindSourceParse, UserID: userID, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	if !parser.called || parser.normalizedInput != normalized {
+		t.Fatalf("parser call = %t input=%q", parser.called, parser.normalizedInput)
+	}
+	for _, wanted := range []string{"global guidance", "prefer explicit receipt facts", "user rule guidance"} {
+		if !strings.Contains(parser.systemPrompt, wanted) {
+			t.Fatalf("system prompt omitted %q", wanted)
+		}
+	}
+	if strings.Contains(parser.systemPrompt, normalized) {
+		t.Fatal("email source content was promoted into the system prompt")
+	}
+	result := repository.parseResult
+	if result == nil || result.ParsedResponse.Candidate.AccountEvidence.CardLastFour != "2562" {
+		t.Fatalf("deterministic rule did not run after Qwen: %#v", result)
+	}
+	if result.RuleID != globalID || result.RuleVersion != 2 || result.UserRuleID != userRuleID || result.UserRuleVersion != 4 {
+		t.Fatalf("rule provenance = %#v", result.SourceParseAudit)
+	}
+	if string(result.ProviderRequest) != `{"request":"exact"}` || string(result.ProviderResponse) != `{"response":"exact"}` || string(result.ModelOutput) != string(raw) {
+		t.Fatalf("audit bodies changed: %#v", result.SourceParseAudit)
+	}
+	if !strings.Contains(string(result.PromptComponents), `"version":3`) {
+		t.Fatalf("default instruction version missing from prompt components: %s", result.PromptComponents)
+	}
+}
+
+func TestHandlerTreatsEqualTopUserRulePriorityAsConfigurationFailure(t *testing.T) {
+	userID, sourceID := uuid.New(), uuid.New()
+	rules := []parserrules.UserRule{
+		{ID: uuid.NewString(), Version: 1, Priority: 5, SenderMatchType: "domain", SenderMatchValue: "example.test"},
+		{ID: uuid.NewString(), Version: 1, Priority: 5, SenderMatchType: "domain", SenderMatchValue: "example.test"},
+	}
+	repository := &repositoryStub{parseInput: transactionstore.SourceParseInput{
+		ID: sourceID, Sender: "alerts@example.test", NormalizedContent: "receipt", UserRules: rules,
+	}}
+	parser := &parserCapture{}
+	handler := Handler{Repository: repository, Parser: parser}
+	payload, _ := json.Marshal(map[string]string{"data_source_id": sourceID.String()})
+	if err := handler.Handle(context.Background(), jobs.Job{Kind: jobs.KindSourceParse, UserID: userID, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	if !repository.failed || parser.called {
+		t.Fatalf("failed=%t parser.called=%t", repository.failed, parser.called)
 	}
 }
 
@@ -148,7 +372,7 @@ func TestHandlerPersistsReconciliationDecision(t *testing.T) {
 	candidate := validCandidate(userID)
 	repository := &repositoryStub{reconcileInput: transactionstore.ReconciliationInput{
 		SourceID: sourceID, Candidate: candidate,
-		Accounts: []reconciliation.AccountIdentity{{ID: accountID.String(), UserID: userID.String(), CardLastFour: "1234"}},
+		Accounts: []reconciliation.AccountIdentity{{ID: accountID.String(), UserID: userID.String(), MatchingKeys: []reconciliation.AccountMatchingKey{{KeyType: "card_last_four", NormalizedValue: "1234"}}}},
 	}}
 	handler := Handler{Repository: repository}
 	payload, _ := json.Marshal(map[string]string{"data_source_id": sourceID.String()})

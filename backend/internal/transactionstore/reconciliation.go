@@ -20,12 +20,17 @@ import (
 // SourceParseInput contains only normalized provider content safe to send to
 // the configured parser. Raw MIME and attachment bytes stay private.
 type SourceParseInput struct {
-	ID                uuid.UUID
-	Sender            string
-	ReceivedAt        time.Time
-	NormalizedContent string
-	Rules             []parserrules.Rule
-	Attachments       []SourceAttachment
+	ID                         uuid.UUID
+	Subject                    string
+	Sender                     string
+	Content                    string
+	ReceivedAt                 time.Time
+	NormalizedContent          string
+	Rules                      []parserrules.Rule
+	UserRules                  []parserrules.UserRule
+	DefaultInstructions        string
+	DefaultInstructionsVersion int
+	Attachments                []SourceAttachment
 }
 
 // SourceAttachment is metadata only. Attachment bytes remain in private
@@ -43,18 +48,46 @@ type ReconciliationInput struct {
 }
 
 type ParsedSourceResult struct {
-	SourceID        uuid.UUID
+	SourceParseAudit
 	SyncRunID       *uuid.UUID
-	Model           string
 	ParsedResponse  reconciliation.ParsedResponse
-	RawResponse     json.RawMessage
-	RuleID          string
-	RuleVersion     int
-	AttachmentUsage []AttachmentUsage
+	ParsedCandidate json.RawMessage
 	AutoEligible    bool
 }
 
 type AttachmentUsage struct{ ObjectPath, Filename, MIMEType string }
+
+type PromptComponent struct {
+	ID      string `json:"id,omitempty"`
+	Name    string `json:"name,omitempty"`
+	Version int    `json:"version,omitempty"`
+	Content string `json:"content"`
+}
+
+type PromptComponents struct {
+	Platform       PromptComponent  `json:"platform"`
+	GlobalRule     *PromptComponent `json:"global_rule"`
+	UserDefault    *PromptComponent `json:"user_default"`
+	UserSourceRule *PromptComponent `json:"user_source_rule"`
+}
+
+// SourceParseAudit is populated before the provider call and enriched with the
+// exact request/response/model JSON as each boundary succeeds.
+type SourceParseAudit struct {
+	SourceID              uuid.UUID
+	Model                 string
+	AssembledSystemPrompt string
+	NormalizedInput       string
+	ProviderRequest       json.RawMessage
+	ProviderResponse      json.RawMessage
+	ModelOutput           json.RawMessage
+	PromptComponents      json.RawMessage
+	RuleID                string
+	RuleVersion           int
+	UserRuleID            string
+	UserRuleVersion       int
+	AttachmentUsage       []AttachmentUsage
+}
 
 type ReconciliationResult struct {
 	SourceID  uuid.UUID
@@ -75,10 +108,11 @@ func (s *Store) LoadSourceParseInput(ctx context.Context, userID, sourceID uuid.
 	if err != nil {
 		return SourceParseInput{}, err
 	}
-	input.Sender = sender
+	input.Subject, input.Sender = subject, sender
 	if strings.TrimSpace(text) == "" {
 		text = normalizedSanitizedHTMLText(sanitizedHTML)
 	}
+	input.Content = text
 	input.NormalizedContent = normalizedEmailContent(subject, sender, text, input.ReceivedAt)
 	if input.NormalizedContent == "" {
 		return SourceParseInput{}, errors.New("source has no normalized email content")
@@ -88,6 +122,17 @@ func (s *Store) LoadSourceParseInput(ctx context.Context, userID, sourceID uuid.
 		return SourceParseInput{}, err
 	}
 	input.Rules = rules
+	if err = s.pool.QueryRow(ctx, `
+		select default_instructions, version
+		from private.user_parser_settings
+		where user_id = $1`, userID).Scan(&input.DefaultInstructions, &input.DefaultInstructionsVersion); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return SourceParseInput{}, err
+	}
+	userRules, err := s.loadActiveUserGmailParserRules(ctx, userID)
+	if err != nil {
+		return SourceParseInput{}, err
+	}
+	input.UserRules = userRules
 	input.Attachments = sourceAttachmentMetadata(rawData)
 	return input, nil
 }
@@ -134,7 +179,8 @@ func sourceAttachmentMetadata(raw []byte) []SourceAttachment {
 
 func (s *Store) loadActiveGmailParserRules(ctx context.Context) ([]parserrules.Rule, error) {
 	rows, err := s.pool.Query(ctx, `
-		select id, version, priority, coalesce(sender_matcher, ''), coalesce(content_matcher, ''), extraction_config
+		select id, version, priority, coalesce(sender_matcher, ''), coalesce(content_matcher, ''),
+			coalesce(prompt_fragment, ''), extraction_config
 		from private.source_parser_rules
 		where provider = 'gmail' and active = true
 		order by priority desc, id asc`)
@@ -145,7 +191,33 @@ func (s *Store) loadActiveGmailParserRules(ctx context.Context) ([]parserrules.R
 	rules := make([]parserrules.Rule, 0)
 	for rows.Next() {
 		var rule parserrules.Rule
-		if err := rows.Scan(&rule.ID, &rule.Version, &rule.Priority, &rule.SenderMatcher, &rule.ContentMatcher, &rule.ExtractionConfig); err != nil {
+		if err := rows.Scan(&rule.ID, &rule.Version, &rule.Priority, &rule.SenderMatcher, &rule.ContentMatcher, &rule.PromptFragment, &rule.ExtractionConfig); err != nil {
+			return nil, err
+		}
+		rules = append(rules, rule)
+	}
+	return rules, rows.Err()
+}
+
+func (s *Store) loadActiveUserGmailParserRules(ctx context.Context, userID uuid.UUID) ([]parserrules.UserRule, error) {
+	rows, err := s.pool.Query(ctx, `
+		select id, name, version, priority, sender_match_type, sender_match_value,
+			coalesce(subject_matcher, ''), coalesce(content_matcher, ''), prompt_fragment
+		from private.user_source_parser_rules
+		where user_id = $1 and provider = 'gmail' and active = true
+		order by priority desc, id asc`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	rules := make([]parserrules.UserRule, 0)
+	for rows.Next() {
+		var rule parserrules.UserRule
+		if err := rows.Scan(
+			&rule.ID, &rule.Name, &rule.Version, &rule.Priority,
+			&rule.SenderMatchType, &rule.SenderMatchValue,
+			&rule.SubjectMatcher, &rule.ContentMatcher, &rule.PromptFragment,
+		); err != nil {
 			return nil, err
 		}
 		rules = append(rules, rule)
@@ -173,7 +245,7 @@ func normalizedEmailContent(subject, sender, text string, receivedAt time.Time) 
 // SaveParsedSource records a validated parser result and queues reconciliation
 // atomically. The parser call itself must have completed before this method.
 func (s *Store) SaveParsedSource(ctx context.Context, userID uuid.UUID, result ParsedSourceResult) error {
-	if result.SourceID == uuid.Nil || !json.Valid(result.RawResponse) {
+	if result.SourceID == uuid.Nil || !validJSONObject(result.ParsedCandidate) {
 		return errors.New("valid source ID and parser response are required")
 	}
 	confidence := confidencePercent(result.ParsedResponse.Candidate.Confidence)
@@ -189,21 +261,44 @@ func (s *Store) SaveParsedSource(ctx context.Context, userID uuid.UUID, result P
 	if status == "review_required" || status == "dangling" {
 		return tx.Commit(ctx)
 	}
-	metadata, err := json.Marshal(map[string]any{"provider": "alibaba_openai_compatible", "thinking": false, "response_format": "json_object", "parser_rule_id": result.RuleID, "parser_rule_version": result.RuleVersion, "attachment_usage": result.AttachmentUsage, "auto_eligible": result.AutoEligible})
+	metadata, err := json.Marshal(map[string]any{
+		"provider": "alibaba_openai_compatible", "thinking": false,
+		"response_format": "json_object", "parser_rule_id": result.RuleID,
+		"parser_rule_version": result.RuleVersion, "user_parser_rule_id": result.UserRuleID,
+		"user_parser_rule_version": result.UserRuleVersion,
+		"attachment_usage":         result.AttachmentUsage, "auto_eligible": result.AutoEligible,
+	})
 	if err != nil {
 		return err
 	}
-	var ruleID *uuid.UUID
-	if result.RuleID != "" {
-		parsedRuleID, parseErr := uuid.Parse(result.RuleID)
-		if parseErr != nil || result.RuleVersion < 1 {
-			return errors.New("invalid parser rule provenance")
-		}
-		ruleID = &parsedRuleID
+	ruleID, err := parseOptionalRuleProvenance(result.RuleID, result.RuleVersion)
+	if err != nil {
+		return err
+	}
+	userRuleID, err := parseOptionalRuleProvenance(result.UserRuleID, result.UserRuleVersion)
+	if err != nil {
+		return err
 	}
 	_, err = tx.Exec(ctx, `
-		insert into private.source_parse_attempts (user_id, data_source_id, parser_rule_id, parser_rule_version, model_name, request_metadata, parsed_candidate, validation_status, started_at, completed_at)
-		values ($1, $2, $3, nullif($4, 0), $5, $6::jsonb, $7::jsonb, 'valid', now(), now())`, userID, result.SourceID, ruleID, result.RuleVersion, result.Model, string(metadata), string(result.RawResponse))
+		insert into private.source_parse_attempts (
+			user_id, data_source_id, parser_rule_id, parser_rule_version,
+			user_parser_rule_id, user_parser_rule_version, model_name,
+			request_metadata, parsed_candidate, assembled_system_prompt,
+			normalized_input, provider_request, provider_response, model_output,
+			prompt_components, validation_status, started_at, completed_at
+		) values (
+			$1, $2, $3, nullif($4, 0), $5, nullif($6, 0), $7,
+			$8::jsonb, $9::jsonb, $10, $11,
+			case when $12 = 'null' then null else $12::json end,
+			case when $13 = 'null' then null else $13::json end,
+			case when $14 = 'null' then null else $14::json end, $15::jsonb,
+			'valid', now(), now()
+		)`, userID, result.SourceID, ruleID, result.RuleVersion,
+		userRuleID, result.UserRuleVersion, result.Model, string(metadata),
+		string(result.ParsedCandidate), result.AssembledSystemPrompt,
+		result.NormalizedInput, nullableJSON(result.ProviderRequest),
+		nullableJSON(result.ProviderResponse), nullableJSON(result.ModelOutput),
+		promptComponentsJSON(result.PromptComponents))
 	if err != nil {
 		return err
 	}
@@ -231,17 +326,25 @@ func (s *Store) SaveParsedSource(ctx context.Context, userID uuid.UUID, result P
 	return tx.Commit(ctx)
 }
 
-func (s *Store) RecordInvalidSourceParse(ctx context.Context, userID, sourceID uuid.UUID, model string, raw json.RawMessage, cause error) error {
-	return s.recordSourceParseError(ctx, userID, sourceID, model, raw, "invalid", cause)
+func (s *Store) RecordInvalidSourceParse(ctx context.Context, userID uuid.UUID, audit SourceParseAudit, cause error) error {
+	return s.recordSourceParseError(ctx, userID, audit, "invalid", cause)
 }
 
-func (s *Store) RecordFailedSourceParse(ctx context.Context, userID, sourceID uuid.UUID, model string, cause error) error {
-	return s.recordSourceParseError(ctx, userID, sourceID, model, nil, "failed", cause)
+func (s *Store) RecordFailedSourceParse(ctx context.Context, userID uuid.UUID, audit SourceParseAudit, cause error) error {
+	return s.recordSourceParseError(ctx, userID, audit, "failed", cause)
 }
 
-func (s *Store) recordSourceParseError(ctx context.Context, userID, sourceID uuid.UUID, model string, raw json.RawMessage, validationStatus string, cause error) error {
-	if sourceID == uuid.Nil || cause == nil {
+func (s *Store) recordSourceParseError(ctx context.Context, userID uuid.UUID, audit SourceParseAudit, validationStatus string, cause error) error {
+	if audit.SourceID == uuid.Nil || cause == nil {
 		return errors.New("source ID and parse error are required")
+	}
+	ruleID, err := parseOptionalRuleProvenance(audit.RuleID, audit.RuleVersion)
+	if err != nil {
+		return err
+	}
+	userRuleID, err := parseOptionalRuleProvenance(audit.UserRuleID, audit.UserRuleVersion)
+	if err != nil {
+		return err
 	}
 	errorSummary := boundedError(cause)
 	tx, err := s.pool.Begin(ctx)
@@ -249,16 +352,42 @@ func (s *Store) recordSourceParseError(ctx context.Context, userID, sourceID uui
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	metadata, err := json.Marshal(map[string]any{
+		"provider": "alibaba_openai_compatible", "thinking": false,
+		"response_format": "json_object", "parser_rule_id": audit.RuleID,
+		"parser_rule_version": audit.RuleVersion, "user_parser_rule_id": audit.UserRuleID,
+		"user_parser_rule_version": audit.UserRuleVersion,
+		"attachment_usage":         audit.AttachmentUsage,
+	})
+	if err != nil {
+		return err
+	}
 	_, err = tx.Exec(ctx, `
-		insert into private.source_parse_attempts (user_id, data_source_id, model_name, request_metadata, parsed_candidate, validation_status, error_summary, started_at, completed_at)
-		values ($1, $2, $3, '{"provider":"alibaba_openai_compatible","thinking":false}'::jsonb,
-			nullif($4::jsonb, 'null'::jsonb), $5, $6, now(), now())`, userID, sourceID, model, nullableJSON(raw), validationStatus, errorSummary)
+		insert into private.source_parse_attempts (
+			user_id, data_source_id, parser_rule_id, parser_rule_version,
+			user_parser_rule_id, user_parser_rule_version, model_name,
+			request_metadata, parsed_candidate, assembled_system_prompt,
+			normalized_input, provider_request, provider_response, model_output,
+			prompt_components, validation_status, error_summary, started_at, completed_at
+		) values (
+			$1, $2, $3, nullif($4, 0), $5, nullif($6, 0), $7,
+			$8::jsonb, null, $9, $10,
+			case when $11 = 'null' then null else $11::json end,
+			case when $12 = 'null' then null else $12::json end,
+			case when $13 = 'null' then null else $13::json end, $14::jsonb,
+			$15, $16, now(), now()
+		)`, userID, audit.SourceID, ruleID, audit.RuleVersion,
+		userRuleID, audit.UserRuleVersion, audit.Model, string(metadata),
+		audit.AssembledSystemPrompt, audit.NormalizedInput,
+		nullableJSON(audit.ProviderRequest), nullableJSON(audit.ProviderResponse),
+		nullableJSON(audit.ModelOutput), promptComponentsJSON(audit.PromptComponents),
+		validationStatus, errorSummary)
 	if err != nil {
 		return err
 	}
 	_, err = tx.Exec(ctx, `
 		update private.data_sources set parse_status = 'failed', parse_confidence = null, parse_error = $3
-		where id = $1 and user_id = $2`, sourceID, userID, errorSummary)
+		where id = $1 and user_id = $2`, audit.SourceID, userID, errorSummary)
 	if err != nil {
 		return err
 	}
@@ -270,6 +399,29 @@ func nullableJSON(raw json.RawMessage) string {
 		return "null"
 	}
 	return string(raw)
+}
+
+func promptComponentsJSON(raw json.RawMessage) string {
+	if !validJSONObject(raw) {
+		return "{}"
+	}
+	return string(raw)
+}
+
+func validJSONObject(raw json.RawMessage) bool {
+	var object map[string]json.RawMessage
+	return json.Unmarshal(raw, &object) == nil && object != nil
+}
+
+func parseOptionalRuleProvenance(id string, version int) (*uuid.UUID, error) {
+	if id == "" && version == 0 {
+		return nil, nil
+	}
+	parsed, err := uuid.Parse(id)
+	if err != nil || version < 1 {
+		return nil, errors.New("invalid parser rule provenance")
+	}
+	return &parsed, nil
 }
 
 func (s *Store) LoadReconciliationInput(ctx context.Context, userID, sourceID uuid.UUID) (ReconciliationInput, error) {
@@ -310,48 +462,44 @@ func (s *Store) LoadReconciliationInput(ctx context.Context, userID, sourceID uu
 
 func (s *Store) loadOwnedAccountIdentities(ctx context.Context, userID uuid.UUID) ([]reconciliation.AccountIdentity, error) {
 	rows, err := s.pool.Query(ctx, `
-		select id, coalesce(account_identifier, ''), metadata
-		from public.accounts where user_id = $1 and deleted_at is null`, userID)
+		select account.id, matching_key.key_type, matching_key.normalized_value
+		from public.accounts account
+		join private.account_matching_keys matching_key
+			on matching_key.account_id = account.id
+			and matching_key.user_id = account.user_id
+			and matching_key.active = true
+			and matching_key.retired_at is null
+		where account.user_id = $1 and account.deleted_at is null
+		order by account.id, matching_key.key_type, matching_key.normalized_value`, userID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	accounts := make([]reconciliation.AccountIdentity, 0)
+	accountsByID := make(map[string]*reconciliation.AccountIdentity)
+	order := make([]string, 0)
 	for rows.Next() {
-		var account reconciliation.AccountIdentity
-		var metadata []byte
-		if err := rows.Scan(&account.ID, &account.AccountIdentifier, &metadata); err != nil {
+		var accountID, keyType, normalizedValue string
+		if err := rows.Scan(&accountID, &keyType, &normalizedValue); err != nil {
 			return nil, err
 		}
-		account.UserID = userID.String()
-		account.MetadataIdentifiers = safeMetadataIdentifiers(metadata)
-		accounts = append(accounts, account)
-	}
-	return accounts, rows.Err()
-}
-
-func safeMetadataIdentifiers(raw []byte) []string {
-	var metadata map[string]json.RawMessage
-	if json.Unmarshal(raw, &metadata) != nil {
-		return nil
-	}
-	values := make([]string, 0)
-	for key, value := range metadata {
-		name := strings.ToLower(key)
-		if !strings.Contains(name, "identifier") && !strings.Contains(name, "card") && !strings.Contains(name, "bank") && !strings.Contains(name, "account") {
-			continue
+		account := accountsByID[accountID]
+		if account == nil {
+			account = &reconciliation.AccountIdentity{ID: accountID, UserID: userID.String()}
+			accountsByID[accountID] = account
+			order = append(order, accountID)
 		}
-		var text string
-		if json.Unmarshal(value, &text) == nil {
-			values = append(values, text)
-			continue
-		}
-		var list []string
-		if json.Unmarshal(value, &list) == nil {
-			values = append(values, list...)
-		}
+		account.MatchingKeys = append(account.MatchingKeys, reconciliation.AccountMatchingKey{
+			KeyType: keyType, NormalizedValue: normalizedValue,
+		})
 	}
-	return values
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	accounts := make([]reconciliation.AccountIdentity, 0, len(order))
+	for _, accountID := range order {
+		accounts = append(accounts, *accountsByID[accountID])
+	}
+	return accounts, nil
 }
 
 func (s *Store) loadOwnedTransactions(ctx context.Context, userID uuid.UUID, occurredAt time.Time) ([]reconciliation.Transaction, error) {
@@ -447,8 +595,8 @@ func (s *Store) PersistReconciliation(ctx context.Context, userID uuid.UUID, res
 		err = tx.QueryRow(ctx, `
 			insert into public.transactions (user_id, account_id, transaction_kind, title, merchant_name,
 				original_amount_minor, original_currency, sgd_amount_minor, occurred_at, category_id, line_items, details,
-				review_status, match_confidence)
-			values ($1, $2, $3, $4, nullif($5, ''), $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, 'confirmed', $13)
+				review_status, match_confidence, creation_method)
+			values ($1, $2, $3, $4, nullif($5, ''), $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, 'confirmed', $13, 'automatic_source')
 			returning id`, userID, accountID, string(result.Candidate.Kind), result.Candidate.Title,
 			result.Candidate.MerchantName, result.Candidate.OriginalAmountMinor, result.Candidate.OriginalCurrency,
 			result.Candidate.SGDAmountMinor, result.Candidate.OccurredAt, categoryID, string(lineItems), string(details), confidence).Scan(&transactionID)

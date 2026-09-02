@@ -60,11 +60,14 @@ func main() {
 		Label: cfg.GmailSyncLabel, InitialBackfillMax: cfg.InitialBackfillMax,
 		DevelopmentRefreshToken: developmentRefreshToken(cfg),
 	}
-	processingHandler := transactionworker.Handler{Repository: store, Parser: qwenClient, Attachments: attachmentClient}
+	processingHandler := transactionworker.Handler{
+		Repository: store, Parser: qwenClient, Attachments: attachmentClient, CleanupAttachments: attachmentClient,
+	}
 	handler := jobs.Router{
-		jobs.KindGmailIngest: gmailHandler,
-		jobs.KindSourceParse: processingHandler,
-		jobs.KindReconcile:   processingHandler,
+		jobs.KindGmailIngest:             gmailHandler,
+		jobs.KindSourceParse:             processingHandler,
+		jobs.KindReconcile:               processingHandler,
+		jobs.KindSourceAttachmentCleanup: processingHandler,
 	}
 	worker := jobs.Worker{Store: store, WorkerID: workerID(), Handler: handler}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

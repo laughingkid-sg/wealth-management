@@ -218,8 +218,8 @@ func (s *Store) CreateTransactionFromSource(ctx context.Context, userID, sourceI
 	err = tx.QueryRow(ctx, `
 		insert into public.transactions (user_id, account_id, transaction_kind, title, merchant_name,
 			original_amount_minor, original_currency, sgd_amount_minor, occurred_at, category_id, line_items, details,
-			review_status, match_confidence)
-		values ($1, $2, $3, $4, nullif($5, ''), $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, 'confirmed', $13)
+			review_status, match_confidence, creation_method)
+		values ($1, $2, $3, $4, nullif($5, ''), $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, 'confirmed', $13, 'user_source')
 		returning id, account_id, transaction_kind, title, merchant_name, original_amount_minor, original_currency,
 			sgd_amount_minor, occurred_at, category_id, line_items, review_status, match_confidence, created_at, updated_at`,
 		userID, accountID, string(parsed.Candidate.Kind), strings.TrimSpace(parsed.Candidate.Title),
@@ -318,7 +318,8 @@ func (s *Store) PatchTransaction(ctx context.Context, userID, transactionID uuid
 			original_currency = case when $11 then $12 else transaction.original_currency end,
 			sgd_amount_minor = case when $13 then $14 else transaction.sgd_amount_minor end,
 			category_id = case when $15 then $16::uuid else transaction.category_id end,
-			line_items = case when $17 then $18::jsonb else transaction.line_items end
+			line_items = case when $17 then $18::jsonb else transaction.line_items end,
+			user_modified_at = now()
 		where transaction.id = $1 and transaction.user_id = $2
 			and (not $5 or exists (select 1 from public.accounts account where account.id = $6 and account.user_id = $2 and account.deleted_at is null))
 			and (not $15 or $16::uuid is null or exists (select 1 from public.transaction_categories category where category.id = $16::uuid and category.active))

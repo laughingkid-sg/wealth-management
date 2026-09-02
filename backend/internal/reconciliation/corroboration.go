@@ -19,7 +19,9 @@ func DeriveAutoEligibility(candidate Candidate, sourceText string) bool {
 }
 
 func hasBoundedAccountIdentifier(evidence AccountEvidence, source string) bool {
-	for _, value := range append([]string{evidence.CardLastFour, evidence.MaskedBankReference}, evidence.AdditionalIdentifiers...) {
+	// Only the two typed, user-configurable matching-key classes may support
+	// automatic account resolution. Generic identifiers remain audit detail.
+	for _, value := range []string{evidence.CardLastFour, evidence.MaskedBankReference} {
 		if hasBoundedLiteral(value, source) {
 			return true
 		}

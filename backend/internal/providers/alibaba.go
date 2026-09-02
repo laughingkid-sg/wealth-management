@@ -2,11 +2,14 @@ package providers
 
 import "context"
 
-// ParsedCandidate is provider-neutral. JSON is the unmodified JSON object returned
-// by the model; domain validation happens before persistence.
+// ParsedCandidate carries both the model result and the exact JSON request and
+// response bodies needed for an owner-visible parse audit. Authentication
+// headers are never included.
 type ParsedCandidate struct {
-	JSON  []byte
-	Model string
+	JSON             []byte
+	Model            string
+	ProviderRequest  []byte
+	ProviderResponse []byte
 }
 
 // AttachmentInput is an already-authorized, decoded visual attachment. PDF
@@ -19,5 +22,5 @@ type AttachmentInput struct {
 
 // TransactionParser implementations must request structured JSON and disable model thinking.
 type TransactionParser interface {
-	ParseTransactionEvidence(context.Context, string, []AttachmentInput) (ParsedCandidate, error)
+	ParseTransactionEvidence(context.Context, string, string, []AttachmentInput) (ParsedCandidate, error)
 }

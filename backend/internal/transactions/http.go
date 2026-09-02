@@ -9,8 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"net/mail"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -20,6 +23,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/zhengteck/wealth-builder/backend/internal/attachmentstorage"
 	"github.com/zhengteck/wealth-builder/backend/internal/auth"
+	"github.com/zhengteck/wealth-builder/backend/internal/parserrules"
 	"github.com/zhengteck/wealth-builder/backend/internal/reconciliation"
 	"github.com/zhengteck/wealth-builder/backend/internal/transactionstore"
 )
@@ -40,6 +44,16 @@ type Repository interface {
 	UnmatchSourceLink(context.Context, uuid.UUID, uuid.UUID) error
 	PatchTransaction(context.Context, uuid.UUID, uuid.UUID, transactionstore.TransactionPatch) (transactionstore.Transaction, error)
 	CreateInternalTransfer(context.Context, uuid.UUID, transactionstore.InternalTransferInput) (transactionstore.InternalTransfer, error)
+	GetTransactionSettings(context.Context, uuid.UUID) (transactionstore.TransactionSettings, error)
+	PutDefaultParserInstructions(context.Context, uuid.UUID, string) (transactionstore.DefaultParserInstructions, error)
+	CreateUserSourceParserRule(context.Context, uuid.UUID, transactionstore.UserSourceParserRuleInput) (transactionstore.UserSourceParserRule, error)
+	UpdateUserSourceParserRule(context.Context, uuid.UUID, uuid.UUID, transactionstore.UserSourceParserRuleInput) (transactionstore.UserSourceParserRule, error)
+	RetireUserSourceParserRule(context.Context, uuid.UUID, uuid.UUID) error
+	CreateAccountMatchingKey(context.Context, uuid.UUID, transactionstore.AccountMatchingKeyInput) (transactionstore.AccountMatchingKey, error)
+	SetAccountMatchingKeyActive(context.Context, uuid.UUID, uuid.UUID, bool) (transactionstore.AccountMatchingKey, error)
+	GetSourceParseDebug(context.Context, uuid.UUID, uuid.UUID) (transactionstore.SourceParseDebug, error)
+	GetSourceParseAuditField(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, string) (transactionstore.SourceParseAuditField, error)
+	StageSourceDeletion(context.Context, uuid.UUID, uuid.UUID) (transactionstore.SourceDeletionResult, error)
 }
 
 type GmailOAuthFlow interface {
@@ -47,7 +61,7 @@ type GmailOAuthFlow interface {
 	Complete(context.Context, string, string) error
 }
 
-type AttachmentSigner interface {
+type AttachmentStorage interface {
 	SignURL(context.Context, attachmentstorage.ObjectRequest, int) (string, error)
 }
 
@@ -56,18 +70,18 @@ type Handler struct {
 	allowDevelopmentToken bool
 	gmailOAuth            GmailOAuthFlow
 	frontendOrigin        *url.URL
-	attachmentSigner      AttachmentSigner
+	attachmentStorage     AttachmentStorage
 }
 
-func NewHandler(repository Repository, allowDevelopmentToken bool, gmailOAuth GmailOAuthFlow, frontendOrigin *url.URL, attachmentSigners ...AttachmentSigner) *Handler {
-	var attachmentSigner AttachmentSigner
-	if len(attachmentSigners) > 0 {
-		attachmentSigner = attachmentSigners[0]
+func NewHandler(repository Repository, allowDevelopmentToken bool, gmailOAuth GmailOAuthFlow, frontendOrigin *url.URL, attachmentStores ...AttachmentStorage) *Handler {
+	var attachmentStore AttachmentStorage
+	if len(attachmentStores) > 0 {
+		attachmentStore = attachmentStores[0]
 	}
 	return &Handler{
 		repository: repository, allowDevelopmentToken: allowDevelopmentToken,
 		gmailOAuth: gmailOAuth, frontendOrigin: frontendOrigin,
-		attachmentSigner: attachmentSigner,
+		attachmentStorage: attachmentStore,
 	}
 }
 
@@ -83,6 +97,16 @@ func (h *Handler) Register(mux *http.ServeMux, verifier auth.Verifier) {
 	mux.Handle("GET /v1/transactions/sources", requireUser(h.listSources))
 	mux.Handle("GET /v1/transactions/sources/{id}/email", requireUser(h.getSourceEmail))
 	mux.Handle("GET /v1/transactions/sources/{id}/attachments", requireUser(h.listSourceAttachments))
+	mux.Handle("GET /v1/transactions/sources/{id}/debug", requireUser(h.getSourceDebug))
+	mux.Handle("GET /v1/transactions/sources/{id}/debug/attempts/{attempt_id}/fields/{field}", requireUser(h.getSourceDebugField))
+	mux.Handle("DELETE /v1/transactions/sources/{id}", requireUser(h.deleteSource))
+	mux.Handle("GET /v1/transactions/settings", requireUser(h.getTransactionSettings))
+	mux.Handle("PUT /v1/transactions/settings/default-instructions", requireUser(h.putDefaultInstructions))
+	mux.Handle("POST /v1/transactions/settings/source-rules", requireUser(h.createSourceRule))
+	mux.Handle("PUT /v1/transactions/settings/source-rules/{id}", requireUser(h.updateSourceRule))
+	mux.Handle("DELETE /v1/transactions/settings/source-rules/{id}", requireUser(h.deleteSourceRule))
+	mux.Handle("POST /v1/transactions/settings/matching-keys", requireUser(h.createMatchingKey))
+	mux.Handle("PATCH /v1/transactions/settings/matching-keys/{id}", requireUser(h.patchMatchingKey))
 	// ServeMux's segment patterns make /{id}/sources ambiguous with the
 	// established /sync-runs/{id} route. This narrow subtree handler preserves
 	// both public paths while rejecting every other transaction subroute.
@@ -361,7 +385,7 @@ func (h *Handler) listSourceAttachments(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusNotFound, "Source not found.")
 		return
 	}
-	if h.attachmentSigner == nil {
+	if h.attachmentStorage == nil {
 		writeError(w, http.StatusServiceUnavailable, "Attachment access is not available.")
 		return
 	}
@@ -376,7 +400,7 @@ func (h *Handler) listSourceAttachments(w http.ResponseWriter, r *http.Request) 
 	}
 	items := make([]attachmentJSON, 0, len(attachments))
 	for _, attachment := range attachments {
-		signedURL, signErr := h.attachmentSigner.SignURL(r.Context(), attachmentstorage.ObjectRequest{
+		signedURL, signErr := h.attachmentStorage.SignURL(r.Context(), attachmentstorage.ObjectRequest{
 			UserID: user.ID, SourceID: sourceID, ObjectPath: attachment.ObjectPath,
 		}, attachmentURLExpirySeconds)
 		if signErr != nil {
@@ -391,6 +415,391 @@ func (h *Handler) listSourceAttachments(w http.ResponseWriter, r *http.Request) 
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items, "next_cursor": nil})
+}
+
+func (h *Handler) getSourceDebug(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	user, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	sourceID, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, "Source not found.")
+		return
+	}
+	debug, err := h.repository.GetSourceParseDebug(r.Context(), user.ID, sourceID)
+	if errors.Is(err, transactionstore.ErrSourceNotFound) {
+		writeError(w, http.StatusNotFound, "Source not found.")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Could not load source debug information.")
+		return
+	}
+	writeJSON(w, http.StatusOK, debug)
+}
+
+func (h *Handler) getSourceDebugField(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	user, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	sourceID, sourceErr := uuid.Parse(r.PathValue("id"))
+	attemptID, attemptErr := uuid.Parse(r.PathValue("attempt_id"))
+	if sourceErr != nil || attemptErr != nil || sourceID == uuid.Nil || attemptID == uuid.Nil {
+		writeError(w, http.StatusNotFound, "Debug field not found.")
+		return
+	}
+	field, err := h.repository.GetSourceParseAuditField(
+		r.Context(), user.ID, sourceID, attemptID, r.PathValue("field"),
+	)
+	if errors.Is(err, transactionstore.ErrSourceDebugFieldUnsupported) {
+		writeError(w, http.StatusBadRequest, "Unsupported debug field.")
+		return
+	}
+	if errors.Is(err, transactionstore.ErrSourceNotFound) {
+		writeError(w, http.StatusNotFound, "Debug field not found.")
+		return
+	}
+	if errors.Is(err, transactionstore.ErrSourceDebugFieldTooLarge) {
+		writeError(w, http.StatusUnprocessableEntity, "Stored debug field exceeds its permitted size.")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Could not load source debug field.")
+		return
+	}
+	writeJSON(w, http.StatusOK, field)
+}
+
+func (h *Handler) deleteSource(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	sourceID, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, "Source not found.")
+		return
+	}
+	result, err := h.repository.StageSourceDeletion(r.Context(), user.ID, sourceID)
+	if errors.Is(err, transactionstore.ErrSourceNotFound) {
+		writeError(w, http.StatusNotFound, "Source not found.")
+		return
+	}
+	if errors.Is(err, transactionstore.ErrSourceDeletionIngestionActive) {
+		writeError(w, http.StatusConflict, "Wait for Gmail sync to finish before deleting this source.")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Could not stage source deletion.")
+		return
+	}
+	status := http.StatusOK
+	if result.CleanupPending {
+		status = http.StatusAccepted
+	}
+	writeJSON(w, status, result)
+}
+
+func (h *Handler) getTransactionSettings(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	settings, err := h.repository.GetTransactionSettings(r.Context(), user.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Could not load transaction settings.")
+		return
+	}
+	writeJSON(w, http.StatusOK, settings)
+}
+
+func (h *Handler) putDefaultInstructions(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	var request struct {
+		DefaultInstructions *string `json:"default_instructions"`
+	}
+	if err := decodeRequestJSON(w, r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid default-instructions request.")
+		return
+	}
+	if request.DefaultInstructions == nil {
+		writeError(w, http.StatusBadRequest, "default_instructions is required")
+		return
+	}
+	instructions := strings.TrimSpace(*request.DefaultInstructions)
+	if utf8.RuneCountInString(instructions) > 4000 {
+		writeError(w, http.StatusBadRequest, "default_instructions must be at most 4000 characters")
+		return
+	}
+	saved, err := h.repository.PutDefaultParserInstructions(r.Context(), user.ID, instructions)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Could not save default parser instructions.")
+		return
+	}
+	writeJSON(w, http.StatusOK, saved)
+}
+
+type sourceRuleRequest struct {
+	Name             string  `json:"name"`
+	Provider         string  `json:"provider"`
+	SenderMatchType  string  `json:"sender_match_type"`
+	SenderMatchValue string  `json:"sender_match_value"`
+	SubjectMatcher   *string `json:"subject_matcher"`
+	ContentMatcher   *string `json:"content_matcher"`
+	PromptFragment   string  `json:"prompt_fragment"`
+	Priority         int64   `json:"priority"`
+	Active           *bool   `json:"active"`
+}
+
+func (h *Handler) createSourceRule(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	input, err := decodeSourceRuleRequest(w, r)
+	if err != nil {
+		return
+	}
+	rule, err := h.repository.CreateUserSourceParserRule(r.Context(), user.ID, input)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Could not create source rule.")
+		return
+	}
+	writeJSON(w, http.StatusCreated, rule)
+}
+
+func (h *Handler) updateSourceRule(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	ruleID, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, "Source rule not found.")
+		return
+	}
+	input, err := decodeSourceRuleRequest(w, r)
+	if err != nil {
+		return
+	}
+	rule, err := h.repository.UpdateUserSourceParserRule(r.Context(), user.ID, ruleID, input)
+	if errors.Is(err, transactionstore.ErrUserSourceRuleNotFound) {
+		writeError(w, http.StatusNotFound, "Source rule not found.")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Could not update source rule.")
+		return
+	}
+	writeJSON(w, http.StatusOK, rule)
+}
+
+func (h *Handler) deleteSourceRule(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	ruleID, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, "Source rule not found.")
+		return
+	}
+	err = h.repository.RetireUserSourceParserRule(r.Context(), user.ID, ruleID)
+	if errors.Is(err, transactionstore.ErrUserSourceRuleNotFound) {
+		writeError(w, http.StatusNotFound, "Source rule not found.")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Could not delete source rule.")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func decodeSourceRuleRequest(w http.ResponseWriter, r *http.Request) (transactionstore.UserSourceParserRuleInput, error) {
+	var request sourceRuleRequest
+	if err := decodeRequestJSON(w, r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid source-rule request.")
+		return transactionstore.UserSourceParserRuleInput{}, err
+	}
+	input, err := request.validate()
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return transactionstore.UserSourceParserRuleInput{}, err
+	}
+	return input, nil
+}
+
+func (request sourceRuleRequest) validate() (transactionstore.UserSourceParserRuleInput, error) {
+	name := strings.TrimSpace(request.Name)
+	if length := utf8.RuneCountInString(name); length < 1 || length > 100 {
+		return transactionstore.UserSourceParserRuleInput{}, errors.New("name must be between 1 and 100 characters")
+	}
+	if request.Provider != "gmail" {
+		return transactionstore.UserSourceParserRuleInput{}, errors.New("provider must be gmail")
+	}
+	if request.SenderMatchType != "exact" && request.SenderMatchType != "domain" && request.SenderMatchType != "regex" {
+		return transactionstore.UserSourceParserRuleInput{}, errors.New("sender_match_type must be exact, domain, or regex")
+	}
+	senderValue := strings.TrimSpace(request.SenderMatchValue)
+	if length := utf8.RuneCountInString(senderValue); length < 1 || length > 500 {
+		return transactionstore.UserSourceParserRuleInput{}, errors.New("sender_match_value must be between 1 and 500 characters")
+	}
+	switch request.SenderMatchType {
+	case "exact":
+		address, err := mail.ParseAddress(senderValue)
+		if err != nil || !strings.Contains(address.Address, "@") {
+			return transactionstore.UserSourceParserRuleInput{}, errors.New("sender_match_value must be a valid email address for exact matching")
+		}
+	case "domain":
+		domain := strings.TrimPrefix(strings.ToLower(senderValue), "@")
+		valid, _ := regexp.MatchString(`^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$`, domain)
+		if !valid || !strings.Contains(domain, ".") || strings.Contains(domain, "..") {
+			return transactionstore.UserSourceParserRuleInput{}, errors.New("sender_match_value must be a valid domain")
+		}
+		senderValue = domain
+	case "regex":
+		if err := parserrules.ValidateRE2(senderValue); err != nil {
+			return transactionstore.UserSourceParserRuleInput{}, errors.New("sender_match_value must be a valid RE2 expression")
+		}
+	}
+	subject, err := validatedOptionalMatcher(request.SubjectMatcher, "subject_matcher")
+	if err != nil {
+		return transactionstore.UserSourceParserRuleInput{}, err
+	}
+	content, err := validatedOptionalMatcher(request.ContentMatcher, "content_matcher")
+	if err != nil {
+		return transactionstore.UserSourceParserRuleInput{}, err
+	}
+	prompt := strings.TrimSpace(request.PromptFragment)
+	if utf8.RuneCountInString(prompt) > 4000 {
+		return transactionstore.UserSourceParserRuleInput{}, errors.New("prompt_fragment must be at most 4000 characters")
+	}
+	if request.Priority < math.MinInt32 || request.Priority > math.MaxInt32 {
+		return transactionstore.UserSourceParserRuleInput{}, errors.New("priority is outside the supported range")
+	}
+	if request.Active == nil {
+		return transactionstore.UserSourceParserRuleInput{}, errors.New("active is required")
+	}
+	return transactionstore.UserSourceParserRuleInput{
+		Name: name, Provider: request.Provider, SenderMatchType: request.SenderMatchType,
+		SenderMatchValue: senderValue, SubjectMatcher: subject, ContentMatcher: content,
+		PromptFragment: prompt, Priority: int(request.Priority), Active: *request.Active,
+	}, nil
+}
+
+func validatedOptionalMatcher(value *string, field string) (*string, error) {
+	if value == nil || strings.TrimSpace(*value) == "" {
+		return nil, nil
+	}
+	trimmed := strings.TrimSpace(*value)
+	if utf8.RuneCountInString(trimmed) > 1000 {
+		return nil, fmt.Errorf("%s must be at most 1000 characters", field)
+	}
+	if parserrules.ValidateRE2(trimmed) != nil {
+		return nil, fmt.Errorf("%s must be a valid RE2 expression", field)
+	}
+	return &trimmed, nil
+}
+
+func (h *Handler) createMatchingKey(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	var request struct {
+		AccountID    string `json:"account_id"`
+		KeyType      string `json:"key_type"`
+		DisplayValue string `json:"display_value"`
+	}
+	if err := decodeRequestJSON(w, r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid matching-key request.")
+		return
+	}
+	accountID, err := uuid.Parse(request.AccountID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "account_id must be a UUID")
+		return
+	}
+	display := strings.TrimSpace(request.DisplayValue)
+	if length := utf8.RuneCountInString(display); length < 1 || length > 100 {
+		writeError(w, http.StatusBadRequest, "display_value must be between 1 and 100 characters")
+		return
+	}
+	if _, err = reconciliation.NormalizeAccountMatchingKey(request.KeyType, display); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	key, err := h.repository.CreateAccountMatchingKey(r.Context(), user.ID, transactionstore.AccountMatchingKeyInput{
+		AccountID: accountID, KeyType: request.KeyType, DisplayValue: display,
+	})
+	if errors.Is(err, transactionstore.ErrAccountNotFound) {
+		writeError(w, http.StatusUnprocessableEntity, "The selected account is unavailable.")
+		return
+	}
+	if errors.Is(err, transactionstore.ErrMatchingKeyConflict) {
+		writeError(w, http.StatusConflict, "That matching key already exists.")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Could not create matching key.")
+		return
+	}
+	writeJSON(w, http.StatusCreated, key)
+}
+
+func (h *Handler) patchMatchingKey(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	keyID, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, "Matching key not found.")
+		return
+	}
+	var request struct {
+		Active *bool `json:"active"`
+	}
+	if err := decodeRequestJSON(w, r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid matching-key request.")
+		return
+	}
+	if request.Active == nil {
+		writeError(w, http.StatusBadRequest, "active is required")
+		return
+	}
+	key, err := h.repository.SetAccountMatchingKeyActive(r.Context(), user.ID, keyID, *request.Active)
+	if errors.Is(err, transactionstore.ErrMatchingKeyNotFound) {
+		writeError(w, http.StatusNotFound, "Matching key not found.")
+		return
+	}
+	if errors.Is(err, transactionstore.ErrMatchingKeyConflict) {
+		writeError(w, http.StatusConflict, "That matching key cannot be reactivated.")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Could not update matching key.")
+		return
+	}
+	writeJSON(w, http.StatusOK, key)
 }
 
 func (h *Handler) retrySourceParse(w http.ResponseWriter, r *http.Request) {

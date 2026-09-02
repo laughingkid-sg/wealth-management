@@ -570,9 +570,9 @@ func insertTransferLeg(ctx context.Context, tx pgx.Tx, userID uuid.UUID, kind st
 		insert into public.transactions (
 			user_id, account_id, transaction_kind, title, merchant_name,
 			original_amount_minor, original_currency, sgd_amount_minor, occurred_at,
-			category_id, line_items, details, review_status
+			category_id, line_items, details, review_status, creation_method
 		) values (
-			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, '{}'::jsonb, 'confirmed'
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, '{}'::jsonb, 'confirmed', 'internal_transfer'
 		)
 		returning id, account_id, transaction_kind, title, merchant_name,
 			original_amount_minor, original_currency, sgd_amount_minor, occurred_at,
