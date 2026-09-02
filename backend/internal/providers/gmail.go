@@ -606,7 +606,7 @@ func normalizedMediaType(value string) string {
 
 func supportedGmailAttachmentType(mediaType string) bool {
 	switch mediaType {
-	case "application/pdf", "image/jpeg", "image/png", "image/gif", "image/webp", "image/heic", "image/heif":
+	case "application/pdf", "image/bmp", "image/jpeg", "image/png", "image/tiff", "image/webp", "image/heic":
 		return true
 	default:
 		return false

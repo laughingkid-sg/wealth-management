@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/zhengteck/wealth-builder/backend/internal/attachmentstorage"
 	"github.com/zhengteck/wealth-builder/backend/internal/emailcontent"
 	"github.com/zhengteck/wealth-builder/backend/internal/jobs"
 	"github.com/zhengteck/wealth-builder/backend/internal/providers"
@@ -23,6 +24,8 @@ const maxJobAttempts = 5
 type Repository interface {
 	GetGmailConnection(context.Context, uuid.UUID) (transactionstore.GmailConnection, error)
 	StoreIngestedSource(context.Context, transactionstore.IngestedSource) (uuid.UUID, bool, error)
+	FindIngestedSourceID(context.Context, uuid.UUID, string) (uuid.UUID, error)
+	UpdateIngestedSourceRawData(context.Context, uuid.UUID, uuid.UUID, json.RawMessage) error
 	StartSyncRun(context.Context, uuid.UUID, uuid.UUID) error
 	CompleteSyncRun(context.Context, uuid.UUID, uuid.UUID, int, int) error
 	RecordSyncFailure(context.Context, uuid.UUID, uuid.UUID, bool) error
@@ -38,6 +41,7 @@ type GmailIngestionHandler struct {
 	Gmail                   providers.GmailClient
 	Tokens                  TokenExchanger
 	Cipher                  *secret.Cipher
+	Attachments             attachmentstorage.Uploader
 	Label                   string
 	InitialBackfillMax      int
 	DevelopmentRefreshToken string
@@ -47,7 +51,7 @@ func (h GmailIngestionHandler) Handle(ctx context.Context, job jobs.Job) error {
 	if job.Kind != jobs.KindGmailIngest {
 		return fmt.Errorf("unsupported job kind %q", job.Kind)
 	}
-	if h.Repository == nil || h.Gmail == nil || h.Tokens == nil || h.Cipher == nil {
+	if h.Repository == nil || h.Gmail == nil || h.Tokens == nil || h.Cipher == nil || h.Attachments == nil {
 		return errors.New("Gmail ingestion handler is not configured")
 	}
 	var payload struct {
@@ -79,16 +83,27 @@ func (h GmailIngestionHandler) Handle(ctx context.Context, job jobs.Job) error {
 		if err != nil {
 			return h.fail(ctx, job, runID, err)
 		}
-		rawData, err := marshalRawData(message)
+		rawData, err := marshalRawData(message, nil, nil)
 		if err != nil {
 			return h.fail(ctx, job, runID, err)
 		}
-		_, inserted, err := h.Repository.StoreIngestedSource(ctx, transactionstore.IngestedSource{
-			UserID: job.UserID, ProviderMessageID: message.ID, ProviderThreadID: message.ThreadID,
+		sourceID, inserted, err := h.Repository.StoreIngestedSource(ctx, transactionstore.IngestedSource{
+			UserID: job.UserID, SyncRunID: runID, ProviderMessageID: message.ID, ProviderThreadID: message.ThreadID,
 			ReceivedAt: message.ReceivedAt, RawData: rawData,
 		})
 		if err != nil {
 			return h.fail(ctx, job, runID, err)
+		}
+		if !inserted {
+			sourceID, err = h.Repository.FindIngestedSourceID(ctx, job.UserID, message.ID)
+			if err != nil {
+				return h.fail(ctx, job, runID, fmt.Errorf("find previously ingested source: %w", err))
+			}
+		}
+		if len(message.Attachments) > 0 {
+			if err := h.persistAttachments(ctx, job.UserID, sourceID, message); err != nil {
+				return h.fail(ctx, job, runID, err)
+			}
 		}
 		if inserted {
 			saved++
@@ -101,6 +116,37 @@ func (h GmailIngestionHandler) Handle(ctx context.Context, job jobs.Job) error {
 	}
 	if err := h.Repository.CompleteSyncRun(ctx, job.UserID, runID, len(refs), saved); err != nil {
 		return fmt.Errorf("complete sync run: %w", err)
+	}
+	return nil
+}
+
+func (h GmailIngestionHandler) persistAttachments(ctx context.Context, userID, sourceID uuid.UUID, message providers.GmailMessage) error {
+	results := make([]attachmentstorage.UploadResult, len(message.Attachments))
+	statuses := make([]string, len(message.Attachments))
+	for index, attachment := range message.Attachments {
+		result, err := h.Attachments.Upload(ctx, attachmentstorage.UploadRequest{
+			UserID: userID, SourceID: sourceID, MIMEType: attachment.MIMEType, Content: attachment.Content,
+		})
+		if err != nil {
+			statuses[index] = "failed"
+			rawData, metadataErr := marshalRawData(message, results, statuses)
+			if metadataErr != nil {
+				return metadataErr
+			}
+			if metadataErr = h.Repository.UpdateIngestedSourceRawData(ctx, userID, sourceID, rawData); metadataErr != nil {
+				return fmt.Errorf("record attachment storage failure: %w", metadataErr)
+			}
+			return fmt.Errorf("upload Gmail attachment %q: %w", attachment.Filename, err)
+		}
+		results[index] = result
+		statuses[index] = "stored"
+	}
+	rawData, err := marshalRawData(message, results, statuses)
+	if err != nil {
+		return err
+	}
+	if err := h.Repository.UpdateIngestedSourceRawData(ctx, userID, sourceID, rawData); err != nil {
+		return fmt.Errorf("save attachment storage metadata: %w", err)
 	}
 	return nil
 }
@@ -148,17 +194,26 @@ func valueOrEmpty(value *string) string {
 	return *value
 }
 
-func marshalRawData(message providers.GmailMessage) (json.RawMessage, error) {
+func marshalRawData(message providers.GmailMessage, storageResults []attachmentstorage.UploadResult, storageStatuses []string) (json.RawMessage, error) {
 	attachments := make([]map[string]any, 0, len(message.Attachments))
-	for _, attachment := range message.Attachments {
+	for index, attachment := range message.Attachments {
 		digest := sha256.Sum256(attachment.Content)
-		attachments = append(attachments, map[string]any{
+		metadata := map[string]any{
 			"provider_attachment_id": attachment.ID, "filename": attachment.Filename,
 			"mime_type": attachment.MIMEType, "byte_size": attachment.Size,
 			"sha256":         hex.EncodeToString(digest[:]),
 			"parse_eligible": attachmentFilenameEligible(attachment.Filename),
-			"storage_status": "deferred",
-		})
+			"storage_status": "pending",
+		}
+		if index < len(storageStatuses) && storageStatuses[index] != "" {
+			metadata["storage_status"] = storageStatuses[index]
+		}
+		if index < len(storageResults) && storageResults[index].ObjectPath != "" {
+			metadata["object_path"] = storageResults[index].ObjectPath
+			metadata["sha256"] = storageResults[index].SHA256
+			metadata["byte_size"] = storageResults[index].ByteSize
+		}
+		attachments = append(attachments, metadata)
 	}
 	data := map[string]any{
 		"provider_message_id": message.ID, "provider_thread_id": message.ThreadID,

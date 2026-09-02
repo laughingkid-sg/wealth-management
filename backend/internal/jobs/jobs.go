@@ -13,13 +13,14 @@ type Kind string
 
 const (
 	KindGmailIngest Kind = "gmail_ingestion"
-	KindSourceParse Kind = "source_parse"
-	KindReconcile   Kind = "reconcile"
+	KindSourceParse Kind = "source_parsing"
+	KindReconcile   Kind = "reconciliation"
 )
 
 type Job struct {
 	ID         uuid.UUID
 	UserID     uuid.UUID
+	SyncRunID  *uuid.UUID
 	Kind       Kind
 	Payload    []byte
 	Attempts   int
@@ -37,6 +38,19 @@ type Store interface {
 
 type Handler interface {
 	Handle(context.Context, Job) error
+}
+
+// Router dispatches durable job kinds to independently configured handlers.
+// It keeps each handler focused while making unsupported queue values fail
+// safely and retry through Worker.
+type Router map[Kind]Handler
+
+func (r Router) Handle(ctx context.Context, job Job) error {
+	handler, ok := r[job.Kind]
+	if !ok || handler == nil {
+		return errors.New("no handler is configured for job kind " + string(job.Kind))
+	}
+	return handler.Handle(ctx, job)
 }
 
 type Worker struct {

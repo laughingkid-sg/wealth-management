@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
 import type { Session } from "@supabase/supabase-js";
 import {
   AlertTriangle,
@@ -7,24 +7,33 @@ import {
   Clock3,
   FileSearch,
   Inbox,
+  Link2Off,
   Mail,
+  PlusCircle,
   RefreshCw,
   Search,
   SlidersHorizontal,
   X,
 } from "lucide-react";
 import {
+  attachSourceToTransaction,
+  createTransactionFromSource,
   getSanitizedEmail,
   getSyncRun,
+  getTransactionSources,
+  listOwnedAccounts,
   listSources,
+  listTransactionsForAccount,
   listTransactions,
   startGmailSync,
   TransactionApiError,
+  unmatchSourceLink,
   type SanitizedEmail,
 } from "./api";
 import {
   formatAmount,
   formatDateTime,
+  type OwnedAccountOption,
   type SourceSummary,
   type TransactionFilters,
   type TransactionListItem,
@@ -52,14 +61,27 @@ function SourceInspector({
   session,
   source,
   close,
+  resolved,
 }: {
   session: Session;
   source: SourceSummary;
   close: () => void;
+  resolved: (message: string) => void;
 }) {
   const [email, setEmail] = useState<SanitizedEmail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [action, setAction] = useState<"attach" | "create">("attach");
+  const [accounts, setAccounts] = useState<OwnedAccountOption[]>([]);
+  const [accountsLoading, setAccountsLoading] = useState(true);
+  const [accountsError, setAccountsError] = useState<string | null>(null);
+  const [accountId, setAccountId] = useState("");
+  const [candidates, setCandidates] = useState<TransactionListItem[]>([]);
+  const [candidatesLoading, setCandidatesLoading] = useState(false);
+  const [candidateError, setCandidateError] = useState<string | null>(null);
+  const [transactionId, setTransactionId] = useState("");
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -83,6 +105,78 @@ function SourceInspector({
       cancelled = true;
     };
   }, [session, source.id]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void listOwnedAccounts(session)
+      .then((items) => {
+        if (!cancelled) setAccounts(items);
+      })
+      .catch((requestError: unknown) => {
+        if (!cancelled) {
+          setAccountsError(
+            requestError instanceof Error ? requestError.message : "Couldn’t load your accounts.",
+          );
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setAccountsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [session]);
+
+  useEffect(() => {
+    if (!accountId) {
+      return;
+    }
+    let cancelled = false;
+    void listTransactionsForAccount(session, accountId)
+      .then((items) => {
+        if (!cancelled) setCandidates(items);
+      })
+      .catch((requestError: unknown) => {
+        if (!cancelled) {
+          setCandidateError(
+            requestError instanceof Error
+              ? requestError.message
+              : "Couldn’t load transactions for this account.",
+          );
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setCandidatesLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [accountId, session]);
+
+  async function submitResolution(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!accountId || (action === "attach" && !transactionId)) return;
+    setSubmitting(true);
+    setActionError(null);
+    try {
+      if (action === "attach") {
+        await attachSourceToTransaction(session, source.id, transactionId);
+        resolved(`Evidence was attached to the selected transaction.`);
+      } else {
+        await createTransactionFromSource(session, source.id, accountId);
+        resolved(`A transaction was created from this evidence.`);
+      }
+      close();
+    } catch (requestError: unknown) {
+      setActionError(
+        requestError instanceof Error
+          ? requestError.message
+          : "Couldn’t save this source decision.",
+      );
+    } finally {
+      setSubmitting(false);
+    }
+  }
 
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={close}>
@@ -122,12 +216,259 @@ function SourceInspector({
             srcDoc={email.html}
           />
         )}
+        <section className="source-resolution" aria-labelledby="source-resolution-title">
+          <div>
+            <p className="eyebrow">RESOLVE SOURCE</p>
+            <h3 id="source-resolution-title">Choose where this evidence belongs</h3>
+            <p className="muted">
+              Select one of your active accounts. The server validates ownership and uses the
+              source candidate; this form never sends parsed amounts or titles.
+            </p>
+          </div>
+          {accountsLoading ? (
+            <p className="muted" aria-live="polite">Loading your accounts…</p>
+          ) : accountsError ? (
+            <section className="notice notice-error" role="alert">
+              <CircleAlert size={20} />
+              <div>
+                <strong>Couldn’t load accounts.</strong>
+                <p>{accountsError}</p>
+              </div>
+            </section>
+          ) : accounts.length === 0 ? (
+            <section className="notice notice-error" role="status">
+              <CircleAlert size={20} />
+              <div>
+                <strong>Add an account first.</strong>
+                <p>A transaction needs an active account before this source can be resolved.</p>
+              </div>
+            </section>
+          ) : (
+            <form className="resolution-form" onSubmit={(event) => void submitResolution(event)}>
+              <fieldset className="resolution-choice">
+                <legend>Resolution</legend>
+                <label>
+                  <input
+                    checked={action === "attach"}
+                    name="source-resolution"
+                    onChange={() => setAction("attach")}
+                    type="radio"
+                    value="attach"
+                  />
+                  Attach to an existing transaction
+                </label>
+                <label>
+                  <input
+                    checked={action === "create"}
+                    name="source-resolution"
+                    onChange={() => setAction("create")}
+                    type="radio"
+                    value="create"
+                  />
+                  Create a transaction from this source
+                </label>
+              </fieldset>
+              <label>
+                Account
+                <select
+                  onChange={(event) => {
+                    const nextAccountId = event.target.value;
+                    setAccountId(nextAccountId);
+                    setCandidates([]);
+                    setCandidateError(null);
+                    setTransactionId("");
+                    setCandidatesLoading(Boolean(nextAccountId));
+                  }}
+                  required
+                  value={accountId}
+                >
+                  <option value="">Choose an account</option>
+                  {accounts.map((account) => (
+                    <option key={account.id} value={account.id}>
+                      {account.name}{account.institution_name ? ` · ${account.institution_name}` : ""}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {action === "attach" && accountId && (
+                <label>
+                  Transaction
+                  <select
+                    disabled={candidatesLoading || Boolean(candidateError)}
+                    onChange={(event) => setTransactionId(event.target.value)}
+                    required
+                    value={transactionId}
+                  >
+                    <option value="">
+                      {candidatesLoading
+                        ? "Loading transactions…"
+                        : candidates.length === 0
+                          ? "No transactions in this account"
+                          : "Choose a transaction"}
+                    </option>
+                    {candidates.map((transaction) => (
+                      <option key={transaction.id} value={transaction.id}>
+                        {transaction.title} · {formatAmount(transaction.original_amount_minor, transaction.original_currency)} · {formatDateTime(transaction.occurred_at)}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
+              {candidateError && (
+                <p className="form-error" role="alert">{candidateError}</p>
+              )}
+              {actionError && (
+                <p className="form-error" role="alert">{actionError}</p>
+              )}
+              <div className="modal-actions">
+                <button className="button button-secondary" onClick={close} type="button">
+                  Cancel
+                </button>
+                <button
+                  className="button button-primary"
+                  disabled={
+                    submitting ||
+                    !accountId ||
+                    (action === "attach" && (!transactionId || candidatesLoading))
+                  }
+                  type="submit"
+                >
+                  <PlusCircle size={17} />
+                  {submitting
+                    ? "Saving…"
+                    : action === "attach"
+                      ? "Attach source"
+                      : "Create transaction"}
+                </button>
+              </div>
+            </form>
+          )}
+        </section>
       </section>
     </div>
   );
 }
 
-function TransactionRows({ items }: { items: TransactionListItem[] }) {
+function TransactionEvidenceDialog({
+  session,
+  transaction,
+  close,
+  unmatched,
+}: {
+  session: Session;
+  transaction: TransactionListItem;
+  close: () => void;
+  unmatched: (message: string) => void;
+}) {
+  const [sources, setSources] = useState<SourceSummary[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [unmatchingId, setUnmatchingId] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void getTransactionSources(session, transaction.id)
+      .then((items) => {
+        if (!cancelled) setSources(items);
+      })
+      .catch((requestError: unknown) => {
+        if (!cancelled) {
+          setError(
+            requestError instanceof Error
+              ? requestError.message
+              : "Couldn’t load this transaction’s evidence.",
+          );
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [session, transaction.id]);
+
+  async function unmatch(source: SourceSummary) {
+    if (!source.source_link_id) return;
+    setUnmatchingId(source.source_link_id);
+    setError(null);
+    try {
+      await unmatchSourceLink(session, source.source_link_id);
+      setSources((current) => current.filter((item) => item.source_link_id !== source.source_link_id));
+      unmatched("Evidence was unmatched and retained for review.");
+    } catch (requestError: unknown) {
+      setError(
+        requestError instanceof Error ? requestError.message : "Couldn’t unmatch this evidence.",
+      );
+    } finally {
+      setUnmatchingId(null);
+    }
+  }
+
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={close}>
+      <section
+        className="modal evidence-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="transaction-evidence-title"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <header className="modal-header">
+          <div>
+            <p className="eyebrow">TRANSACTION EVIDENCE</p>
+            <h2 id="transaction-evidence-title">{transaction.title}</h2>
+            <p className="muted">Unmatching keeps the source and its audit history for review.</p>
+          </div>
+          <button className="icon-button" onClick={close} type="button" aria-label="Close evidence">
+            <X size={18} />
+          </button>
+        </header>
+        {loading ? (
+          <p className="source-loading" aria-live="polite">Loading attached evidence…</p>
+        ) : error ? (
+          <section className="notice notice-error" role="alert">
+            <CircleAlert size={20} />
+            <div>
+              <strong>Couldn’t update transaction evidence.</strong>
+              <p>{error}</p>
+            </div>
+          </section>
+        ) : sources.length === 0 ? (
+          <p className="source-loading">There is no active evidence attached to this transaction.</p>
+        ) : (
+          <ul className="evidence-list">
+            {sources.map((source) => (
+              <li key={source.source_link_id ?? source.id}>
+                <div>
+                  <strong>{sourceTitle(source)}</strong>
+                  <p>{source.sender ?? source.provider} · {formatDateTime(source.received_at)}</p>
+                </div>
+                <button
+                  className="button button-secondary"
+                  disabled={!source.source_link_id || unmatchingId === source.source_link_id}
+                  onClick={() => void unmatch(source)}
+                  type="button"
+                >
+                  <Link2Off size={17} />
+                  {unmatchingId === source.source_link_id ? "Unmatching…" : "Unmatch"}
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function TransactionRows({
+  items,
+  inspectEvidence,
+}: {
+  items: TransactionListItem[];
+  inspectEvidence: (transaction: TransactionListItem) => void;
+}) {
   return (
     <section className="transaction-list" aria-label="Transactions">
       {items.map((transaction) => (
@@ -148,6 +489,13 @@ function TransactionRows({ items }: { items: TransactionListItem[] }) {
               <span className="status-pill review">Needs review</span>
             )}
           </div>
+          <button
+            className="button button-secondary button-compact"
+            onClick={() => inspectEvidence(transaction)}
+            type="button"
+          >
+            Evidence{transaction.source_count ? ` (${transaction.source_count})` : ""}
+          </button>
           <strong className={`transaction-amount ${transaction.transaction_kind}`}>
             {transaction.transaction_kind === "debit" ? "−" : "+"}
             {formatAmount(transaction.original_amount_minor, transaction.original_currency)}
@@ -204,7 +552,7 @@ function SourceCards({
             </dl>
           </div>
           <button className="button button-secondary" onClick={() => inspect(source)} type="button">
-            <FileSearch size={17} /> Inspect source
+            <FileSearch size={17} /> Inspect & resolve
           </button>
         </article>
       ))}
@@ -222,6 +570,8 @@ export function TransactionsPage({ session }: { session: Session }) {
   const [syncRun, setSyncRun] = useState<TransactionSyncRun | null>(null);
   const [startingSync, setStartingSync] = useState(false);
   const [inspecting, setInspecting] = useState<SourceSummary | null>(null);
+  const [evidenceTransaction, setEvidenceTransaction] = useState<TransactionListItem | null>(null);
+  const [success, setSuccess] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -313,6 +663,11 @@ export function TransactionsPage({ session }: { session: Session }) {
 
   function clearFilters() {
     setFilters({});
+  }
+
+  function showSuccess(message: string) {
+    setSuccess(message);
+    void load();
   }
 
   return (
@@ -409,6 +764,19 @@ export function TransactionsPage({ session }: { session: Session }) {
         </section>
       )}
 
+      {success && (
+        <section className="notice notice-success" role="status">
+          <CheckCircle2 size={20} />
+          <div>
+            <strong>Saved</strong>
+            <p>{success}</p>
+          </div>
+          <button className="button button-secondary" onClick={() => setSuccess(null)} type="button">
+            Dismiss
+          </button>
+        </section>
+      )}
+
       {loading ? (
         <section className="transaction-panel" aria-label="Loading transactions">
           <div className="skeleton-row" />
@@ -428,12 +796,27 @@ export function TransactionsPage({ session }: { session: Session }) {
           {hasFilters && <button className="button button-secondary" onClick={clearFilters} type="button">Clear filters</button>}
         </section>
       ) : view === "transactions" ? (
-        <TransactionRows items={transactions} />
+        <TransactionRows inspectEvidence={setEvidenceTransaction} items={transactions} />
       ) : (
         <SourceCards inspect={setInspecting} sources={sources} view={view} />
       )}
 
-      {inspecting && <SourceInspector close={() => setInspecting(null)} session={session} source={inspecting} />}
+      {inspecting && (
+        <SourceInspector
+          close={() => setInspecting(null)}
+          resolved={showSuccess}
+          session={session}
+          source={inspecting}
+        />
+      )}
+      {evidenceTransaction && (
+        <TransactionEvidenceDialog
+          close={() => setEvidenceTransaction(null)}
+          session={session}
+          transaction={evidenceTransaction}
+          unmatched={showSuccess}
+        />
+      )}
     </>
   );
 }

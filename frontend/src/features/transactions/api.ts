@@ -1,6 +1,7 @@
 import type { Session } from "@supabase/supabase-js";
 import type {
   MinorUnitAmount,
+  OwnedAccountOption,
   SourceStatus,
   SourceSummary,
   SyncRunStatus,
@@ -130,6 +131,10 @@ function parseSource(value: unknown): SourceSummary | null {
   if (!id || !receivedAt) return null;
   return {
     id,
+    source_link_id:
+      nullableString(value.source_link_id) ||
+      nullableString(value.link_id) ||
+      nullableString(value.transaction_data_source_id),
     source_type: enumValue(value.source_type, ["gmail_email", "phone_notification"], "gmail_email"),
     provider: stringValue(value.provider, "Gmail"),
     subject: nullableString(value.subject),
@@ -145,6 +150,18 @@ function parseSource(value: unknown): SourceSummary | null {
     suggested_amount_minor: nullableMinorUnitAmount(value.suggested_amount_minor),
     suggested_currency: nullableString(value.suggested_currency),
     suggested_account_name: nullableString(value.suggested_account_name),
+  };
+}
+
+function parseOwnedAccount(value: unknown): OwnedAccountOption | null {
+  if (!isRecord(value)) return null;
+  const id = stringValue(value.id);
+  const name = stringValue(value.name);
+  if (!id || !name) return null;
+  return {
+    id,
+    name,
+    institution_name: stringValue(value.institution_name),
   };
 }
 
@@ -233,6 +250,35 @@ export async function listTransactions(
     );
 }
 
+export async function listOwnedAccounts(session: Session): Promise<OwnedAccountOption[]> {
+  const params = new URLSearchParams({
+    select: "id,name,institution_name",
+    deleted_at: "is.null",
+    order: "sort_order.asc,name.asc",
+  });
+  const response = await requestDataRest(session, `accounts?${params.toString()}`);
+  return extractItems(response)
+    .map(parseOwnedAccount)
+    .filter((item): item is OwnedAccountOption => item !== null);
+}
+
+export async function listTransactionsForAccount(
+  session: Session,
+  accountId: string,
+): Promise<TransactionListItem[]> {
+  const params = new URLSearchParams({
+    select:
+      "id,title,merchant_name,account_id,transaction_kind,original_amount_minor,original_currency,sgd_amount_minor,occurred_at,review_status,accounts(name),transaction_categories(name)",
+    account_id: `eq.${accountId}`,
+    order: "occurred_at.desc",
+    limit: "100",
+  });
+  const response = await requestDataRest(session, `transactions?${params.toString()}`);
+  return extractItems(response)
+    .map(parseTransaction)
+    .filter((item): item is TransactionListItem => item !== null);
+}
+
 export async function listSources(
   session: Session,
   status: "dangling" | "review",
@@ -272,4 +318,53 @@ export async function getSanitizedEmail(
   const html = stringValue(response.html);
   if (!html) throw new TransactionApiError("This source does not contain displayable email content.", 404);
   return { subject: stringValue(response.subject, "Email source"), html };
+}
+
+export async function getTransactionSources(
+  session: Session,
+  transactionId: string,
+): Promise<SourceSummary[]> {
+  const response = await request(
+    session,
+    `/v1/transactions/${encodeURIComponent(transactionId)}/sources`,
+  );
+  return extractItems(response)
+    .map(parseSource)
+    .filter((item): item is SourceSummary => item !== null);
+}
+
+export async function attachSourceToTransaction(
+  session: Session,
+  sourceId: string,
+  transactionId: string,
+): Promise<void> {
+  await request(session, `/v1/transactions/sources/${encodeURIComponent(sourceId)}/attach`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ transaction_id: transactionId }),
+  });
+}
+
+export async function createTransactionFromSource(
+  session: Session,
+  sourceId: string,
+  accountId: string,
+): Promise<void> {
+  await request(
+    session,
+    `/v1/transactions/sources/${encodeURIComponent(sourceId)}/create-transaction`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ account_id: accountId }),
+    },
+  );
+}
+
+export async function unmatchSourceLink(session: Session, sourceLinkId: string): Promise<void> {
+  await request(
+    session,
+    `/v1/transactions/source-links/${encodeURIComponent(sourceLinkId)}/unmatch`,
+    { method: "POST" },
+  );
 }

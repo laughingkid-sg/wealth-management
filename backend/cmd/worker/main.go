@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/zhengteck/wealth-builder/backend/internal/attachmentstorage"
 	"github.com/zhengteck/wealth-builder/backend/internal/config"
 	"github.com/zhengteck/wealth-builder/backend/internal/database"
 	"github.com/zhengteck/wealth-builder/backend/internal/ingestion"
@@ -17,6 +18,7 @@ import (
 	"github.com/zhengteck/wealth-builder/backend/internal/providers"
 	"github.com/zhengteck/wealth-builder/backend/internal/secret"
 	"github.com/zhengteck/wealth-builder/backend/internal/transactionstore"
+	"github.com/zhengteck/wealth-builder/backend/internal/transactionworker"
 )
 
 func main() {
@@ -41,12 +43,26 @@ func main() {
 	if err != nil {
 		log.Fatalf("configure Gmail client: %v", err)
 	}
+	attachmentClient, err := attachmentstorage.New(http.DefaultClient, cfg.SupabaseURL, cfg.SupabaseServiceRoleKey)
+	if err != nil {
+		log.Fatalf("configure transaction attachment storage: %v", err)
+	}
+	qwenClient, err := providers.NewAlibabaQwenClient(http.DefaultClient, cfg.AlibabaBaseURL, cfg.AlibabaTokenPlanAPIKey, cfg.AlibabaModel)
+	if err != nil {
+		log.Fatalf("configure Alibaba parser: %v", err)
+	}
 
 	store := transactionstore.New(pool)
-	handler := ingestion.GmailIngestionHandler{
-		Repository: store, Gmail: gmailClient, Tokens: oauthClient, Cipher: cipher,
+	gmailHandler := ingestion.GmailIngestionHandler{
+		Repository: store, Gmail: gmailClient, Tokens: oauthClient, Cipher: cipher, Attachments: attachmentClient,
 		Label: cfg.GmailSyncLabel, InitialBackfillMax: cfg.InitialBackfillMax,
 		DevelopmentRefreshToken: developmentRefreshToken(cfg),
+	}
+	processingHandler := transactionworker.Handler{Repository: store, Parser: qwenClient}
+	handler := jobs.Router{
+		jobs.KindGmailIngest: gmailHandler,
+		jobs.KindSourceParse: processingHandler,
+		jobs.KindReconcile:   processingHandler,
 	}
 	worker := jobs.Worker{Store: store, WorkerID: workerID(), Handler: handler}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

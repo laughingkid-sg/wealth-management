@@ -22,6 +22,7 @@ export interface TransactionListItem {
 
 export interface SourceSummary {
   id: string;
+  source_link_id: string | null;
   source_type: "gmail_email" | "phone_notification";
   provider: string;
   subject: string | null;
@@ -33,6 +34,12 @@ export interface SourceSummary {
   suggested_amount_minor: MinorUnitAmount | null;
   suggested_currency: string | null;
   suggested_account_name: string | null;
+}
+
+export interface OwnedAccountOption {
+  id: string;
+  name: string;
+  institution_name: string;
 }
 
 export interface TransactionSyncRun {

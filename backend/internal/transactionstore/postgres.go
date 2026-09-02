@@ -68,6 +68,7 @@ type GmailConnection struct {
 
 type IngestedSource struct {
 	UserID            uuid.UUID
+	SyncRunID         uuid.UUID
 	ProviderMessageID string
 	ProviderThreadID  string
 	ReceivedAt        time.Time
@@ -216,8 +217,13 @@ func (s *Store) ConsumeOAuthState(ctx context.Context, digest []byte, now time.T
 }
 
 func (s *Store) StoreIngestedSource(ctx context.Context, source IngestedSource) (uuid.UUID, bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return uuid.Nil, false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
 	var id uuid.UUID
-	err := s.pool.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		insert into private.data_sources (
 			user_id, source_type, provider, provider_message_id, provider_thread_id, received_at, raw_data
 		) values ($1, 'gmail_email', 'gmail', $2, nullif($3, ''), $4, $5::jsonb)
@@ -227,6 +233,19 @@ func (s *Store) StoreIngestedSource(ctx context.Context, source IngestedSource) 
 		return uuid.Nil, false, nil
 	}
 	if err != nil {
+		return uuid.Nil, false, err
+	}
+	payload, err := json.Marshal(map[string]string{"data_source_id": id.String()})
+	if err != nil {
+		return uuid.Nil, false, err
+	}
+	_, err = tx.Exec(ctx, `
+		insert into private.transaction_jobs (user_id, sync_run_id, data_source_id, job_type, payload)
+		values ($1, $2, $3, $4, $5::jsonb)`, source.UserID, source.SyncRunID, id, string(jobs.KindSourceParse), payload)
+	if err != nil {
+		return uuid.Nil, false, err
+	}
+	if err = tx.Commit(ctx); err != nil {
 		return uuid.Nil, false, err
 	}
 	return id, true, nil
@@ -279,7 +298,7 @@ func (s *Store) Claim(ctx context.Context, workerID string, now time.Time) (*job
 		update private.transaction_jobs job set status = 'running', attempts = job.attempts + 1,
 			leased_at = $1, lease_expires_at = $1 + interval '5 minutes', leased_by = $2
 		from candidate where job.id = candidate.id
-		returning job.id, job.user_id, job.job_type, job.payload, job.attempts, job.run_after, job.lease_expires_at`, now, workerID).Scan(&job.ID, &job.UserID, &job.Kind, &payload, &job.Attempts, &job.Available, &lease)
+		returning job.id, job.user_id, job.sync_run_id, job.job_type, job.payload, job.attempts, job.run_after, job.lease_expires_at`, now, workerID).Scan(&job.ID, &job.UserID, &job.SyncRunID, &job.Kind, &payload, &job.Attempts, &job.Available, &lease)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
