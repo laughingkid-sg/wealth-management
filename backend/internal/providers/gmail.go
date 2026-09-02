@@ -12,18 +12,30 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const (
-	GmailReadonlyScope         = "https://www.googleapis.com/auth/gmail.readonly"
-	defaultGoogleTokenURL      = "https://oauth2.googleapis.com/token"
-	defaultGmailAPIBaseURL     = "https://gmail.googleapis.com/gmail/v1"
-	maxGmailAttachmentBytes    = 5 * 1024 * 1024
+	GmailReadonlyScope      = "https://www.googleapis.com/auth/gmail.readonly"
+	defaultGoogleTokenURL   = "https://oauth2.googleapis.com/token"
+	defaultGmailAPIBaseURL  = "https://gmail.googleapis.com/gmail/v1"
+	maxGmailAttachmentBytes = 5 * 1024 * 1024
+	// The remaining 32 KiB below the parser's 256 KiB text ceiling covers
+	// bounded subject/sender fields, labels, prefixes, and received_at.
+	maxGmailBodyBytes          = 224 * 1024
+	maxGmailHeaderValueBytes   = 8 * 1024
 	defaultProviderHTTPTimeout = 20 * time.Second
 )
+
+// ErrGmailMessageUnavailable identifies a Gmail message that was listed but
+// disappeared before its complete contents (or one of its attachments) could
+// be read. Callers may safely skip that source; other provider failures remain
+// retryable errors.
+var ErrGmailMessageUnavailable = errors.New("Gmail message is unavailable")
 
 type GmailMessageRef struct {
 	ID, ThreadID string
@@ -31,9 +43,10 @@ type GmailMessageRef struct {
 }
 
 type GmailMessage struct {
-	ID, ThreadID, RawMIME, HTML, Text string
-	ReceivedAt                        time.Time
-	Attachments                       []GmailAttachment
+	ID, ThreadID, HTML, Text string
+	ReceivedAt               time.Time
+	Attachments              []GmailAttachment
+	BodyTruncated            bool
 	// Headers contains available message headers, keyed case-insensitively in
 	// their canonical lower-case form (for example, "subject" and "from").
 	// It is source evidence, not trusted transaction data.
@@ -260,9 +273,17 @@ func newGmailHTTPClient(httpClient *http.Client, baseURL string) (*GmailHTTPClie
 	}, nil
 }
 
-// ListLabelMessages returns newest-first messages. label may be a Gmail label
-// ID or its visible name (the transaction application passes "odin-finance").
-func (c *GmailHTTPClient) ListLabelMessages(ctx context.Context, accessToken, label, pageToken string, maxResults int) ([]GmailMessageRef, string, error) {
+const (
+	historyCursorPrefix = "history:"
+	maxHistoryPages     = 3
+	historyPageSize     = 100
+)
+
+// ListLabelMessages returns the initial bounded newest messages only when no
+// cursor exists. New messages use a Gmail history cursor. Expired or legacy
+// cursor values use bounded full-label recovery; neither path advances a
+// cursor after an incomplete read.
+func (c *GmailHTTPClient) ListLabelMessages(ctx context.Context, accessToken, label, cursor string, maxResults int) ([]GmailMessageRef, string, error) {
 	if c == nil {
 		return nil, "", errors.New("Gmail client is nil")
 	}
@@ -279,16 +300,93 @@ func (c *GmailHTTPClient) ListLabelMessages(ctx context.Context, accessToken, la
 	if err != nil {
 		return nil, "", err
 	}
-	query := url.Values{"labelIds": {labelID}, "maxResults": {strconv.Itoa(maxResults)}}
-	if strings.TrimSpace(pageToken) != "" {
-		query.Set("pageToken", pageToken)
+	if cursor == "" {
+		return c.initialLabelMessages(ctx, accessToken, labelID, maxResults)
 	}
+	if strings.HasPrefix(cursor, historyCursorPrefix) {
+		refs, next, err := c.historyAddedMessages(ctx, accessToken, labelID, strings.TrimPrefix(cursor, historyCursorPrefix))
+		if err == nil {
+			return refs, next, nil
+		}
+		if !errors.Is(err, errHistoryExpired) {
+			return nil, "", err
+		}
+		return c.recoverLabelMessages(ctx, accessToken, labelID)
+	}
+	// Older builds persisted a page-token-like cursor rather than a Gmail
+	// History ID. Treat it as incomplete state and recover the full label: using
+	// the initial five-message backfill here would silently drop older messages.
+	return c.recoverLabelMessages(ctx, accessToken, labelID)
+}
+
+var errHistoryExpired = errors.New("Gmail history cursor expired")
+
+const maxRecoveryPages = 50
+
+func (c *GmailHTTPClient) recoverLabelMessages(ctx context.Context, accessToken, labelID string) ([]GmailMessageRef, string, error) {
+	next, err := c.currentHistoryCursor(ctx, accessToken)
+	if err != nil {
+		return nil, "", err
+	}
+	refs := make([]GmailMessageRef, 0)
+	pageToken := ""
+	for page := 0; page < maxRecoveryPages; page++ {
+		query := url.Values{"labelIds": {labelID}, "maxResults": {"100"}}
+		if pageToken != "" {
+			query.Set("pageToken", pageToken)
+		}
+		var listed struct {
+			Messages []struct {
+				ID       string `json:"id"`
+				ThreadID string `json:"threadId"`
+			} `json:"messages"`
+			NextPageToken string `json:"nextPageToken"`
+		}
+		if err := c.getJSON(ctx, accessToken, "users/me/messages", query, &listed); err != nil {
+			return nil, "", err
+		}
+		for _, message := range listed.Messages {
+			metadata, err := c.messageMetadata(ctx, accessToken, message.ID)
+			if err != nil {
+				if isHistoryExpiredError(err) {
+					// A message can disappear after list/recovery but before its
+					// metadata request. It is not actionable evidence and must not
+					// make an otherwise complete recovery permanently fail.
+					continue
+				}
+				return nil, "", err
+			}
+			threadID := message.ThreadID
+			if threadID == "" {
+				threadID = metadata.ThreadID
+			}
+			refs = append(refs, GmailMessageRef{ID: message.ID, ThreadID: threadID, ReceivedAt: metadata.ReceivedAt})
+		}
+		if listed.NextPageToken == "" {
+			sort.Slice(refs, func(i, j int) bool { return refs[i].ReceivedAt.After(refs[j].ReceivedAt) })
+			return refs, next, nil
+		}
+		if page == maxRecoveryPages-1 {
+			return nil, "", errors.New("Gmail recovery pagination safety bound reached")
+		}
+		pageToken = listed.NextPageToken
+	}
+	return nil, "", errors.New("Gmail recovery pagination ended unexpectedly")
+}
+
+func (c *GmailHTTPClient) initialLabelMessages(ctx context.Context, accessToken, labelID string, maxResults int) ([]GmailMessageRef, string, error) {
+	// Capture a lower bound before listing. A message arriving during the list
+	// will be replayed on the next History sync instead of being skipped.
+	next, err := c.currentHistoryCursor(ctx, accessToken)
+	if err != nil {
+		return nil, "", err
+	}
+	query := url.Values{"labelIds": {labelID}, "maxResults": {strconv.Itoa(maxResults)}}
 	var listed struct {
 		Messages []struct {
 			ID       string `json:"id"`
 			ThreadID string `json:"threadId"`
 		} `json:"messages"`
-		NextPageToken string `json:"nextPageToken"`
 	}
 	if err := c.getJSON(ctx, accessToken, "users/me/messages", query, &listed); err != nil {
 		return nil, "", err
@@ -300,6 +398,12 @@ func (c *GmailHTTPClient) ListLabelMessages(ctx context.Context, accessToken, la
 		}
 		metadata, err := c.messageMetadata(ctx, accessToken, message.ID)
 		if err != nil {
+			if isHistoryExpiredError(err) {
+				// A message may be deleted after the initial list. The profile
+				// history ID was captured before listing, so skipping this vanished
+				// item cannot skip a still-existing message on the next sync.
+				continue
+			}
 			return nil, "", err
 		}
 		threadID := message.ThreadID
@@ -308,7 +412,145 @@ func (c *GmailHTTPClient) ListLabelMessages(ctx context.Context, accessToken, la
 		}
 		refs = append(refs, GmailMessageRef{ID: message.ID, ThreadID: threadID, ReceivedAt: metadata.ReceivedAt})
 	}
-	return refs, listed.NextPageToken, nil
+	return refs, next, nil
+}
+
+func (c *GmailHTTPClient) historyAddedMessages(ctx context.Context, accessToken, labelID, startHistoryID string) ([]GmailMessageRef, string, error) {
+	if strings.TrimSpace(startHistoryID) == "" {
+		return nil, "", errHistoryExpired
+	}
+	seen := make(map[string]GmailMessageRef)
+	pageToken := ""
+	for page := 0; page < maxHistoryPages; page++ {
+		// Gmail historyTypes accepts one enum value; omit it to receive both
+		// messagesAdded and labelsAdded, then filter safely in this client.
+		query := url.Values{"startHistoryId": {startHistoryID}, "labelId": {labelID}, "maxResults": {strconv.Itoa(historyPageSize)}}
+		if pageToken != "" {
+			query.Set("pageToken", pageToken)
+		}
+		var response struct {
+			HistoryID string `json:"historyId"`
+			History   []struct {
+				MessagesAdded []struct {
+					Message struct {
+						ID       string `json:"id"`
+						ThreadID string `json:"threadId"`
+					} `json:"message"`
+				} `json:"messagesAdded"`
+				LabelsAdded []struct {
+					Message struct {
+						ID       string `json:"id"`
+						ThreadID string `json:"threadId"`
+					} `json:"message"`
+					LabelIDs []string `json:"labelIds"`
+				} `json:"labelsAdded"`
+			} `json:"history"`
+			NextPageToken string `json:"nextPageToken"`
+		}
+		err := c.getJSON(ctx, accessToken, "users/me/history", query, &response)
+		if err != nil {
+			if isHistoryExpiredError(err) {
+				return nil, "", errHistoryExpired
+			}
+			return nil, "", err
+		}
+		for _, history := range response.History {
+			for _, added := range history.MessagesAdded {
+				if added.Message.ID == "" {
+					continue
+				}
+				if _, exists := seen[added.Message.ID]; exists {
+					continue
+				}
+				metadata, metadataErr := c.messageMetadata(ctx, accessToken, added.Message.ID)
+				if metadataErr != nil {
+					if isHistoryExpiredError(metadataErr) {
+						continue
+					}
+					return nil, "", metadataErr
+				}
+				threadID := added.Message.ThreadID
+				if threadID == "" {
+					threadID = metadata.ThreadID
+				}
+				seen[added.Message.ID] = GmailMessageRef{ID: added.Message.ID, ThreadID: threadID, ReceivedAt: metadata.ReceivedAt}
+			}
+			for _, added := range history.LabelsAdded {
+				if added.Message.ID == "" || !containsLabel(added.LabelIDs, labelID) {
+					continue
+				}
+				if _, exists := seen[added.Message.ID]; exists {
+					continue
+				}
+				metadata, metadataErr := c.messageMetadata(ctx, accessToken, added.Message.ID)
+				if metadataErr != nil {
+					if isHistoryExpiredError(metadataErr) {
+						continue
+					}
+					return nil, "", metadataErr
+				}
+				threadID := added.Message.ThreadID
+				if threadID == "" {
+					threadID = metadata.ThreadID
+				}
+				seen[added.Message.ID] = GmailMessageRef{ID: added.Message.ID, ThreadID: threadID, ReceivedAt: metadata.ReceivedAt}
+			}
+		}
+		if response.NextPageToken == "" {
+			if strings.TrimSpace(response.HistoryID) == "" {
+				return nil, "", errors.New("Gmail history response omitted history ID")
+			}
+			return sortedGmailMessageRefs(seen), historyCursorPrefix + response.HistoryID, nil
+		}
+		if page == maxHistoryPages-1 {
+			// Never advance the cursor after seeing only part of a history
+			// window: doing so would silently lose the remaining messages.
+			return nil, "", errors.New("Gmail history pagination safety bound reached")
+		}
+		pageToken = response.NextPageToken
+	}
+	return nil, "", errors.New("Gmail history pagination ended unexpectedly")
+}
+
+func containsLabel(labels []string, wanted string) bool {
+	for _, label := range labels {
+		if label == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+func sortedGmailMessageRefs(seen map[string]GmailMessageRef) []GmailMessageRef {
+	refs := make([]GmailMessageRef, 0, len(seen))
+	for _, ref := range seen {
+		refs = append(refs, ref)
+	}
+	sort.Slice(refs, func(i, j int) bool {
+		if refs[i].ReceivedAt.Equal(refs[j].ReceivedAt) {
+			return refs[i].ID > refs[j].ID
+		}
+		return refs[i].ReceivedAt.After(refs[j].ReceivedAt)
+	})
+	return refs
+}
+
+func (c *GmailHTTPClient) currentHistoryCursor(ctx context.Context, accessToken string) (string, error) {
+	var profile struct {
+		HistoryID string `json:"historyId"`
+	}
+	if err := c.getJSON(ctx, accessToken, "users/me/profile", nil, &profile); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(profile.HistoryID) == "" {
+		return "", errors.New("Gmail profile omitted history ID")
+	}
+	return historyCursorPrefix + profile.HistoryID, nil
+}
+
+func isHistoryExpiredError(err error) bool {
+	var status *gmailHTTPError
+	return errors.As(err, &status) && status.StatusCode == http.StatusNotFound
 }
 
 func (c *GmailHTTPClient) GetMessage(ctx context.Context, accessToken, messageID string) (GmailMessage, error) {
@@ -321,35 +563,27 @@ func (c *GmailHTTPClient) GetMessage(ctx context.Context, accessToken, messageID
 	if strings.TrimSpace(accessToken) == "" {
 		return GmailMessage{}, errors.New("Gmail access token is empty")
 	}
-	var raw struct {
-		ID           string `json:"id"`
-		ThreadID     string `json:"threadId"`
-		InternalDate string `json:"internalDate"`
-		Raw          string `json:"raw"`
-	}
-	if err := c.getJSON(ctx, accessToken, "users/me/messages/"+url.PathEscape(messageID), url.Values{"format": {"raw"}}, &raw); err != nil {
-		return GmailMessage{}, err
-	}
-	rawMIME, err := decodeGmailBase64(raw.Raw)
-	if err != nil {
-		return GmailMessage{}, fmt.Errorf("decode Gmail raw message: %w", err)
-	}
 	var full gmailMessagePayload
 	if err := c.getJSON(ctx, accessToken, "users/me/messages/"+url.PathEscape(messageID), url.Values{"format": {"full"}}, &full); err != nil {
+		if isHistoryExpiredError(err) {
+			return GmailMessage{}, fmt.Errorf("%w: %v", ErrGmailMessageUnavailable, err)
+		}
 		return GmailMessage{}, err
 	}
-	receivedAt, err := parseInternalDate(firstNonEmpty(full.InternalDate, raw.InternalDate))
+	receivedAt, err := parseInternalDate(full.InternalDate)
 	if err != nil {
 		return GmailMessage{}, err
 	}
 	message := GmailMessage{
-		ID:         firstNonEmpty(full.ID, raw.ID, messageID),
-		ThreadID:   firstNonEmpty(full.ThreadID, raw.ThreadID),
-		RawMIME:    string(rawMIME),
+		ID:         firstNonEmpty(full.ID, messageID),
+		ThreadID:   full.ThreadID,
 		ReceivedAt: receivedAt,
 		Headers:    normalizedHeaders(full.Payload.Headers),
 	}
 	if err := c.collectPayload(ctx, accessToken, message.ID, full.Payload, &message); err != nil {
+		if isHistoryExpiredError(err) {
+			return GmailMessage{}, fmt.Errorf("%w: %v", ErrGmailMessageUnavailable, err)
+		}
 		return GmailMessage{}, err
 	}
 	message.HTML = normalizeEmailContent(message.HTML)
@@ -450,18 +684,27 @@ func (c *GmailHTTPClient) collectPayload(ctx context.Context, accessToken, messa
 		}
 		return nil
 	}
-	if payload.Body.Data == "" {
+	if payload.Body.Data == "" || (mediaType != "text/plain" && mediaType != "text/html") {
 		return nil
 	}
 	content, err := decodeGmailBase64(payload.Body.Data)
 	if err != nil {
 		return fmt.Errorf("decode Gmail message body: %w", err)
 	}
+	remaining := maxGmailBodyBytes - len(message.Text) - len(message.HTML)
+	if remaining < 0 {
+		remaining = 0
+	}
+	decoded := strings.ToValidUTF8(string(content), "\uFFFD")
 	switch mediaType {
 	case "text/plain":
-		message.Text = appendEmailContent(message.Text, string(content))
+		var truncated bool
+		message.Text, truncated = appendBoundedEmailContent(message.Text, decoded, remaining)
+		message.BodyTruncated = message.BodyTruncated || truncated
 	case "text/html":
-		message.HTML = appendEmailContent(message.HTML, string(content))
+		var truncated bool
+		message.HTML, truncated = appendBoundedEmailContent(message.HTML, decoded, remaining)
+		message.BodyTruncated = message.BodyTruncated || truncated
 	}
 	return nil
 }
@@ -533,12 +776,19 @@ func (c *GmailHTTPClient) getJSON(ctx context.Context, accessToken, resource str
 	}
 	defer response.Body.Close()
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return fmt.Errorf("Gmail API request returned status %d", response.StatusCode)
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+		return &gmailHTTPError{StatusCode: response.StatusCode}
 	}
 	if err := decodeJSON(response.Body, target); err != nil {
 		return fmt.Errorf("decode Gmail API response: %w", err)
 	}
 	return nil
+}
+
+type gmailHTTPError struct{ StatusCode int }
+
+func (e *gmailHTTPError) Error() string {
+	return fmt.Sprintf("Gmail API request returned status %d", e.StatusCode)
 }
 
 func providerHTTPClient(client *http.Client) *http.Client {
@@ -590,7 +840,9 @@ func normalizedHeaders(headers []gmailHeader) map[string]string {
 			continue
 		}
 		if _, exists := result[name]; !exists {
-			result[name] = strings.TrimSpace(header.Value)
+			value := strings.TrimSpace(strings.ToValidUTF8(header.Value, "\uFFFD"))
+			value, _ = truncateUTF8(value, maxGmailHeaderValueBytes)
+			result[name] = value
 		}
 	}
 	return result
@@ -613,11 +865,33 @@ func supportedGmailAttachmentType(mediaType string) bool {
 	}
 }
 
-func appendEmailContent(current, next string) string {
-	if current == "" {
-		return next
+func appendBoundedEmailContent(current, next string, remaining int) (string, bool) {
+	separator := ""
+	if current != "" {
+		separator = "\n\n"
 	}
-	return current + "\n\n" + next
+	if remaining <= len(separator) {
+		return current, next != ""
+	}
+	next, truncated := truncateUTF8(next, remaining-len(separator))
+	if next == "" {
+		return current, truncated
+	}
+	return current + separator + next, truncated
+}
+
+func truncateUTF8(value string, maxBytes int) (string, bool) {
+	if len(value) <= maxBytes {
+		return value, false
+	}
+	if maxBytes <= 0 {
+		return "", true
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.ValidString(value[:cut]) {
+		cut--
+	}
+	return value[:cut], true
 }
 
 func normalizeEmailContent(value string) string {

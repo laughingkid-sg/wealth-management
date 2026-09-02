@@ -93,8 +93,68 @@ func TestReconcileUsesTenMinuteWindowOnlyAsSupportingSignal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile() error = %v", err)
 	}
-	if decision.Outcome != OutcomeReview || decision.Score.Total() != 65 {
-		t.Fatalf("Reconcile() = %#v, want low-confidence review with only account and time signals", decision)
+	if decision.Outcome != OutcomeCreate || decision.TransactionID != "" {
+		t.Fatalf("Reconcile() = %#v, want creation because time alone is not a plausible collision", decision)
+	}
+}
+
+func TestReconcileUnrelatedSameAccountActivityDoesNotSuppressCreation(t *testing.T) {
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	candidate := validCandidate(now)
+	candidate.AccountEvidence.CardLastFour = "4242"
+
+	decision, err := Reconcile(candidate, []AccountIdentity{{
+		ID: "account-1", UserID: "user-1", CardLastFour: "4242",
+	}}, []Transaction{{
+		ID: "unrelated", UserID: "user-1", AccountID: "account-1", Kind: KindDebit,
+		MerchantName: "Grocer", OriginalAmountMinor: 9900, OriginalCurrency: "SGD",
+		OccurredAt: now.Add(12 * time.Hour), References: []string{"different-reference"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Outcome != OutcomeCreate || decision.AccountID != "account-1" {
+		t.Fatalf("Reconcile() = %#v, want reliable unmatched creation", decision)
+	}
+}
+
+func TestReconcilePlausibleAmountCurrencyAndTimeCollisionRequiresReview(t *testing.T) {
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	candidate := validCandidate(now)
+	candidate.AccountEvidence.CardLastFour = "4242"
+	candidate.MerchantName = ""
+
+	decision, err := Reconcile(candidate, []AccountIdentity{{
+		ID: "account-1", UserID: "user-1", CardLastFour: "4242",
+	}}, []Transaction{{
+		ID: "plausible", UserID: "user-1", AccountID: "account-1", Kind: KindDebit,
+		OriginalAmountMinor: candidate.OriginalAmountMinor, OriginalCurrency: candidate.OriginalCurrency,
+		OccurredAt: now.Add(5 * time.Minute),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Outcome != OutcomeReview || decision.TransactionID != "" {
+		t.Fatalf("Reconcile() = %#v, want review for a plausible but unsafe collision", decision)
+	}
+}
+
+func TestReconcileDoesNotAutoAttachOnAccountAmountAndCurrencyOnly(t *testing.T) {
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	candidate := validCandidate(now)
+	candidate.AccountEvidence.CardLastFour = "4242"
+	candidate.OriginalAmountMinor = 648
+	candidate.OriginalCurrency = "USD"
+	candidate.MerchantName = ""
+	decision, err := Reconcile(candidate, []AccountIdentity{{ID: "account-1", UserID: "user-1", CardLastFour: "4242"}}, []Transaction{{
+		ID: "transaction-1", UserID: "user-1", AccountID: "account-1", Kind: KindDebit,
+		OriginalAmountMinor: 648, OriginalCurrency: "USD", OccurredAt: now,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Outcome != OutcomeReview {
+		t.Fatalf("Reconcile() = %#v, want review for unsafe account+amount+currency match", decision)
 	}
 }
 
@@ -152,7 +212,7 @@ func TestValidateLineItemRequiresIntegerQuantityAndSafeDetails(t *testing.T) {
 
 func TestValidateParsedResponseRequiresCitedCoreFields(t *testing.T) {
 	candidate := validCandidate(time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC))
-	err := ValidateParsedResponse(ParsedResponse{Candidate: candidate, Evidence: []FieldEvidence{{Field: "title", SourcePath: "payload.subject", Confidence: 1}}})
+	err := ValidateParsedResponse(ParsedResponse{Candidate: candidate, Evidence: []FieldEvidence{{Field: "title", SourcePath: "subject", Confidence: 1}}})
 	if err == nil || !strings.Contains(err.Error(), "missing required field evidence") {
 		t.Fatalf("ValidateParsedResponse() error = %v, want missing-citations error", err)
 	}
@@ -161,14 +221,54 @@ func TestValidateParsedResponseRequiresCitedCoreFields(t *testing.T) {
 func TestValidateParsedResponseAcceptsCitedCoreFields(t *testing.T) {
 	candidate := validCandidate(time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC))
 	err := ValidateParsedResponse(ParsedResponse{Candidate: candidate, Evidence: []FieldEvidence{
-		{Field: "transaction_kind", SourcePath: "body.kind", Confidence: 0.95},
+		{Field: "transaction_kind", SourcePath: "text.kind", Confidence: 0.95},
 		{Field: "title", SourcePath: "subject", Confidence: 1},
-		{Field: "original_amount", SourcePath: "body.amount", Confidence: 0.95},
-		{Field: "original_currency", SourcePath: "body.currency", Confidence: 0.95},
-		{Field: "occurred_at", SourcePath: "headers.date", Confidence: 0.9},
+		{Field: "merchant_name", SourcePath: "text.merchant", Confidence: 0.95},
+		{Field: "original_amount_minor", SourcePath: "text.amount", Confidence: 0.95},
+		{Field: "original_currency", SourcePath: "text.currency", Confidence: 0.95},
+		{Field: "occurred_at", SourcePath: "sender.date", Confidence: 0.9},
 	}})
 	if err != nil {
 		t.Fatalf("ValidateParsedResponse() error = %v", err)
+	}
+}
+
+func TestValidateParsedResponseRejectsUnknownEvidenceFieldAndPath(t *testing.T) {
+	candidate := validCandidate(time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC))
+	valid := []FieldEvidence{
+		{Field: "transaction_kind", SourcePath: "text.kind", Confidence: .9}, {Field: "title", SourcePath: "subject", Confidence: .9},
+		{Field: "merchant_name", SourcePath: "text.merchant", Confidence: .9}, {Field: "original_amount_minor", SourcePath: "text.amount", Confidence: .9},
+		{Field: "original_currency", SourcePath: "text.currency", Confidence: .9}, {Field: "occurred_at", SourcePath: "sender.date", Confidence: .9},
+	}
+	if err := ValidateParsedResponse(ParsedResponse{Candidate: candidate, Evidence: append(valid, FieldEvidence{Field: "made_up", SourcePath: "text.x", Confidence: 1})}); err == nil || !strings.Contains(err.Error(), "unknown evidence field") {
+		t.Fatalf("unknown field error = %v", err)
+	}
+	if err := ValidateParsedResponse(ParsedResponse{Candidate: candidate, Evidence: append(valid, FieldEvidence{Field: "references", SourcePath: "headers.message_id", Confidence: 1})}); err == nil || !strings.Contains(err.Error(), "invalid source path") {
+		t.Fatalf("path error = %v", err)
+	}
+}
+
+func TestAggregateConfidenceUsesMinimumRecognizedCitation(t *testing.T) {
+	confidence := AggregateConfidence([]FieldEvidence{
+		{Field: "title", SourcePath: "subject", Confidence: .4},
+		{Field: "transaction_kind", SourcePath: "text.kind", Confidence: .95},
+		{Field: "unknown", SourcePath: "text.noise", Confidence: 1},
+	})
+	if confidence != .4 {
+		t.Fatalf("AggregateConfidence() = %v, want .4", confidence)
+	}
+}
+
+func TestIsISO4217UsesCurrencyRegistry(t *testing.T) {
+	for _, code := range []string{"SGD", "JPY", "KWD"} {
+		if !IsISO4217(code) {
+			t.Fatalf("IsISO4217(%q) = false", code)
+		}
+	}
+	for _, code := range []string{"ZZZ", "usd", "USDD"} {
+		if IsISO4217(code) {
+			t.Fatalf("IsISO4217(%q) = true", code)
+		}
 	}
 }
 
@@ -202,5 +302,6 @@ func validCandidate(occurredAt time.Time) Candidate {
 		OriginalCurrency:    "USD",
 		OccurredAt:          occurredAt,
 		Confidence:          0.9,
+		AutoEligible:        true,
 	}
 }

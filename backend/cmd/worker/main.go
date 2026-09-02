@@ -35,19 +35,21 @@ func main() {
 	if err != nil {
 		log.Fatalf("configure token cipher: %v", err)
 	}
-	oauthClient, err := providers.NewGoogleOAuthClient(http.DefaultClient, cfg.GoogleOAuthClientID, cfg.GoogleOAuthClientSecret)
+	providerHTTPClient := &http.Client{Timeout: cfg.OutboundHTTPTimeout}
+	storageHTTPClient := &http.Client{Timeout: cfg.OutboundHTTPTimeout}
+	oauthClient, err := providers.NewGoogleOAuthClient(providerHTTPClient, cfg.GoogleOAuthClientID, cfg.GoogleOAuthClientSecret)
 	if err != nil {
 		log.Fatalf("configure Google OAuth client: %v", err)
 	}
-	gmailClient, err := providers.NewGmailHTTPClient(http.DefaultClient)
+	gmailClient, err := providers.NewGmailHTTPClient(providerHTTPClient)
 	if err != nil {
 		log.Fatalf("configure Gmail client: %v", err)
 	}
-	attachmentClient, err := attachmentstorage.New(http.DefaultClient, cfg.SupabaseURL, cfg.SupabaseServiceRoleKey)
+	attachmentClient, err := attachmentstorage.New(storageHTTPClient, cfg.SupabaseURL, cfg.SupabaseServiceRoleKey)
 	if err != nil {
 		log.Fatalf("configure transaction attachment storage: %v", err)
 	}
-	qwenClient, err := providers.NewAlibabaQwenClient(http.DefaultClient, cfg.AlibabaBaseURL, cfg.AlibabaTokenPlanAPIKey, cfg.AlibabaModel)
+	qwenClient, err := providers.NewAlibabaQwenClient(providerHTTPClient, cfg.AlibabaBaseURL, cfg.AlibabaTokenPlanAPIKey, cfg.AlibabaModel)
 	if err != nil {
 		log.Fatalf("configure Alibaba parser: %v", err)
 	}
@@ -58,7 +60,7 @@ func main() {
 		Label: cfg.GmailSyncLabel, InitialBackfillMax: cfg.InitialBackfillMax,
 		DevelopmentRefreshToken: developmentRefreshToken(cfg),
 	}
-	processingHandler := transactionworker.Handler{Repository: store, Parser: qwenClient}
+	processingHandler := transactionworker.Handler{Repository: store, Parser: qwenClient, Attachments: attachmentClient}
 	handler := jobs.Router{
 		jobs.KindGmailIngest: gmailHandler,
 		jobs.KindSourceParse: processingHandler,

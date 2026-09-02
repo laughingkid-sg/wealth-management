@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/zhengteck/wealth-builder/backend/internal/reconciliation"
 )
 
@@ -110,7 +111,7 @@ func (s *Store) AttachSource(ctx context.Context, userID, sourceID, transactionI
 	if err != nil {
 		return uuid.Nil, err
 	}
-	if status != "dangling" {
+	if status != "dangling" && status != "review_required" && status != "parsed" {
 		return uuid.Nil, ErrSourceNotActionable
 	}
 	linked, err := sourceHasActiveLink(ctx, tx, userID, sourceID)
@@ -135,7 +136,9 @@ func (s *Store) AttachSource(ctx context.Context, userID, sourceID, transactionI
 	}
 	if _, err = tx.Exec(ctx, `
 		update private.data_sources
-		set parse_status = 'parsed', suggested_account_id = null, parse_error = null
+		set parse_status = 'parsed', suggested_account_id = null,
+			suggested_transaction_id = null, reconciliation_reason = null,
+			parse_error = null
 		where id = $1 and user_id = $2`, sourceID, userID); err != nil {
 		return uuid.Nil, err
 	}
@@ -181,17 +184,20 @@ func (s *Store) CreateTransactionFromSource(ctx context.Context, userID, sourceI
 	if err != nil {
 		return Transaction{}, err
 	}
-	parsed, err := reconciliation.DecodeParsedResponse(candidateRaw)
-	if err != nil || parsed.Candidate.UserID != userID.String() {
+	parsed, err := decodePersistedCandidate(candidateRaw, userID)
+	if err != nil {
 		return Transaction{}, ErrSourceNotActionable
 	}
-	var accountExists bool
-	if err = tx.QueryRow(ctx, `
-		select exists(select 1 from public.accounts where id = $1 and user_id = $2 and deleted_at is null)`, accountID, userID).Scan(&accountExists); err != nil {
-		return Transaction{}, err
+	var lockedAccountID uuid.UUID
+	err = tx.QueryRow(ctx, `
+		select id from public.accounts
+		where id = $1 and user_id = $2 and deleted_at is null
+		for share`, accountID, userID).Scan(&lockedAccountID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Transaction{}, ErrAccountNotFound
 	}
-	if !accountExists {
-		return Transaction{}, ErrTransactionNotFound
+	if err != nil {
+		return Transaction{}, err
 	}
 	lineItems, err := json.Marshal(parsed.Candidate.LineItems)
 	if err != nil {
@@ -204,18 +210,22 @@ func (s *Store) CreateTransactionFromSource(ctx context.Context, userID, sourceI
 	if err != nil {
 		return Transaction{}, fmt.Errorf("encode source details: %w", err)
 	}
+	categoryID, err := s.resolveCategoryLeaf(ctx, tx, parsed.Candidate.CategoryLeafName)
+	if err != nil {
+		return Transaction{}, err
+	}
 	var transaction Transaction
 	err = tx.QueryRow(ctx, `
 		insert into public.transactions (user_id, account_id, transaction_kind, title, merchant_name,
-			original_amount_minor, original_currency, sgd_amount_minor, occurred_at, line_items, details,
+			original_amount_minor, original_currency, sgd_amount_minor, occurred_at, category_id, line_items, details,
 			review_status, match_confidence)
-		values ($1, $2, $3, $4, nullif($5, ''), $6, $7, $8, $9, $10::jsonb, $11::jsonb, 'confirmed', $12)
+		values ($1, $2, $3, $4, nullif($5, ''), $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, 'confirmed', $13)
 		returning id, account_id, transaction_kind, title, merchant_name, original_amount_minor, original_currency,
 			sgd_amount_minor, occurred_at, category_id, line_items, review_status, match_confidence, created_at, updated_at`,
 		userID, accountID, string(parsed.Candidate.Kind), strings.TrimSpace(parsed.Candidate.Title),
 		strings.TrimSpace(parsed.Candidate.MerchantName), parsed.Candidate.OriginalAmountMinor,
 		parsed.Candidate.OriginalCurrency, parsed.Candidate.SGDAmountMinor, parsed.Candidate.OccurredAt,
-		lineItems, details, confidencePercent(parsed.Candidate.Confidence)).Scan(transactionFields(&transaction)...)
+		categoryID, string(lineItems), string(details), confidencePercent(parsed.Candidate.Confidence)).Scan(transactionFields(&transaction)...)
 	if err != nil {
 		return Transaction{}, err
 	}
@@ -225,7 +235,10 @@ func (s *Store) CreateTransactionFromSource(ctx context.Context, userID, sourceI
 		return Transaction{}, err
 	}
 	if _, err = tx.Exec(ctx, `
-		update private.data_sources set parse_status = 'parsed', suggested_account_id = $3, parse_error = null
+		update private.data_sources
+		set parse_status = 'parsed', suggested_account_id = $3,
+			suggested_transaction_id = null, reconciliation_reason = null,
+			parse_error = null
 		where id = $1 and user_id = $2`, sourceID, userID, accountID); err != nil {
 		return Transaction{}, err
 	}
@@ -235,25 +248,68 @@ func (s *Store) CreateTransactionFromSource(ctx context.Context, userID, sourceI
 	return transaction, nil
 }
 
-// UnmatchSourceLink only deactivates an evidence link. It deliberately leaves
-// the source and canonical transaction untouched for audit and reattachment.
+// UnmatchSourceLink deactivates an evidence link while retaining its audit
+// row. A source with no other active evidence link returns to the dangling
+// queue so the user can reattach it deliberately.
 func (s *Store) UnmatchSourceLink(ctx context.Context, userID, linkID uuid.UUID) error {
-	command, err := s.pool.Exec(ctx, `
-		update private.transaction_data_sources
-		set detached_at = now(), detached_by_user = true
-		where id = $1 and user_id = $2 and detached_at is null`, linkID, userID)
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
-	if command.RowsAffected() != 1 {
+	defer func() { _ = tx.Rollback(ctx) }()
+	var sourceID uuid.UUID
+	err = tx.QueryRow(ctx, `
+		update private.transaction_data_sources
+		set detached_at = now(), detached_by_user = true
+		where id = $1 and user_id = $2 and detached_at is null
+		returning data_source_id`, linkID, userID).Scan(&sourceID)
+	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrSourceLinkNotFound
 	}
-	return nil
+	if err != nil {
+		return err
+	}
+	var hasRemainingLink bool
+	if err = tx.QueryRow(ctx, `
+		select exists(
+			select 1 from private.transaction_data_sources
+			where user_id = $1 and data_source_id = $2 and detached_at is null
+		)`, userID, sourceID).Scan(&hasRemainingLink); err != nil {
+		return err
+	}
+	if !hasRemainingLink {
+		if _, err = tx.Exec(ctx, `
+			update private.data_sources
+			set parse_status = 'dangling', suggested_transaction_id = null,
+				reconciliation_reason = 'The source is not attached to a transaction.',
+				parse_error = null
+			where id = $1 and user_id = $2`, sourceID, userID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *Store) PatchTransaction(ctx context.Context, userID, transactionID uuid.UUID, patch TransactionPatch) (Transaction, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Transaction{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if patch.AccountID != nil {
+		if err = validatePatchedTransferAccount(ctx, tx, userID, transactionID, *patch.AccountID); err != nil {
+			return Transaction{}, err
+		}
+	}
+	if patch.CategoryID.Set && patch.CategoryID.Value != nil {
+		if err = validatePatchedCategory(ctx, tx, *patch.CategoryID.Value); err != nil {
+			return Transaction{}, err
+		}
+	}
+
 	var transaction Transaction
-	err := s.pool.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		update public.transactions transaction
 		set title = case when $3 then $4 else transaction.title end,
 			account_id = case when $5 then $6 else transaction.account_id end,
@@ -261,11 +317,11 @@ func (s *Store) PatchTransaction(ctx context.Context, userID, transactionID uuid
 			original_amount_minor = case when $9 then $10 else transaction.original_amount_minor end,
 			original_currency = case when $11 then $12 else transaction.original_currency end,
 			sgd_amount_minor = case when $13 then $14 else transaction.sgd_amount_minor end,
-			category_id = case when $15 then $16 else transaction.category_id end,
+			category_id = case when $15 then $16::uuid else transaction.category_id end,
 			line_items = case when $17 then $18::jsonb else transaction.line_items end
 		where transaction.id = $1 and transaction.user_id = $2
 			and (not $5 or exists (select 1 from public.accounts account where account.id = $6 and account.user_id = $2 and account.deleted_at is null))
-			and (not $15 or $16 is null or exists (select 1 from public.transaction_categories category where category.id = $16 and category.active))
+			and (not $15 or $16::uuid is null or exists (select 1 from public.transaction_categories category where category.id = $16::uuid and category.active))
 		returning transaction.id, transaction.account_id, transaction.transaction_kind, transaction.title, transaction.merchant_name,
 			transaction.original_amount_minor, transaction.original_currency, transaction.sgd_amount_minor, transaction.occurred_at,
 			transaction.category_id, transaction.line_items, transaction.review_status, transaction.match_confidence,
@@ -283,7 +339,80 @@ func (s *Store) PatchTransaction(ctx context.Context, userID, transactionID uuid
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Transaction{}, ErrTransactionNotFound
 	}
-	return transaction, err
+	if err != nil {
+		return Transaction{}, mapTransferIntegrityError(err)
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return Transaction{}, mapTransferIntegrityError(err)
+	}
+	return transaction, nil
+}
+
+func validatePatchedTransferAccount(
+	ctx context.Context,
+	tx pgx.Tx,
+	userID, transactionID, accountID uuid.UUID,
+) error {
+	var lockedAccountID uuid.UUID
+	err := tx.QueryRow(ctx, `
+		select id
+		from public.accounts
+		where id = $1 and user_id = $2 and deleted_at is null
+		for share`, accountID, userID).Scan(&lockedAccountID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrAccountNotFound
+	}
+	if err != nil {
+		return err
+	}
+
+	var counterpartAccountID uuid.UUID
+	err = tx.QueryRow(ctx, `
+		select counterpart.account_id
+		from private.transaction_links transfer
+		join public.transactions counterpart
+			on counterpart.user_id = transfer.user_id
+			and counterpart.id = case
+				when transfer.debit_transaction_id = $2 then transfer.credit_transaction_id
+				else transfer.debit_transaction_id
+			end
+		where transfer.user_id = $1
+			and $2 in (transfer.debit_transaction_id, transfer.credit_transaction_id)
+		order by transfer.id
+		limit 1
+		for update of transfer`, userID, transactionID).Scan(&counterpartAccountID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if accountID == counterpartAccountID {
+		return ErrTransferSameAccount
+	}
+	return nil
+}
+
+func validatePatchedCategory(ctx context.Context, tx pgx.Tx, categoryID uuid.UUID) error {
+	var lockedCategoryID uuid.UUID
+	err := tx.QueryRow(ctx, `
+		select id
+		from public.transaction_categories
+		where id = $1 and active
+		for share`, categoryID).Scan(&lockedCategoryID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrCategoryNotFound
+	}
+	return err
+}
+
+func mapTransferIntegrityError(err error) error {
+	var postgresError *pgconn.PgError
+	if errors.As(err, &postgresError) && postgresError.Code == "23514" &&
+		postgresError.Message == "an internal transfer link requires two distinct accounts" {
+		return ErrTransferSameAccount
+	}
+	return err
 }
 
 func lockActionableSource(ctx context.Context, tx pgx.Tx, userID, sourceID uuid.UUID) (string, error) {

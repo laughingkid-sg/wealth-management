@@ -10,11 +10,16 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
 	"unicode"
+
+	textcurrency "golang.org/x/text/currency"
 )
+
+var ruleEvidencePath = regexp.MustCompile(`^rule:[^:\s]+:v[1-9][0-9]*$`)
 
 const (
 	// MatchWindow is a supporting signal only; it can never create a match by itself.
@@ -46,7 +51,9 @@ const (
 // Candidate is normalized transaction evidence from one data source. IDs are
 // strings so callers may use UUIDs without coupling this package to a storage driver.
 type Candidate struct {
-	UserID              string          `json:"user_id"`
+	// UserID is trusted server context, never model output. The worker binds it
+	// after strict decoding and before persistence/reconciliation.
+	UserID              string          `json:"-"`
 	Kind                TransactionKind `json:"transaction_kind"`
 	Title               string          `json:"title"`
 	MerchantName        string          `json:"merchant_name"`
@@ -57,7 +64,12 @@ type Candidate struct {
 	References          []string        `json:"references"`
 	AccountEvidence     AccountEvidence `json:"account_evidence"`
 	LineItems           []LineItem      `json:"line_items"`
-	Confidence          float64         `json:"confidence"`
+	CategoryLeafName    string          `json:"category_leaf_name,omitempty"`
+	// Confidence is derived server-side from valid citations, never accepted
+	// from model output.
+	Confidence float64 `json:"-"`
+	// AutoEligible is server-derived corroboration, never model output.
+	AutoEligible bool `json:"-"`
 }
 
 // AccountEvidence contains only source-derived safe identifiers, never a full
@@ -245,24 +257,76 @@ func ValidateLineItem(item LineItem) error {
 // deterministic parser. It does not make a missing account identifier invalid;
 // reconciliation will retain that source as dangling.
 func ValidateParsedResponse(response ParsedResponse) error {
-	if err := ValidateCandidate(response.Candidate); err != nil {
+	return validateParsedResponse(response, false)
+}
+
+// ValidateEvidenceEntries validates model-provided citations before any
+// trusted deterministic rule evidence is injected.
+func ValidateEvidenceEntries(response ParsedResponse) error {
+	for _, evidence := range response.Evidence {
+		if !decisiveEvidenceField(evidence.Field) {
+			return fmt.Errorf("unknown evidence field %q", evidence.Field)
+		}
+		if !validEvidenceSourcePath(evidence.SourcePath, false) {
+			return fmt.Errorf("%s evidence has an invalid source path", evidence.Field)
+		}
+		if !validConfidence(evidence.Confidence) {
+			return fmt.Errorf("%s evidence confidence must be between zero and one", evidence.Field)
+		}
+	}
+	return nil
+}
+
+// ValidateParsedResponseAfterRule validates a final parser result after the
+// trusted server has injected deterministic rule evidence.
+func ValidateParsedResponseAfterRule(response ParsedResponse) error {
+	return validateParsedResponse(response, true)
+}
+
+func validateParsedResponse(response ParsedResponse, allowRuleEvidence bool) error {
+	// Model output deliberately carries no user ID; ownership is bound by the
+	// durable job before this result can be persisted.
+	candidate := response.Candidate
+	candidate.UserID = "bound-by-server"
+	if err := ValidateCandidate(candidate); err != nil {
 		return err
 	}
 	required := map[string]bool{
-		"transaction_kind":  false,
-		"title":             false,
-		"original_amount":   false,
-		"original_currency": false,
-		"occurred_at":       false,
+		"transaction_kind":      false,
+		"title":                 false,
+		"original_amount_minor": false,
+		"original_currency":     false,
+		"occurred_at":           false,
+	}
+	if strings.TrimSpace(response.Candidate.MerchantName) != "" {
+		required["merchant_name"] = false
+	}
+	if response.Candidate.SGDAmountMinor != nil {
+		required["sgd_amount_minor"] = false
+	}
+	if len(response.Candidate.References) > 0 {
+		required["references"] = false
+	}
+	if hasAccountEvidence(response.Candidate.AccountEvidence) {
+		required["account_evidence"] = false
+	}
+	if len(response.Candidate.LineItems) > 0 {
+		required["line_items"] = false
+	}
+	if strings.TrimSpace(response.Candidate.CategoryLeafName) != "" {
+		required["category_leaf_name"] = false
 	}
 	for _, evidence := range response.Evidence {
+		if !decisiveEvidenceField(evidence.Field) {
+			return fmt.Errorf("unknown evidence field %q", evidence.Field)
+		}
+		if !validEvidenceSourcePath(evidence.SourcePath, allowRuleEvidence) {
+			return fmt.Errorf("%s evidence has an invalid source path", evidence.Field)
+		}
+		if !validConfidence(evidence.Confidence) {
+			return fmt.Errorf("%s evidence confidence must be between zero and one", evidence.Field)
+		}
 		if _, wanted := required[evidence.Field]; wanted {
-			if strings.TrimSpace(evidence.SourcePath) == "" {
-				return fmt.Errorf("%s evidence must include a source path", evidence.Field)
-			}
-			if !validConfidence(evidence.Confidence) {
-				return fmt.Errorf("%s evidence confidence must be between zero and one", evidence.Field)
-			}
 			required[evidence.Field] = true
 		}
 	}
@@ -279,9 +343,83 @@ func ValidateParsedResponse(response ParsedResponse) error {
 	return nil
 }
 
+func decisiveEvidenceField(field string) bool {
+	switch field {
+	case "transaction_kind", "title", "merchant_name", "original_amount_minor", "original_currency", "sgd_amount_minor", "occurred_at", "references", "account_evidence", "line_items", "category_leaf_name":
+		return true
+	default:
+		return false
+	}
+}
+
+func validEvidenceSourcePath(path string, allowRule bool) bool {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return false
+	}
+	if allowRule && ruleEvidencePath.MatchString(path) {
+		return true
+	}
+	if path == "received_at" {
+		return true
+	}
+	for _, prefix := range []string{"subject", "sender", "text", "attachment"} {
+		if path == prefix || strings.HasPrefix(path, prefix+".") || strings.HasPrefix(path, prefix+"[") {
+			return true
+		}
+	}
+	return false
+}
+
+func hasAccountEvidence(evidence AccountEvidence) bool {
+	return strings.TrimSpace(evidence.CardLastFour) != "" ||
+		strings.TrimSpace(evidence.MaskedBankReference) != "" ||
+		len(evidence.AdditionalIdentifiers) > 0
+}
+
+// AggregateConfidence uses the minimum valid decisive citation confidence.
+// This keeps an extra high-confidence citation from inflating trust in a
+// weaker required fact.
+func AggregateConfidence(evidence []FieldEvidence) float64 {
+	minimum := 1.0
+	found := false
+	for _, item := range evidence {
+		if !decisiveEvidenceField(item.Field) || !validEvidenceSourcePath(item.SourcePath, true) || !validConfidence(item.Confidence) {
+			continue
+		}
+		if !found || item.Confidence < minimum {
+			minimum = item.Confidence
+		}
+		found = true
+	}
+	if !found {
+		return 0
+	}
+	return minimum
+}
+
 // DecodeParsedResponse is a strict boundary for decoded LLM JSON. It rejects
 // unknown fields before applying the domain and evidence validation rules.
 func DecodeParsedResponse(raw []byte) (ParsedResponse, error) {
+	response, err := decodeParsedResponse(raw)
+	if err != nil {
+		return ParsedResponse{}, err
+	}
+	if err := ValidateParsedResponse(response); err != nil {
+		return ParsedResponse{}, err
+	}
+	return response, nil
+}
+
+// DecodeParsedResponseForRuleApplication is a strict JSON decoder for worker
+// use. It deliberately defers required-field validation until trusted rule
+// values have been applied; callers must validate evidence first and then call
+// ValidateParsedResponseAfterRule.
+func DecodeParsedResponseForRuleApplication(raw []byte) (ParsedResponse, error) {
+	return decodeParsedResponse(raw)
+}
+
+func decodeParsedResponse(raw []byte) (ParsedResponse, error) {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	var response ParsedResponse
@@ -293,9 +431,6 @@ func DecodeParsedResponse(raw []byte) (ParsedResponse, error) {
 			return ParsedResponse{}, errors.New("decode parsed response: multiple JSON values")
 		}
 		return ParsedResponse{}, fmt.Errorf("decode parsed response: %w", err)
-	}
-	if err := ValidateParsedResponse(response); err != nil {
-		return ParsedResponse{}, err
 	}
 	return response, nil
 }
@@ -317,10 +452,16 @@ func Reconcile(candidate Candidate, accounts []AccountIdentity, transactions []T
 	case accountAmbiguous:
 		return Decision{Outcome: OutcomeReview, Reason: "account evidence matches more than one account"}, nil
 	}
+	if !candidate.AutoEligible {
+		return Decision{Outcome: OutcomeReview, AccountID: accountID, Reason: "source evidence is not sufficiently corroborated for automatic action"}, nil
+	}
 
 	possible := make([]scoredTransaction, 0)
 	for _, transaction := range transactions {
 		if transaction.UserID != candidate.UserID || transaction.AccountID != accountID || transaction.Kind != candidate.Kind {
+			continue
+		}
+		if !plausibleExistingMatch(candidate, transaction) {
 			continue
 		}
 		score := scoreCandidate(candidate, transaction)
@@ -328,7 +469,7 @@ func Reconcile(candidate Candidate, accounts []AccountIdentity, transactions []T
 	}
 	sort.Slice(possible, func(i, j int) bool { return possible[i].score.Total() > possible[j].score.Total() })
 
-	if len(possible) > 0 && possible[0].score.Total() >= highMatchScore {
+	if len(possible) > 0 && possible[0].score.Total() >= highMatchScore && safeAutomaticAttach(candidate, possible[0].transaction) {
 		if len(possible) > 1 && possible[0].score.Total()-possible[1].score.Total() <= ambiguousScoreDelta {
 			return Decision{Outcome: OutcomeReview, AccountID: accountID, Score: possible[0].score, Reason: "multiple plausible transaction matches"}, nil
 		}
@@ -341,6 +482,38 @@ func Reconcile(candidate Candidate, accounts []AccountIdentity, transactions []T
 		return Decision{Outcome: OutcomeReview, AccountID: accountID, Reason: "candidate confidence is below creation threshold"}, nil
 	}
 	return Decision{Outcome: OutcomeCreate, AccountID: accountID, Reason: "reliable unmatched candidate"}, nil
+}
+
+// plausibleExistingMatch prevents ordinary account activity from suppressing
+// creation merely because it falls inside the broad database lookup window.
+// A candidate needs an exact shared reference, or matching amount/currency
+// plus at least one merchant/time signal, before a below-threshold collision
+// is meaningful enough to send to review.
+func plausibleExistingMatch(candidate Candidate, transaction Transaction) bool {
+	if hasSharedReference(candidate.References, transaction.References) {
+		return true
+	}
+	if candidate.OriginalAmountMinor != transaction.OriginalAmountMinor || candidate.OriginalCurrency != transaction.OriginalCurrency {
+		return false
+	}
+	merchantMatches := normalizeMerchant(candidate.MerchantName) != "" &&
+		normalizeMerchant(candidate.MerchantName) == normalizeMerchant(transaction.MerchantName)
+	withinWindow := absoluteDuration(candidate.OccurredAt.Sub(transaction.OccurredAt)) <= MatchWindow
+	return merchantMatches || withinWindow
+}
+
+// safeAutomaticAttach requires a resolved account plus an unambiguous source
+// identity signal. Amount and currency alone are common across subscriptions
+// and must stay in review even if they produce a high numeric score.
+func safeAutomaticAttach(candidate Candidate, transaction Transaction) bool {
+	if hasSharedReference(candidate.References, transaction.References) {
+		return true
+	}
+	return candidate.OriginalAmountMinor == transaction.OriginalAmountMinor &&
+		candidate.OriginalCurrency == transaction.OriginalCurrency &&
+		normalizeMerchant(candidate.MerchantName) != "" &&
+		normalizeMerchant(candidate.MerchantName) == normalizeMerchant(transaction.MerchantName) &&
+		absoluteDuration(candidate.OccurredAt.Sub(transaction.OccurredAt)) <= MatchWindow
 }
 
 type accountResolution int
@@ -476,17 +649,18 @@ func absoluteDuration(value time.Duration) time.Duration {
 	return value
 }
 
-func validCurrency(currency string) bool {
-	if len(currency) != 3 {
+// IsISO4217 validates a canonical, uppercase ISO 4217 code using the
+// registry rather than accepting arbitrary three-letter strings.
+func IsISO4217(value string) bool {
+	value = strings.TrimSpace(value)
+	if value != strings.ToUpper(value) {
 		return false
 	}
-	for _, char := range currency {
-		if char < 'A' || char > 'Z' {
-			return false
-		}
-	}
-	return true
+	_, err := textcurrency.ParseISO(value)
+	return err == nil
 }
+
+func validCurrency(value string) bool { return IsISO4217(value) }
 
 func validConfidence(value float64) bool {
 	return !math.IsNaN(value) && !math.IsInf(value, 0) && value >= 0 && value <= 1

@@ -26,6 +26,7 @@ type Repository interface {
 	StoreIngestedSource(context.Context, transactionstore.IngestedSource) (uuid.UUID, bool, error)
 	FindIngestedSourceID(context.Context, uuid.UUID, string) (uuid.UUID, error)
 	UpdateIngestedSourceRawData(context.Context, uuid.UUID, uuid.UUID, json.RawMessage) error
+	EnqueueSourceParse(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) error
 	StartSyncRun(context.Context, uuid.UUID, uuid.UUID) error
 	CompleteSyncRun(context.Context, uuid.UUID, uuid.UUID, int, int) error
 	RecordSyncFailure(context.Context, uuid.UUID, uuid.UUID, bool) error
@@ -81,6 +82,12 @@ func (h GmailIngestionHandler) Handle(ctx context.Context, job jobs.Job) error {
 	for _, ref := range refs {
 		message, err := h.Gmail.GetMessage(ctx, accessToken, ref.ID)
 		if err != nil {
+			if errors.Is(err, providers.ErrGmailMessageUnavailable) {
+				// The message disappeared after Gmail listed it. The provider has
+				// already captured the next History cursor, so skipping it is safe;
+				// any other provider error keeps the old cursor for a retry.
+				continue
+			}
 			return h.fail(ctx, job, runID, err)
 		}
 		rawData, err := marshalRawData(message, nil, nil)
@@ -104,6 +111,12 @@ func (h GmailIngestionHandler) Handle(ctx context.Context, job jobs.Job) error {
 			if err := h.persistAttachments(ctx, job.UserID, sourceID, message); err != nil {
 				return h.fail(ctx, job, runID, err)
 			}
+		}
+		// The enqueue implementation is idempotent and only queues eligible
+		// pending sources. This repairs a source whose first attachment upload
+		// failed without re-queuing already failed/processed duplicates.
+		if err := h.Repository.EnqueueSourceParse(ctx, job.UserID, runID, sourceID); err != nil {
+			return h.fail(ctx, job, runID, fmt.Errorf("enqueue source parse: %w", err))
 		}
 		if inserted {
 			saved++
@@ -218,8 +231,13 @@ func marshalRawData(message providers.GmailMessage, storageResults []attachments
 	data := map[string]any{
 		"provider_message_id": message.ID, "provider_thread_id": message.ThreadID,
 		"headers": message.Headers, "subject": message.Headers["subject"], "sender": message.Headers["from"],
-		"raw_mime": message.RawMIME, "html_sanitized": emailcontent.SanitizeHTML(message.HTML),
-		"text": message.Text, "attachments": attachments,
+		// Retain the original provider HTML only in private source metadata for
+		// evidence fidelity. Browser endpoints deliberately return the separate
+		// sanitized field below.
+		"html_raw":       message.HTML,
+		"html_sanitized": emailcontent.SanitizeHTML(message.HTML),
+		"text":           message.Text, "body_truncated": message.BodyTruncated,
+		"attachments": attachments,
 	}
 	return json.Marshal(data)
 }

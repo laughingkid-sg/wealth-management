@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/zhengteck/wealth-builder/backend/internal/attachmentstorage"
 	"github.com/zhengteck/wealth-builder/backend/internal/auth"
 	"github.com/zhengteck/wealth-builder/backend/internal/config"
 	"github.com/zhengteck/wealth-builder/backend/internal/database"
@@ -30,8 +31,13 @@ func main() {
 	}
 	defer pool.Close()
 
-	verifier := auth.NewSupabaseUserVerifier(cfg.SupabaseURL, cfg.SupabaseServiceRoleKey, http.DefaultClient)
+	outboundHTTPClient := &http.Client{Timeout: cfg.OutboundHTTPTimeout}
+	verifier := auth.NewSupabaseUserVerifier(cfg.SupabaseURL, cfg.SupabaseServiceRoleKey, outboundHTTPClient)
 	store := transactionstore.New(pool)
+	attachmentClient, err := attachmentstorage.New(outboundHTTPClient, cfg.SupabaseURL, cfg.SupabaseServiceRoleKey)
+	if err != nil {
+		log.Fatalf("configure transaction attachment storage: %v", err)
+	}
 	cipher, err := secret.New(cfg.TokenEncryptionKey)
 	if err != nil {
 		log.Fatalf("configure token cipher: %v", err)
@@ -40,7 +46,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("configure Gmail connection persistence: %v", err)
 	}
-	oauthClient, err := providers.NewGoogleOAuthClient(http.DefaultClient, cfg.GoogleOAuthClientID, cfg.GoogleOAuthClientSecret)
+	oauthClient, err := providers.NewGoogleOAuthClient(outboundHTTPClient, cfg.GoogleOAuthClientID, cfg.GoogleOAuthClientSecret)
 	if err != nil {
 		log.Fatalf("configure Google OAuth client: %v", err)
 	}
@@ -50,7 +56,7 @@ func main() {
 	}
 	mux := http.NewServeMux()
 	mux.Handle("GET /healthz", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }))
-	transactions.NewHandler(store, cfg.Environment == "development" && cfg.GoogleTestRefreshToken != "", oauthFlow, cfg.FrontendOrigin).Register(mux, verifier)
+	transactions.NewHandler(store, cfg.Environment == "development" && cfg.GoogleTestRefreshToken != "", oauthFlow, cfg.FrontendOrigin, attachmentClient).Register(mux, verifier)
 	server := &http.Server{Addr: cfg.APIAddress, Handler: securityHeaders(mux), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second}
 
 	stop := make(chan os.Signal, 1)

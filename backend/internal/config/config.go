@@ -39,6 +39,7 @@ type Config struct {
 	GmailSyncLabel         string
 	InitialBackfillMax     int
 	WorkerPollInterval     time.Duration
+	OutboundHTTPTimeout    time.Duration
 }
 
 // LoadFromEnv validates the complete runtime contract before either process starts.
@@ -151,6 +152,14 @@ func LoadFromEnv() (Config, error) {
 		return Config{}, err
 	}
 	cfg.WorkerPollInterval = time.Duration(pollSeconds) * time.Second
+	httpTimeoutSeconds, err := optionalPositiveInt("OUTBOUND_HTTP_TIMEOUT_SECONDS", 20)
+	if err != nil {
+		return Config{}, err
+	}
+	if httpTimeoutSeconds > 120 {
+		return Config{}, fmt.Errorf("OUTBOUND_HTTP_TIMEOUT_SECONDS must be at most 120")
+	}
+	cfg.OutboundHTTPTimeout = time.Duration(httpTimeoutSeconds) * time.Second
 	return cfg, nil
 }
 
@@ -166,8 +175,13 @@ func validateTransactionPoolerURL(raw string) (*url.URL, error) {
 	if parsed.Port() != "6543" {
 		return nil, fmt.Errorf("SUPABASE_DB_URL must use transaction-pooler port 6543")
 	}
-	if parsed.Query().Get("sslmode") != "require" {
-		return nil, fmt.Errorf("SUPABASE_DB_URL must set sslmode=require")
+	query := parsed.Query()
+	sslModes, hasSSLMode := query["sslmode"]
+	if !hasSSLMode {
+		query.Set("sslmode", "require")
+		parsed.RawQuery = query.Encode()
+	} else if len(sslModes) != 1 || sslModes[0] != "require" {
+		return nil, fmt.Errorf("SUPABASE_DB_URL sslmode must be require when explicitly set")
 	}
 	return parsed, nil
 }

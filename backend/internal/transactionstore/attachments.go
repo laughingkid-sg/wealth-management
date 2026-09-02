@@ -34,7 +34,7 @@ func (s *Store) UpdateIngestedSourceRawData(ctx context.Context, userID, sourceI
 	}
 	command, err := s.pool.Exec(ctx, `
 		update private.data_sources set raw_data = $3::jsonb
-		where id = $1 and user_id = $2 and source_type = 'gmail_email' and provider = 'gmail'`, sourceID, userID, rawData)
+		where id = $1 and user_id = $2 and source_type = 'gmail_email' and provider = 'gmail'`, sourceID, userID, string(rawData))
 	if err != nil {
 		return err
 	}

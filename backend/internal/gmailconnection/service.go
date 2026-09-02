@@ -1,5 +1,5 @@
-// Package gmailconnection persists OAuth refresh tokens only after a validated callback.
-// OAuth callback state is deliberately not implemented until the schema has a durable state table.
+// Package gmailconnection persists OAuth refresh tokens only after a validated,
+// single-use OAuth callback.
 package gmailconnection
 
 import (

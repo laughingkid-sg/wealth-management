@@ -51,6 +51,26 @@ func TestLoadFromEnvRejectsIncorrectInitialBackfill(t *testing.T) {
 	}
 }
 
+func TestLoadFromEnvAddsRequiredSSLModeWhenMissing(t *testing.T) {
+	setValidEnvironment(t)
+	t.Setenv("SUPABASE_DB_URL", "postgresql://postgres.project:password@aws-0-ap-southeast-1.pooler.supabase.com:6543/postgres")
+	cfg, err := LoadFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.SupabaseDBURL.Query().Get("sslmode"); got != "require" {
+		t.Fatalf("sslmode = %q, want require", got)
+	}
+}
+
+func TestLoadFromEnvRejectsWeakerExplicitSSLMode(t *testing.T) {
+	setValidEnvironment(t)
+	t.Setenv("SUPABASE_DB_URL", "postgresql://postgres.project:password@aws-0-ap-southeast-1.pooler.supabase.com:6543/postgres?sslmode=disable")
+	if _, err := LoadFromEnv(); err == nil || !strings.Contains(err.Error(), "sslmode") {
+		t.Fatalf("LoadFromEnv() error = %v, want sslmode rejection", err)
+	}
+}
+
 func setValidEnvironment(t *testing.T) {
 	t.Helper()
 	t.Setenv("APP_ENV", "development")
@@ -64,7 +84,7 @@ func setValidEnvironment(t *testing.T) {
 	t.Setenv("ALIBABA_TOKEN_PLAN_API_KEY", "server-only")
 	t.Setenv("FRONTEND_ORIGIN", "http://localhost:5173")
 	t.Setenv("GMAIL_INITIAL_BACKFILL_MAX_MESSAGES", "5")
-	for _, key := range []string{"GOOGLE_TEST_REFRESH_TOKEN", "ALIBABA_TOKEN_PLAN_BASE_URL", "ALIBABA_TOKEN_PLAN_MODEL", "GMAIL_SYNC_LABEL", "WORKER_POLL_SECONDS"} {
+	for _, key := range []string{"GOOGLE_TEST_REFRESH_TOKEN", "ALIBABA_TOKEN_PLAN_BASE_URL", "ALIBABA_TOKEN_PLAN_MODEL", "GMAIL_SYNC_LABEL", "WORKER_POLL_SECONDS", "OUTBOUND_HTTP_TIMEOUT_SECONDS"} {
 		t.Setenv(key, "")
 	}
 }

@@ -4,6 +4,7 @@ package transactions
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/zhengteck/wealth-builder/backend/internal/attachmentstorage"
 	"github.com/zhengteck/wealth-builder/backend/internal/auth"
 	"github.com/zhengteck/wealth-builder/backend/internal/reconciliation"
 	"github.com/zhengteck/wealth-builder/backend/internal/transactionstore"
@@ -25,13 +27,19 @@ import (
 type Repository interface {
 	CreateSyncRun(context.Context, uuid.UUID, bool) (transactionstore.SyncRun, error)
 	GetSyncRun(context.Context, uuid.UUID, uuid.UUID) (transactionstore.SyncRun, error)
-	ListSources(context.Context, uuid.UUID, string) ([]transactionstore.SourceSummary, error)
+	GetLatestSyncRun(context.Context, uuid.UUID) (transactionstore.SyncRun, error)
+	GetGmailConnectionStatus(context.Context, uuid.UUID) (transactionstore.GmailConnectionStatus, error)
+	ListSourcesPage(context.Context, uuid.UUID, string, *transactionstore.SourcePageCursor, int) (transactionstore.SourcePage, error)
+	RetrySourceParse(context.Context, uuid.UUID, uuid.UUID) error
 	GetSanitizedEmail(context.Context, uuid.UUID, uuid.UUID) (transactionstore.SanitizedEmail, error)
+	ListSourceAttachments(context.Context, uuid.UUID, uuid.UUID) ([]transactionstore.AttachmentRecord, error)
+	ListTransactionsPage(context.Context, uuid.UUID, transactionstore.TransactionListFilter) (transactionstore.TransactionPage, error)
 	ListTransactionSources(context.Context, uuid.UUID, uuid.UUID) ([]transactionstore.SourceEvidence, error)
 	AttachSource(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (uuid.UUID, error)
 	CreateTransactionFromSource(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (transactionstore.Transaction, error)
 	UnmatchSourceLink(context.Context, uuid.UUID, uuid.UUID) error
 	PatchTransaction(context.Context, uuid.UUID, uuid.UUID, transactionstore.TransactionPatch) (transactionstore.Transaction, error)
+	CreateInternalTransfer(context.Context, uuid.UUID, transactionstore.InternalTransferInput) (transactionstore.InternalTransfer, error)
 }
 
 type GmailOAuthFlow interface {
@@ -39,32 +47,51 @@ type GmailOAuthFlow interface {
 	Complete(context.Context, string, string) error
 }
 
+type AttachmentSigner interface {
+	SignURL(context.Context, attachmentstorage.ObjectRequest, int) (string, error)
+}
+
 type Handler struct {
 	repository            Repository
 	allowDevelopmentToken bool
 	gmailOAuth            GmailOAuthFlow
 	frontendOrigin        *url.URL
+	attachmentSigner      AttachmentSigner
 }
 
-func NewHandler(repository Repository, allowDevelopmentToken bool, gmailOAuth GmailOAuthFlow, frontendOrigin *url.URL) *Handler {
-	return &Handler{repository: repository, allowDevelopmentToken: allowDevelopmentToken, gmailOAuth: gmailOAuth, frontendOrigin: frontendOrigin}
+func NewHandler(repository Repository, allowDevelopmentToken bool, gmailOAuth GmailOAuthFlow, frontendOrigin *url.URL, attachmentSigners ...AttachmentSigner) *Handler {
+	var attachmentSigner AttachmentSigner
+	if len(attachmentSigners) > 0 {
+		attachmentSigner = attachmentSigners[0]
+	}
+	return &Handler{
+		repository: repository, allowDevelopmentToken: allowDevelopmentToken,
+		gmailOAuth: gmailOAuth, frontendOrigin: frontendOrigin,
+		attachmentSigner: attachmentSigner,
+	}
 }
 
 func (h *Handler) Register(mux *http.ServeMux, verifier auth.Verifier) {
 	requireUser := func(next http.HandlerFunc) http.Handler { return auth.RequireUser(verifier, next) }
 	mux.Handle("POST /v1/transactions/gmail/sync-runs", requireUser(h.createSyncRun))
 	mux.Handle("POST /v1/transactions/gmail/connect", requireUser(h.beginGmailConnection))
+	mux.Handle("GET /v1/transactions/gmail/connection", requireUser(h.getGmailConnection))
 	mux.Handle("GET /v1/transactions/gmail/oauth/callback", http.HandlerFunc(h.completeGmailConnection))
+	mux.Handle("GET /v1/transactions/sync-runs/latest", requireUser(h.getLatestSyncRun))
 	mux.Handle("GET /v1/transactions/sync-runs/{id}", requireUser(h.getSyncRun))
+	mux.Handle("GET /v1/transactions", requireUser(h.listTransactions))
 	mux.Handle("GET /v1/transactions/sources", requireUser(h.listSources))
 	mux.Handle("GET /v1/transactions/sources/{id}/email", requireUser(h.getSourceEmail))
+	mux.Handle("GET /v1/transactions/sources/{id}/attachments", requireUser(h.listSourceAttachments))
 	// ServeMux's segment patterns make /{id}/sources ambiguous with the
 	// established /sync-runs/{id} route. This narrow subtree handler preserves
 	// both public paths while rejecting every other transaction subroute.
 	mux.Handle("GET /v1/transactions/", requireUser(h.transactionSubroute))
 	mux.Handle("POST /v1/transactions/sources/{id}/attach", requireUser(h.attachSource))
 	mux.Handle("POST /v1/transactions/sources/{id}/create-transaction", requireUser(h.createTransactionFromSource))
+	mux.Handle("POST /v1/transactions/sources/{id}/retry", requireUser(h.retrySourceParse))
 	mux.Handle("POST /v1/transactions/source-links/{id}/unmatch", requireUser(h.unmatchSourceLink))
+	mux.Handle("POST /v1/transactions/internal-transfers", requireUser(h.createInternalTransfer))
 	mux.Handle("PATCH /v1/transactions/{id}", requireUser(h.patchTransaction))
 }
 
@@ -84,6 +111,20 @@ func (h *Handler) beginGmailConnection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"authorization_url": authorizationURL})
+}
+
+func (h *Handler) getGmailConnection(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	connection, err := h.repository.GetGmailConnectionStatus(r.Context(), user.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Could not load Gmail connection.")
+		return
+	}
+	writeJSON(w, http.StatusOK, connection)
 }
 
 func (h *Handler) completeGmailConnection(w http.ResponseWriter, r *http.Request) {
@@ -118,11 +159,33 @@ func (h *Handler) createSyncRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "Connect Gmail before starting a refresh.")
 		return
 	}
+	if errors.Is(err, transactionstore.ErrSyncRunInProgress) {
+		writeError(w, http.StatusConflict, "A Gmail refresh is already in progress.")
+		return
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Could not start Gmail refresh.")
 		return
 	}
 	writeJSON(w, http.StatusAccepted, syncRunResponse(run))
+}
+
+func (h *Handler) getLatestSyncRun(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	run, err := h.repository.GetLatestSyncRun(r.Context(), user.ID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "Sync run not found.")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Could not load sync run.")
+		return
+	}
+	writeJSON(w, http.StatusOK, syncRunResponse(run))
 }
 
 func (h *Handler) getSyncRun(w http.ResponseWriter, r *http.Request) {
@@ -158,16 +221,110 @@ func (h *Handler) listSources(w http.ResponseWriter, r *http.Request) {
 	if status == "review" {
 		status = "review_required"
 	}
-	if status != "" && status != "dangling" && status != "review_required" {
-		writeError(w, http.StatusBadRequest, "status must be dangling or review")
+	if status == "" {
+		status = "dangling"
+	}
+	if status != "dangling" && status != "review_required" && status != "failed" {
+		writeError(w, http.StatusBadRequest, "status must be dangling, review, or failed")
 		return
 	}
-	sources, err := h.repository.ListSources(r.Context(), user.ID, status)
+	limit, err := pageLimit(r.URL.Query().Get("limit"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var cursor *transactionstore.SourcePageCursor
+	if rawCursor := r.URL.Query().Get("cursor"); rawCursor != "" {
+		timestamp, id, decodeErr := decodeCursor(rawCursor, "sources:"+status)
+		if decodeErr != nil {
+			writeError(w, http.StatusBadRequest, "Invalid source cursor.")
+			return
+		}
+		cursor = &transactionstore.SourcePageCursor{ReceivedAt: timestamp, ID: id}
+	}
+	page, err := h.repository.ListSourcesPage(r.Context(), user.ID, status, cursor, limit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Could not load sources.")
 		return
 	}
-	writeJSON(w, http.StatusOK, sources)
+	items := make([]sourceSummaryJSON, 0, len(page.Items))
+	for _, source := range page.Items {
+		items = append(items, sourceSummaryResponse(source))
+	}
+	var nextCursor *string
+	if page.HasMore && len(page.Items) > 0 {
+		last := page.Items[len(page.Items)-1]
+		encoded := encodeCursor("sources:"+status, last.ReceivedAt, last.ID)
+		nextCursor = &encoded
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items, "next_cursor": nextCursor})
+}
+
+func (h *Handler) listTransactions(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	query := r.URL.Query()
+	kind := query.Get("kind")
+	if kind != "" && kind != "debit" && kind != "credit" {
+		writeError(w, http.StatusBadRequest, "kind must be debit or credit")
+		return
+	}
+	reviewStatus := query.Get("review")
+	if reviewStatus != "" && reviewStatus != "confirmed" && reviewStatus != "review_required" && reviewStatus != "pending" {
+		writeError(w, http.StatusBadRequest, "review must be confirmed, review_required, or pending")
+		return
+	}
+	search := strings.TrimSpace(query.Get("search"))
+	if utf8.RuneCountInString(search) > 100 {
+		writeError(w, http.StatusBadRequest, "search must be at most 100 characters")
+		return
+	}
+	var accountID *uuid.UUID
+	if rawAccountID := query.Get("account_id"); rawAccountID != "" {
+		parsed, err := uuid.Parse(rawAccountID)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "account_id must be a UUID")
+			return
+		}
+		accountID = &parsed
+	}
+	limit, err := pageLimit(query.Get("limit"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	scope := transactionCursorScope(kind, reviewStatus, accountID, search)
+	var cursor *transactionstore.TransactionPageCursor
+	if rawCursor := query.Get("cursor"); rawCursor != "" {
+		timestamp, id, decodeErr := decodeCursor(rawCursor, scope)
+		if decodeErr != nil {
+			writeError(w, http.StatusBadRequest, "Invalid transaction cursor.")
+			return
+		}
+		cursor = &transactionstore.TransactionPageCursor{OccurredAt: timestamp, ID: id}
+	}
+	page, err := h.repository.ListTransactionsPage(r.Context(), user.ID, transactionstore.TransactionListFilter{
+		Kind: kind, ReviewStatus: reviewStatus, AccountID: accountID,
+		Search: search, Cursor: cursor, Limit: limit,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Could not load transactions.")
+		return
+	}
+	items := make([]transactionListJSON, 0, len(page.Items))
+	for _, transaction := range page.Items {
+		items = append(items, transactionListResponse(transaction))
+	}
+	var nextCursor *string
+	if page.HasMore && len(page.Items) > 0 {
+		last := page.Items[len(page.Items)-1]
+		encoded := encodeCursor(scope, last.OccurredAt, last.ID)
+		nextCursor = &encoded
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items, "next_cursor": nextCursor})
 }
 
 func (h *Handler) getSourceEmail(w http.ResponseWriter, r *http.Request) {
@@ -191,6 +348,67 @@ func (h *Handler) getSourceEmail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, email)
+}
+
+func (h *Handler) listSourceAttachments(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	sourceID, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, "Source not found.")
+		return
+	}
+	if h.attachmentSigner == nil {
+		writeError(w, http.StatusServiceUnavailable, "Attachment access is not available.")
+		return
+	}
+	attachments, err := h.repository.ListSourceAttachments(r.Context(), user.ID, sourceID)
+	if errors.Is(err, transactionstore.ErrSourceNotFound) {
+		writeError(w, http.StatusNotFound, "Source not found.")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Could not load source attachments.")
+		return
+	}
+	items := make([]attachmentJSON, 0, len(attachments))
+	for _, attachment := range attachments {
+		signedURL, signErr := h.attachmentSigner.SignURL(r.Context(), attachmentstorage.ObjectRequest{
+			UserID: user.ID, SourceID: sourceID, ObjectPath: attachment.ObjectPath,
+		}, attachmentURLExpirySeconds)
+		if signErr != nil {
+			writeError(w, http.StatusBadGateway, "Could not prepare attachment access.")
+			return
+		}
+		items = append(items, attachmentJSON{
+			ID: attachment.ID, Filename: attachment.Filename, MIMEType: attachment.MIMEType,
+			ByteSize: attachment.ByteSize, SHA256: attachment.SHA256,
+			ParseEligible: attachment.ParseEligible, ParseStatus: attachment.ParseStatus,
+			StorageStatus: "stored", SignedURL: signedURL,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items, "next_cursor": nil})
+}
+
+func (h *Handler) retrySourceParse(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	sourceID, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, "Source not found.")
+		return
+	}
+	err = h.repository.RetrySourceParse(r.Context(), user.ID, sourceID)
+	if writeActionError(w, err, "Source", "Could not retry source parsing.") {
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "queued"})
 }
 
 func (h *Handler) listTransactionSources(w http.ResponseWriter, r *http.Request) {
@@ -301,6 +519,50 @@ func (h *Handler) unmatchSourceLink(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (h *Handler) createInternalTransfer(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	var request internalTransferRequest
+	if err := decodeRequestJSON(w, r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid internal transfer: "+safeValidationMessage(err))
+		return
+	}
+	debit, err := request.Debit.toStoreInput("debit")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid internal transfer: "+err.Error())
+		return
+	}
+	credit, err := request.Credit.toStoreInput("credit")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid internal transfer: "+err.Error())
+		return
+	}
+	if debit.AccountID == credit.AccountID {
+		writeError(w, http.StatusBadRequest, "Invalid internal transfer: debit and credit accounts must be different")
+		return
+	}
+	transfer, err := h.repository.CreateInternalTransfer(r.Context(), user.ID, transactionstore.InternalTransferInput{
+		Debit: debit, Credit: credit,
+	})
+	if errors.Is(err, transactionstore.ErrAccountNotFound) ||
+		errors.Is(err, transactionstore.ErrTransferSameAccount) ||
+		errors.Is(err, transactionstore.ErrCategoryNotFound) ||
+		errors.Is(err, transactionstore.ErrSourceNotFound) ||
+		errors.Is(err, transactionstore.ErrSourceNotActionable) ||
+		errors.Is(err, transactionstore.ErrSourceAlreadyLinked) {
+		writeError(w, http.StatusUnprocessableEntity, "An Account, category, or source is unavailable for this transfer.")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Could not create internal transfer.")
+		return
+	}
+	writeJSON(w, http.StatusCreated, internalTransferResponse(transfer))
+}
+
 func (h *Handler) patchTransaction(w http.ResponseWriter, r *http.Request) {
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
@@ -344,6 +606,18 @@ func writeActionError(w http.ResponseWriter, err error, resource, fallback strin
 	}
 	if errors.Is(err, transactionstore.ErrSourceNotActionable) || errors.Is(err, transactionstore.ErrSourceAlreadyLinked) {
 		writeError(w, http.StatusConflict, "This source is no longer available for that action.")
+		return true
+	}
+	if errors.Is(err, transactionstore.ErrAccountNotFound) {
+		writeError(w, http.StatusUnprocessableEntity, "The selected account is unavailable.")
+		return true
+	}
+	if errors.Is(err, transactionstore.ErrCategoryNotFound) {
+		writeError(w, http.StatusUnprocessableEntity, "The selected category is unavailable.")
+		return true
+	}
+	if errors.Is(err, transactionstore.ErrTransferSameAccount) {
+		writeError(w, http.StatusUnprocessableEntity, "Internal transfer legs must use different accounts.")
 		return true
 	}
 	writeError(w, http.StatusInternalServerError, fallback)
@@ -453,6 +727,96 @@ func decodeTransactionPatch(w http.ResponseWriter, r *http.Request) (transaction
 		patch.LineItems = &lineItems
 	}
 	return patch, nil
+}
+
+type internalTransferRequest struct {
+	Debit  transferLegRequest `json:"debit"`
+	Credit transferLegRequest `json:"credit"`
+}
+
+type transferLegRequest struct {
+	AccountID           string          `json:"account_id"`
+	Title               string          `json:"title"`
+	MerchantName        *string         `json:"merchant_name"`
+	OriginalAmountMinor json.RawMessage `json:"original_amount_minor"`
+	OriginalCurrency    string          `json:"original_currency"`
+	SGDAmountMinor      json.RawMessage `json:"sgd_amount_minor"`
+	OccurredAt          string          `json:"occurred_at"`
+	CategoryID          *string         `json:"category_id"`
+	LineItems           json.RawMessage `json:"line_items"`
+	SourceIDs           []string        `json:"source_ids"`
+}
+
+func (request transferLegRequest) toStoreInput(legName string) (transactionstore.TransferLegInput, error) {
+	field := func(name string) string { return legName + "." + name }
+	accountID, err := uuid.Parse(strings.TrimSpace(request.AccountID))
+	if err != nil || accountID == uuid.Nil {
+		return transactionstore.TransferLegInput{}, fmt.Errorf("%s must be a UUID", field("account_id"))
+	}
+	title := strings.TrimSpace(request.Title)
+	if title == "" || utf8.RuneCountInString(title) > 250 {
+		return transactionstore.TransferLegInput{}, fmt.Errorf("%s must be 1 to 250 characters", field("title"))
+	}
+	var merchantName *string
+	if request.MerchantName != nil {
+		value := strings.TrimSpace(*request.MerchantName)
+		if value == "" || utf8.RuneCountInString(value) > 250 {
+			return transactionstore.TransferLegInput{}, fmt.Errorf("%s must be 1 to 250 characters", field("merchant_name"))
+		}
+		merchantName = &value
+	}
+	originalAmount, err := requiredMinorAmount(request.OriginalAmountMinor, field("original_amount_minor"), false)
+	if err != nil {
+		return transactionstore.TransferLegInput{}, err
+	}
+	currency := strings.TrimSpace(request.OriginalCurrency)
+	if !validCurrency(currency) {
+		return transactionstore.TransferLegInput{}, fmt.Errorf("%s must be a three-letter uppercase ISO code", field("original_currency"))
+	}
+	var sgdAmount *int64
+	if len(request.SGDAmountMinor) > 0 && !isJSONNull(request.SGDAmountMinor) {
+		value, amountErr := requiredMinorAmount(request.SGDAmountMinor, field("sgd_amount_minor"), false)
+		if amountErr != nil {
+			return transactionstore.TransferLegInput{}, amountErr
+		}
+		sgdAmount = &value
+	}
+	occurredAt, err := time.Parse(time.RFC3339, strings.TrimSpace(request.OccurredAt))
+	if err != nil {
+		return transactionstore.TransferLegInput{}, fmt.Errorf("%s must be an RFC3339 timestamp", field("occurred_at"))
+	}
+	var categoryID *uuid.UUID
+	if request.CategoryID != nil {
+		value, parseErr := uuid.Parse(strings.TrimSpace(*request.CategoryID))
+		if parseErr != nil || value == uuid.Nil {
+			return transactionstore.TransferLegInput{}, fmt.Errorf("%s must be a UUID or null", field("category_id"))
+		}
+		categoryID = &value
+	}
+	lineItems := json.RawMessage("[]")
+	if len(request.LineItems) > 0 {
+		lineItems, err = validateLineItems(request.LineItems)
+		if err != nil {
+			return transactionstore.TransferLegInput{}, fmt.Errorf("%s: %w", legName, err)
+		}
+	}
+	if len(request.SourceIDs) > 20 {
+		return transactionstore.TransferLegInput{}, fmt.Errorf("%s may contain at most 20 source_ids", legName)
+	}
+	sourceIDs := make([]uuid.UUID, 0, len(request.SourceIDs))
+	for index, rawID := range request.SourceIDs {
+		value, parseErr := uuid.Parse(strings.TrimSpace(rawID))
+		if parseErr != nil || value == uuid.Nil {
+			return transactionstore.TransferLegInput{}, fmt.Errorf("%s.source_ids[%d] must be a UUID", legName, index)
+		}
+		sourceIDs = append(sourceIDs, value)
+	}
+	return transactionstore.TransferLegInput{
+		AccountID: accountID, Title: title, MerchantName: merchantName,
+		OriginalAmountMinor: originalAmount, OriginalCurrency: currency,
+		SGDAmountMinor: sgdAmount, OccurredAt: occurredAt, CategoryID: categoryID,
+		LineItems: lineItems, SourceIDs: sourceIDs,
+	}, nil
 }
 
 func requiredString(raw json.RawMessage, field string) (string, error) {
@@ -579,6 +943,122 @@ func transactionResponse(transaction transactionstore.Transaction) transactionJS
 	return response
 }
 
+type transferLinkJSON struct {
+	ID                       string  `json:"id"`
+	LinkType                 string  `json:"link_type"`
+	Role                     string  `json:"role"`
+	CounterpartTransactionID string  `json:"counterpart_transaction_id"`
+	CounterpartAccountID     string  `json:"counterpart_account_id"`
+	CounterpartTitle         string  `json:"counterpart_title"`
+	CounterpartAccountName   *string `json:"counterpart_account_name"`
+}
+
+type transactionListJSON struct {
+	transactionJSON
+	AccountName        string            `json:"account_name"`
+	CategoryName       *string           `json:"category_name"`
+	CategoryParentName *string           `json:"category_parent_name"`
+	Details            json.RawMessage   `json:"details"`
+	SourceCount        int               `json:"source_count"`
+	TransferLink       *transferLinkJSON `json:"transfer_link"`
+}
+
+func transactionListResponse(transaction transactionstore.TransactionListRecord) transactionListJSON {
+	response := transactionListJSON{
+		transactionJSON: transactionResponse(transaction.Transaction),
+		AccountName:     transaction.AccountName, CategoryName: transaction.CategoryName,
+		CategoryParentName: transaction.CategoryParentName,
+		Details:            transaction.Details, SourceCount: transaction.SourceCount,
+	}
+	if len(response.Details) == 0 {
+		response.Details = json.RawMessage("{}")
+	}
+	if transaction.TransferLink != nil {
+		response.TransferLink = &transferLinkJSON{
+			ID: transaction.TransferLink.ID.String(), LinkType: transaction.TransferLink.LinkType,
+			Role:                     transaction.TransferLink.Role,
+			CounterpartTransactionID: transaction.TransferLink.CounterpartTransactionID.String(),
+			CounterpartAccountID:     transaction.TransferLink.CounterpartAccountID.String(),
+			CounterpartTitle:         transaction.TransferLink.CounterpartTitle,
+			CounterpartAccountName:   transaction.TransferLink.CounterpartAccountName,
+		}
+	}
+	return response
+}
+
+func internalTransferResponse(transfer transactionstore.InternalTransfer) map[string]any {
+	return map[string]any{
+		"link": map[string]any{
+			"id": transfer.ID.String(), "link_type": transfer.LinkType,
+			"debit_transaction_id":  transfer.Debit.ID.String(),
+			"credit_transaction_id": transfer.Credit.ID.String(),
+			"created_at":            transfer.CreatedAt,
+		},
+		"debit":  transactionResponse(transfer.Debit),
+		"credit": transactionResponse(transfer.Credit),
+	}
+}
+
+type sourceSummaryJSON struct {
+	ID                        string    `json:"id"`
+	SourceType                string    `json:"source_type"`
+	Provider                  string    `json:"provider"`
+	ReceivedAt                time.Time `json:"received_at"`
+	ParseStatus               string    `json:"parse_status"`
+	ParseConfidence           *int16    `json:"parse_confidence"`
+	Subject                   string    `json:"subject"`
+	Sender                    string    `json:"sender"`
+	ParseError                *string   `json:"parse_error"`
+	ReconciliationReason      *string   `json:"reconciliation_reason"`
+	SuggestedTitle            *string   `json:"suggested_title"`
+	SuggestedAmountMinor      *string   `json:"suggested_amount_minor"`
+	SuggestedCurrency         *string   `json:"suggested_currency"`
+	SuggestedAccountID        *string   `json:"suggested_account_id"`
+	SuggestedAccountName      *string   `json:"suggested_account_name"`
+	SuggestedTransactionID    *string   `json:"suggested_transaction_id"`
+	SuggestedCategoryLeafName *string   `json:"suggested_category_leaf_name"`
+	CreatedAt                 time.Time `json:"created_at"`
+}
+
+func sourceSummaryResponse(source transactionstore.SourceSummary) sourceSummaryJSON {
+	response := sourceSummaryJSON{
+		ID: source.ID.String(), SourceType: source.SourceType, Provider: source.Provider,
+		ReceivedAt: source.ReceivedAt, ParseStatus: source.ParseStatus,
+		ParseConfidence: source.ParseConfidence, Subject: source.Subject, Sender: source.Sender,
+		ParseError: source.ParseError, ReconciliationReason: source.ReconciliationReason,
+		SuggestedTitle: source.SuggestedTitle, SuggestedCurrency: source.SuggestedCurrency,
+		SuggestedAccountName:      source.SuggestedAccountName,
+		SuggestedCategoryLeafName: source.SuggestedCategoryLeafName, CreatedAt: source.CreatedAt,
+	}
+	if source.SuggestedAmountMinor != nil {
+		value := strconv.FormatInt(*source.SuggestedAmountMinor, 10)
+		response.SuggestedAmountMinor = &value
+	}
+	if source.SuggestedAccountID != nil {
+		value := source.SuggestedAccountID.String()
+		response.SuggestedAccountID = &value
+	}
+	if source.SuggestedTransactionID != nil {
+		value := source.SuggestedTransactionID.String()
+		response.SuggestedTransactionID = &value
+	}
+	return response
+}
+
+const attachmentURLExpirySeconds = 300
+
+type attachmentJSON struct {
+	ID            string `json:"id"`
+	Filename      string `json:"filename"`
+	MIMEType      string `json:"mime_type"`
+	ByteSize      int64  `json:"byte_size"`
+	SHA256        string `json:"sha256"`
+	ParseEligible bool   `json:"parse_eligible"`
+	ParseStatus   string `json:"parse_status"`
+	StorageStatus string `json:"storage_status"`
+	SignedURL     string `json:"signed_url"`
+}
+
 type transactionJSON struct {
 	ID                  string             `json:"id"`
 	AccountID           string             `json:"account_id"`
@@ -637,25 +1117,82 @@ func minorString(value *int64) *string {
 func isJSONNull(raw json.RawMessage) bool { return strings.TrimSpace(string(raw)) == "null" }
 
 func validCurrency(value string) bool {
-	if len(value) != 3 {
-		return false
-	}
-	for _, character := range value {
-		if character < 'A' || character > 'Z' {
-			return false
-		}
-	}
-	return true
+	return reconciliation.IsISO4217(value)
 }
 
 func syncRunResponse(run transactionstore.SyncRun) map[string]any {
 	return map[string]any{
 		"id": run.ID, "status": run.Status, "messages_discovered": run.MessagesFoundCount,
-		"messages_ingested": run.SourcesSavedCount, "sources_parsed": 0,
+		"messages_ingested": run.SourcesSavedCount, "sources_parsed": run.SourcesParsedCount,
+		"sources_failed":       run.SourcesFailedCount,
 		"transactions_created": run.TransactionsCreatedCount, "sources_review": run.ReviewRequiredCount,
 		"sources_dangling": run.DanglingSourcesCount, "error_summary": run.ErrorSummary,
-		"started_at": run.StartedAt, "completed_at": run.CompletedAt,
+		"started_at": run.StartedAt, "ingestion_completed_at": run.IngestionCompletedAt,
+		"completed_at": run.CompletedAt,
 	}
+}
+
+type encodedPageCursor struct {
+	Version   int       `json:"v"`
+	Scope     string    `json:"scope"`
+	Timestamp time.Time `json:"timestamp"`
+	ID        string    `json:"id"`
+}
+
+func pageLimit(raw string) (int, error) {
+	if raw == "" {
+		return 50, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 1 || value > 100 {
+		return 0, errors.New("limit must be an integer from 1 to 100")
+	}
+	return value, nil
+}
+
+func encodeCursor(scope string, timestamp time.Time, id uuid.UUID) string {
+	encoded, _ := json.Marshal(encodedPageCursor{Version: 1, Scope: scope, Timestamp: timestamp.UTC(), ID: id.String()})
+	return base64.RawURLEncoding.EncodeToString(encoded)
+}
+
+func decodeCursor(raw, scope string) (time.Time, uuid.UUID, error) {
+	if len(raw) > 1024 {
+		return time.Time{}, uuid.Nil, errors.New("cursor is too long")
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return time.Time{}, uuid.Nil, err
+	}
+	var cursor encodedPageCursor
+	decoder := json.NewDecoder(bytes.NewReader(decoded))
+	decoder.DisallowUnknownFields()
+	if err = decoder.Decode(&cursor); err != nil {
+		return time.Time{}, uuid.Nil, err
+	}
+	if err = decoder.Decode(&struct{}{}); err != io.EOF {
+		return time.Time{}, uuid.Nil, errors.New("cursor contains trailing data")
+	}
+	id, err := uuid.Parse(cursor.ID)
+	if err != nil || id == uuid.Nil || cursor.Version != 1 || cursor.Scope != scope || cursor.Timestamp.IsZero() {
+		return time.Time{}, uuid.Nil, errors.New("cursor does not match this listing")
+	}
+	return cursor.Timestamp, id, nil
+}
+
+func transactionCursorScope(kind, reviewStatus string, accountID *uuid.UUID, search string) string {
+	account := ""
+	if accountID != nil {
+		account = accountID.String()
+	}
+	return strings.Join([]string{"transactions", kind, reviewStatus, account, search}, "\x00")
+}
+
+func safeValidationMessage(err error) string {
+	message := strings.TrimSpace(err.Error())
+	if message == "" || len(message) > 300 || strings.ContainsAny(message, "\r\n") {
+		return "request body is invalid"
+	}
+	return message
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
