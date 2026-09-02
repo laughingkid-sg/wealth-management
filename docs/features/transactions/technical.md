@@ -2,7 +2,7 @@
 
 ## Implementation status
 
-The React workspace, Go API, Go worker, database migrations, and automated-test fixtures described here are implemented on `codex/feat-transaction`. Migrations through `20260902230002` are applied to the hosted development project, migration histories match, hosted database lint and all 180 pgTAP assertions pass, the hosted transaction-store integration suite passes, and the final Go/frontend release checks pass. Earlier scoped Gmail → Storage → Qwen → reconciliation, replay-idempotency, and signed-attachment checks also passed. The current FairPrice/Citi `2562` reparse is recorded separately below because sending the retained source to Qwen requires an explicit outbound-data approval.
+The React workspace, Go API, Go worker, database migrations, and automated-test fixtures described here are implemented on `codex/feat-transaction`. Migrations through `20260902230003` are applied to the hosted development project, migration histories match, hosted database lint and all 189 pgTAP assertions pass, the hosted transaction-store race/integration suite passes, and the final Go/frontend release checks pass. Earlier scoped Gmail → Storage → Qwen → reconciliation, replay-idempotency, and signed-attachment checks also passed. The current FairPrice/Citi `2562` reparse is recorded separately below because sending the retained source to Qwen requires an explicit outbound-data approval.
 
 ## Component boundary
 
@@ -42,7 +42,7 @@ React POST /gmail/sync-runs
   -> sync progress recomputed; terminal run published through Realtime
 ```
 
-Only one `queued` or `running` sync run is allowed per user. Jobs support `gmail_ingestion`, `source_parsing`, `reconciliation`, and `source_attachment_cleanup`, have a maximum of five attempts, use exponential retry delay, and are claimed with `FOR UPDATE SKIP LOCKED`. The worker records lease ownership and heartbeats/completes only its own lease. It does not hold a transaction while calling Gmail, Storage, or Qwen. A crashed worker’s expired lease can be reclaimed; a final expired lease is marked failed rather than leaving the run permanently active.
+Only one `queued` or `running` sync run is allowed per user. Jobs support `gmail_ingestion`, `source_parsing`, `reconciliation`, and `source_attachment_cleanup`, use exponential retry delay, and are claimed with `FOR UPDATE SKIP LOCKED`. Ordinary jobs have a maximum of five attempts; cleanup jobs retry in five-attempt bursts and enter a fifteen-minute cooldown between bursts until their exact objects are deleted. The worker records lease ownership and heartbeats/completes only its own lease. It does not hold a transaction while calling Gmail, Storage, or Qwen. A crashed worker’s expired lease can be reclaimed; an expired final cleanup lease requeues with the same durable payload while other final attempts become safely visible failures.
 
 Ingestion has its own completion timestamp. A run becomes terminal only after ingestion is complete and all child jobs are no longer queued/running. A terminal Gmail-ingestion failure sets the run to `failed`. Source-level terminal failures remain visible and can produce a completed run with a redacted error summary. The safe progress projection includes discovered messages, saved sources, parsed sources, failed sources, transactions created, sources linked, review count, dangling count, and lifecycle timestamps.
 
@@ -123,7 +123,7 @@ Missing Account evidence is a valid parse and becomes dangling at reconciliation
 
 Reconciliation first resolves Account evidence against active, explicitly configured matching keys owned by the job user. Only `card_last_four` can match a `card_last_four` key, and only `masked_bank_reference` can match a `bank_account_suffix` key. Account names, `accounts.account_identifier`, arbitrary Account metadata, and candidate `additional_identifiers` are deliberately excluded.
 
-Card keys remove whitespace and common masking characters but must yield exactly four ASCII digits; the system never truncates a longer value. Bank suffix keys lowercase and remove Unicode whitespace plus `*`, `•`, and `-`, retaining other characters. Stored display values remain unchanged. `(user_id, key_type, normalized_value)` is permanently unique, including retired rows. Matching-key identity is immutable; retirement/reactivation changes lifecycle state only.
+Card keys remove whitespace and common masking characters but must yield exactly four ASCII digits; the system never truncates a longer value. Model-provided card evidence is matchable only when the normalized source contains exactly one masked-card or explicit card-context suffix with the same value. Missing, conflicting, or bare four-digit occurrences are demoted to non-matching audit detail while the exact model output remains unchanged. Bank suffix keys lowercase and remove Unicode whitespace plus `*`, `•`, and `-`, retaining other characters. Stored display values remain unchanged. `(user_id, key_type, normalized_value)` is permanently unique, including retired rows. Matching-key identity is immutable; retirement/reactivation changes lifecycle state only.
 
 - No Account evidence or no owned match → `dangling`.
 - More than one owned Account match → `review_required`.
@@ -163,11 +163,13 @@ All monetary columns use `bigint` integer minor units. Timestamps use `timestamp
 | `private.deleted_provider_messages` | SHA-256 provider-identity tombstones that prevent deliberate raw deletions from being recreated without retaining the source UUID, provider message ID, content, or paths. |
 | `private.transaction_data_sources` | Evidence junction with source role, confidence, matched-by provenance, and detachable audit fields. A source ordinarily has one active link; exactly two are allowed only when they are the debit and credit legs of the same internal-transfer pair. Unmatching soft-detaches evidence before reuse. |
 | `private.transaction_links` | Relationship junction; currently one `internal_transfer` debit/credit pair. Deferred trigger checks same owner, distinct rows and Accounts, correct kinds, and exclusive transfer membership. |
-| `private.transaction_jobs` | Durable queued/running/completed/failed/cancelled jobs with attempts, schedule, lease owner/expiry, payload references, and redacted error. The source-attachment cleanup kind acts as an outbox with no source FK and is removed after successful object deletion. |
+| `private.transaction_jobs` | Durable queued/running/completed/failed/cancelled jobs with attempts, schedule, lease owner/expiry, payload references, and redacted error. The source-attachment cleanup kind acts as an outbox with no source FK, records a cumulative failure count, requeues instead of becoming terminal, and is removed after successful object deletion. |
 
 Migration `20260902230001_add_transaction_configuration_and_audit.sql` adds parser settings, source rules, typed Account matching keys, parse-call audit columns, transaction provenance, and raw-source deletion cascades. It backfills only recognized Account metadata aliases while preserving the original metadata, retires the original OCBC row in favor of a prompt-bearing v2, and seeds the generic masked-card rule. All new configuration tables remain in the non-exposed `private` schema with RLS enabled and browser grants revoked.
 
 Forward migration `20260902230002_add_durable_source_deletion.sql` adds the per-user coordination row, one-way deletion tombstones, and the cleanup outbox job kind. It intentionally follows the already-applied configuration migration instead of rewriting hosted migration history.
+
+Forward migration `20260902230003_keep_source_cleanup_retrying.sql` adds cumulative cleanup-failure monitoring, recovers any prior terminal cleanup row, and changes the monitoring index without rewriting either applied predecessor. The worker must be deployed after this migration because its retry path writes the new column.
 
 ### Line-item JSON
 
@@ -289,7 +291,8 @@ The API and worker are separate processes and both need the backend environment.
 - Source, transaction, Account, link, sync, and attachment paths are checked against the authenticated user before reads or writes.
 - Parser settings, source-rule changes, matching keys, Debug records, and deletion plans are owner-scoped in SQL as well as at the HTTP boundary.
 - Qwen never receives the Account catalogue or matching-key table. User guidance is appended beneath an immutable platform contract and email/attachment instructions are treated as untrusted content.
-- Raw deletion is database-first and owner-scoped. A per-user coordination lock prevents races with Gmail ingestion; database cascades clear source jobs, attempts, and links; transaction provenance limits automatic cleanup to a never-edited `automatic_source` record with no remaining active evidence or transfer link. Exact Storage paths are committed as leased cleanup work before any external call, and a one-way provider digest prevents reingestion of deliberately deleted evidence.
+- Raw deletion is database-first and owner-scoped. A per-user coordination lock prevents races with Gmail ingestion; database cascades clear source jobs, attempts, and links; transaction provenance limits automatic cleanup to a never-edited `automatic_source` record with no remaining active evidence or transfer link. Exact Storage paths are committed as leased cleanup work before any external call, a one-way provider digest prevents reingestion of deliberately deleted evidence, and cleanup failures or expired final leases remain queued with monitored cooldown until success.
+- Automatic canonical creation takes the same stable per-user transaction lock and repeats Account/nearby-transaction reconciliation inside the write transaction. Two workers holding stale create decisions therefore converge on one transaction and two evidence links rather than creating duplicates.
 - The model never chooses user ownership. Gmail/provider content, HTML, filenames, parser output, category names, and cursor values are validated before use.
 - Transactions and internal-transfer legs can reference only active same-user Accounts. Transfer pair integrity is enforced in both Go and a deferred database trigger.
 - OAuth state is expiring/single-use, PKCE is required, refresh tokens are encrypted at rest by the application, and secrets/errors are not returned to the browser.
@@ -297,7 +300,7 @@ The API and worker are separate processes and both need the backend environment.
 
 ## Verification and release gate
 
-The repository contains focused Go tests for Auth, OAuth state/token storage, Gmail listing/history and parsing, attachment Storage/signing, ingestion idempotency, durable jobs/leases, parser-provider contracts, deterministic rules, evidence validation, reconciliation, HTTP validation, source actions, and SQL store behavior. It also contains pgTAP coverage for transaction schema/RLS/storage and the operational migration.
+The repository contains focused Go tests for Auth, OAuth state/token storage, Gmail listing/history and parsing, attachment Storage/signing, ingestion idempotency, durable jobs/leases, parser-provider contracts, deterministic rules, semantic card corroboration, reconciliation races, HTTP validation, source actions, cleanup recovery, and SQL store behavior. It also contains pgTAP coverage for transaction schema/RLS/storage and the operational migrations.
 
 `backend/internal/transactione2e/harness_test.go` also provides a scoped, non-destructive live harness. It is disabled by default and claims only the newly created run. It normally requires exactly one active stored Gmail-connection owner. In development only, when no active connection exists and `GOOGLE_TEST_REFRESH_TOKEN` is configured, it may instead select exactly one distinct owner of an active Account and create a development-token-enabled run. Zero or multiple eligible owners fail closed; the token and selected UUID are never logged or persisted. Because the fallback deliberately creates no Gmail connection or cursor, a later fallback run repeats the bounded initial window; provider-message uniqueness keeps that replay idempotent. Run it only with reviewed hosted credentials and an intentionally labelled test message:
 
@@ -319,18 +322,18 @@ npm run lint
 npm run build
 ```
 
-For a future release rerun, also validate migrations in a disposable/local migration environment, run the transaction pgTAP tests and Supabase security/performance advisors, perform the scoped live harness, and confirm local/remote migration history after any hosted application. The current release results are recorded below.
+For a future release rerun, validate each migration with a hosted dry run and transaction-wrapped rollback rehearsal, run the transaction pgTAP tests and Supabase security/performance advisors, perform the scoped live harness, and confirm local/remote migration history after any hosted application. Do not start local Supabase/Docker unless the user explicitly requests it. The current release results are recorded below.
 
 ### Status at this documentation update
 
 | Gate | Status |
 | --- | --- |
 | React/Go implementation and focused coverage | **Passed.** Go/frontend build and lint, Go race checks, and integration coverage passed in the completed verification runs. |
-| Hosted migration rehearsal/application/history | **Passed.** `20260902230002_add_durable_source_deletion.sql` passed dry run and transaction-wrapped rollback rehearsal, is applied after `20260902230001`, and local/remote histories match through `20260902230002`. No local Supabase or Docker instance was used. |
-| Hosted database validation | **Passed.** Database lint reports no schema errors; the existing 152 pgTAP assertions and the new 28 deletion/audit assertions all pass and roll back their fixtures. |
-| Hosted Go store integration | **Passed.** Transaction-store integration tests pass through the configured transaction pooler, including deletion staging/tombstones, cleanup retry/success, source reingestion prevention, and bounded/exact Debug behavior. |
+| Hosted migration rehearsal/application/history | **Passed.** `20260902230003_keep_source_cleanup_retrying.sql` passed dry run and transaction-wrapped rollback rehearsal, is applied after `20260902230002`, and local/remote histories match through `20260902230003`. No local Supabase or Docker instance was used. |
+| Hosted database validation | **Passed.** Database lint reports no schema errors; all 189 pgTAP assertions pass and roll back their fixtures, including 28 source-deletion and 9 cleanup-recovery assertions. |
+| Hosted Go store integration | **Passed.** The race-enabled transaction-store integration suite passes through the configured transaction pooler, including serialized concurrent create decisions, deletion staging/tombstones, non-terminal cleanup retry and expired-lease recovery, source reingestion prevention, and bounded/exact Debug behavior. |
 | Live Gmail → private Storage ingestion | **Passed.** The initial scoped run fetched and stored five unique `odin-finance` sources, including one private attachment. |
-| Live Qwen parsing and reconciliation | **Baseline passed; current targeted check awaiting explicit approval.** Earlier `qwen3.8-flash` checks reached the provider with thinking disabled and reconciled the five-source backfill. The exact FairPrice invalid-category response is now covered by a worker regression: optional category/citation is discarded while the trusted `2562` Account evidence remains; required or other populated-field citation failures still fail. A fresh retained-source call is not claimed until outbound-data approval is granted. |
+| Live Qwen parsing and reconciliation | **Baseline passed; current targeted check awaiting explicit approval.** Earlier `qwen3.8-flash` checks reached the provider with thinking disabled and reconciled the five-source backfill. The exact FairPrice invalid-category response is now covered by a worker regression: optional category/citation is discarded while semantically corroborated masked-card evidence `Mastercard (**** 2562)` remains; a bare or conflicting four-digit value is demoted, and required or other populated-field citation failures still fail. A fresh retained-source call is not claimed until outbound-data approval is granted. |
 | Idempotent replay | **Passed.** Repeating the same five-message run created zero duplicate sources. |
 | Five-minute signed attachment access | **Passed.** A live ranged download through the signed URL succeeded within its five-minute lifetime. |
 | Hosted anonymous/private-schema denial | **Passed for the exercised surfaces.** Anonymous REST requests to Transactions and sync data returned `401`; requesting the private source schema returned `406`. |
