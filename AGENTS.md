@@ -35,6 +35,7 @@ Keep the frontend, API, and database concerns separate. Browser code may use Sup
 ## Supabase rules
 
 - Use the available Supabase skill and MCP/documentation before implementing Supabase features; verify current API/CLI behaviour rather than relying on memory.
+- Use the configured hosted/remote Supabase project for development and testing by default. Do not start or use a local Docker Supabase instance unless the user explicitly requests it.
 - Never expose the Supabase `service_role`/secret key in frontend code or any public environment variable. The frontend may use only the publishable (or legacy anon) key.
 - Enable RLS on every browser-accessible table and write policies that restrict rows to the authenticated user. Policies must enforce ownership, not merely `TO authenticated`.
 - Treat `user_metadata` as user-controlled; do not use it for authorization.
