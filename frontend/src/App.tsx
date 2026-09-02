@@ -42,7 +42,10 @@ import {
   type MetadataEntry,
 } from "./features/accounts/validation";
 import { isSupabaseConfigured, supabase } from "./lib/supabase";
+import { TransactionsPage } from "./features/transactions/TransactionsPage";
 import "./App.css";
+
+type WorkspacePage = "accounts" | "transactions";
 
 const newDraft = (): AccountDraft => ({
   side: "asset",
@@ -428,8 +431,8 @@ function AccountForm({
 
 const navigation = [
   { label: "Dashboard", icon: LayoutDashboard },
-  { label: "Accounts", icon: Landmark, active: true },
-  { label: "Transactions", icon: ArrowLeftRight },
+  { label: "Accounts", icon: Landmark, page: "accounts" as const },
+  { label: "Transactions", icon: ArrowLeftRight, page: "transactions" as const },
   { label: "Investments", icon: ChartColumn },
   { label: "Goals", icon: WalletCards },
 ];
@@ -437,9 +440,13 @@ const navigation = [
 function SideNav({
   email,
   signOut,
+  activePage,
+  onNavigate,
 }: {
   email: string | undefined;
   signOut: () => Promise<void>;
+  activePage: WorkspacePage;
+  onNavigate: (page: WorkspacePage) => void;
 }) {
   return (
     <aside className="side-nav">
@@ -448,19 +455,23 @@ function SideNav({
         <span>Wealth Builder</span>
       </div>
       <nav aria-label="Primary navigation">
-        {navigation.map(({ label, icon: Icon, active }) => (
+        {navigation.map(({ label, icon: Icon, page }) => {
+          const active = page === activePage;
+          return (
           <button
             key={label}
             type="button"
             className={`nav-item${active ? " active" : ""}`}
             aria-current={active ? "page" : undefined}
-            disabled={!active}
+            disabled={!page}
+            onClick={page ? () => onNavigate(page) : undefined}
           >
             <Icon size={19} />
             <span>{label}</span>
-            {!active && <small>Soon</small>}
+            {!page && <small>Soon</small>}
           </button>
-        ))}
+          );
+        })}
       </nav>
       <div className="nav-bottom">
         <button className="nav-item" type="button" disabled>
@@ -489,9 +500,13 @@ function SideNav({
 function AccountsPage({
   session,
   signOut,
+  activePage,
+  onNavigate,
 }: {
   session: Session;
   signOut: () => Promise<void>;
+  activePage: WorkspacePage;
+  onNavigate: (page: WorkspacePage) => void;
 }) {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [loading, setLoading] = useState(true);
@@ -687,7 +702,12 @@ function AccountsPage({
     ) : null;
   return (
     <div className="app-layout">
-      <SideNav email={session.user.email} signOut={signOut} />
+      <SideNav
+        activePage={activePage}
+        email={session.user.email}
+        onNavigate={onNavigate}
+        signOut={signOut}
+      />
       <div className="app-main">
         <header className="top-bar">
           <div className="top-bar-title">
@@ -713,6 +733,10 @@ function AccountsPage({
           </div>
         </header>
         <main className="app-shell">
+          {activePage === "transactions" ? (
+            <TransactionsPage session={session} />
+          ) : (
+            <>
           <header className="page-header">
             <div>
               <p className="eyebrow">ACCOUNT DIRECTORY</p>
@@ -888,6 +912,8 @@ function AccountsPage({
               saved={load}
             />
           )}
+            </>
+          )}
         </main>
         <footer className="app-footer">
           © {new Date().getFullYear()} Wealth Builder. All rights reserved.
@@ -900,6 +926,7 @@ function AccountsPage({
 export default function App() {
   const [session, setSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(true);
+  const [activePage, setActivePage] = useState<WorkspacePage>("accounts");
   useEffect(() => {
     void supabase.auth.getSession().then(({ data }) => {
       setSession(data.session);
@@ -932,6 +959,8 @@ export default function App() {
     );
   return session ? (
     <AccountsPage
+      activePage={activePage}
+      onNavigate={setActivePage}
       session={session}
       signOut={() => supabase.auth.signOut().then(() => undefined)}
     />
