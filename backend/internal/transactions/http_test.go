@@ -492,6 +492,218 @@ func TestPatchTransactionValidatesDecimalMoneyAndLineItems(t *testing.T) {
 	}
 }
 
+func TestValidateLineItemsRejectsCollectionAndDescriptionBounds(t *testing.T) {
+	validItem := lineItemRequest{
+		SchemaVersion: 1,
+		Description:   "Coffee",
+		Quantity:      1,
+		Currency:      "SGD",
+		Details:       json.RawMessage(`{}`),
+	}
+	tooMany := make([]lineItemRequest, 101)
+	for index := range tooMany {
+		tooMany[index] = validItem
+	}
+	encoded, err := json.Marshal(tooMany)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = validateLineItems(encoded); err == nil || !strings.Contains(err.Error(), "at most 100 items") {
+		t.Fatalf("validateLineItems(101 items) error = %v", err)
+	}
+
+	validItem.Description = "  " + strings.Repeat("界", 250) + "  "
+	encoded, err = json.Marshal([]lineItemRequest{validItem})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = validateLineItems(encoded); err != nil {
+		t.Fatalf("validateLineItems(250 Unicode characters) error = %v", err)
+	}
+
+	validItem.Description = strings.Repeat("界", 251)
+	encoded, err = json.Marshal([]lineItemRequest{validItem})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = validateLineItems(encoded); err == nil || !strings.Contains(err.Error(), "description must be at most 250 characters") {
+		t.Fatalf("validateLineItems(251 Unicode characters) error = %v", err)
+	}
+
+	validItem.Description = "Oversized metadata"
+	validItem.Details = json.RawMessage(`{"blob":"` + strings.Repeat("x", 256*1024) + `"}`)
+	encoded, err = json.Marshal([]lineItemRequest{validItem})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = validateLineItems(encoded); err == nil || !strings.Contains(err.Error(), "serialized line_items must not exceed 262144 bytes") {
+		t.Fatalf("validateLineItems(oversized details) error = %v", err)
+	}
+}
+
+func TestTransactionResponseDecodesStoredLineItemMoneyRepresentations(t *testing.T) {
+	raw := json.RawMessage(`[
+		{"schema_version":1,"description":"Coffee","quantity":2,"unit_price_minor":"000625","line_total_minor":1250,"tax_minor":null,"currency":"SGD","details":{"sku":"latte"}},
+		{"schema_version":1,"description":"Voucher","quantity":1,"line_total_minor":"0","tax_minor":0,"discount_minor":"9223372036854775807","currency":"SGD","details":{}}
+	]`)
+
+	response := transactionResponse(transactionstore.Transaction{LineItems: raw})
+	if len(response.LineItems) != 2 {
+		t.Fatalf("line items = %#v, want two preserved items", response.LineItems)
+	}
+	first := response.LineItems[0]
+	if first.UnitPriceMinor == nil || *first.UnitPriceMinor != "625" ||
+		first.LineTotalMinor == nil || *first.LineTotalMinor != "1250" {
+		t.Fatalf("first line item money = unit:%v total:%v", first.UnitPriceMinor, first.LineTotalMinor)
+	}
+	if first.TaxMinor != nil || first.DiscountMinor != nil {
+		t.Fatalf("null/missing optional money = tax:%v discount:%v, want nil", first.TaxMinor, first.DiscountMinor)
+	}
+	second := response.LineItems[1]
+	if second.UnitPriceMinor != nil || second.LineTotalMinor == nil || *second.LineTotalMinor != "0" ||
+		second.TaxMinor == nil || *second.TaxMinor != "0" ||
+		second.DiscountMinor == nil || *second.DiscountMinor != "9223372036854775807" {
+		t.Fatalf("second line item money = unit:%v total:%v tax:%v discount:%v",
+			second.UnitPriceMinor, second.LineTotalMinor, second.TaxMinor, second.DiscountMinor)
+	}
+	if string(first.Details) != `{"sku":"latte"}` {
+		t.Fatalf("details = %s, want source value preserved", first.Details)
+	}
+}
+
+func TestPatchTransactionResponsePreservesStoredStringLineItems(t *testing.T) {
+	transactionID := uuid.New()
+	repository := &repositoryStub{transaction: transactionstore.Transaction{
+		ID: transactionID, AccountID: uuid.New(), TransactionKind: "debit", Title: "Coffee edited",
+		OriginalAmountMinor: 1250, OriginalCurrency: "SGD", OccurredAt: time.Now(),
+		LineItems:    json.RawMessage(`[{"schema_version":1,"description":"Coffee","quantity":2,"unit_price_minor":"625","line_total_minor":"1250","currency":"SGD","details":{}}]`),
+		ReviewStatus: "confirmed", CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}}
+	mux := authenticatedMux(t, repository, uuid.New())
+	request := httptest.NewRequest(http.MethodPatch, "/v1/transactions/"+transactionID.String(), strings.NewReader(`{"title":"Coffee edited"}`))
+	request.Header.Set("Authorization", "Bearer valid")
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("response = %d %s", response.Code, response.Body.String())
+	}
+	var body transactionJSON
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.LineItems) != 1 || body.LineItems[0].UnitPriceMinor == nil ||
+		*body.LineItems[0].UnitPriceMinor != "625" || body.LineItems[0].LineTotalMinor == nil ||
+		*body.LineItems[0].LineTotalMinor != "1250" {
+		t.Fatalf("PATCH line items = %#v, want valid stored values preserved", body.LineItems)
+	}
+}
+
+func TestStoredLineItemDecoderFailsSafely(t *testing.T) {
+	validPrefix := `[{"schema_version":1,"description":"Coffee","quantity":1,"unit_price_minor":`
+	validSuffix := `,"currency":"SGD","details":{}}]`
+	tests := map[string]string{
+		"negative number":   `-1`,
+		"negative string":   `"-1"`,
+		"fraction number":   `1.5`,
+		"fraction string":   `"1.5"`,
+		"exponent number":   `1e2`,
+		"nondecimal string": `"one"`,
+		"overflow number":   `9223372036854775808`,
+		"overflow string":   `"9223372036854775808"`,
+		"wrong JSON type":   `{}`,
+	}
+	for name, amount := range tests {
+		t.Run(name, func(t *testing.T) {
+			raw := json.RawMessage(validPrefix + amount + validSuffix)
+			if _, err := decodeStoredLineItems(raw); err == nil {
+				t.Fatal("decodeStoredLineItems() error = nil, want invalid stored data rejected")
+			}
+			if got := lineItemsResponse(raw); len(got) != 0 {
+				t.Fatalf("lineItemsResponse() = %#v, want fail-closed empty response", got)
+			}
+		})
+	}
+}
+
+func TestPatchTransactionAcceptsTrimmedMerchantAndUserNotes(t *testing.T) {
+	transactionID := uuid.New()
+	repository := &repositoryStub{transaction: transactionstore.Transaction{
+		ID: transactionID, AccountID: uuid.New(), TransactionKind: "debit", Title: "Groceries",
+		OriginalAmountMinor: 450, OriginalCurrency: "SGD", OccurredAt: time.Now(),
+		LineItems: json.RawMessage("[]"), ReviewStatus: "confirmed", CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}}
+	mux := authenticatedMux(t, repository, uuid.New())
+	request := httptest.NewRequest(
+		http.MethodPatch,
+		"/v1/transactions/"+transactionID.String(),
+		strings.NewReader(`{"merchant_name":"  FairPrice  ","user_notes":"  Family groceries  "}`),
+	)
+	request.Header.Set("Authorization", "Bearer valid")
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("response = %d %s", response.Code, response.Body.String())
+	}
+	if !repository.patch.MerchantName.Set || repository.patch.MerchantName.Value == nil ||
+		*repository.patch.MerchantName.Value != "FairPrice" {
+		t.Fatalf("merchant patch = %#v", repository.patch.MerchantName)
+	}
+	if !repository.patch.UserNotes.Set || repository.patch.UserNotes.Value == nil ||
+		*repository.patch.UserNotes.Value != "Family groceries" {
+		t.Fatalf("notes patch = %#v", repository.patch.UserNotes)
+	}
+}
+
+func TestPatchTransactionClearsNullableMerchantAndEmptyUserNotes(t *testing.T) {
+	repository := &repositoryStub{transaction: transactionstore.Transaction{
+		ID: uuid.New(), AccountID: uuid.New(), TransactionKind: "debit", Title: "Groceries",
+		OriginalAmountMinor: 450, OriginalCurrency: "SGD", OccurredAt: time.Now(),
+		LineItems: json.RawMessage("[]"), ReviewStatus: "confirmed", CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}}
+	mux := authenticatedMux(t, repository, uuid.New())
+	request := httptest.NewRequest(
+		http.MethodPatch,
+		"/v1/transactions/"+repository.transaction.ID.String(),
+		strings.NewReader(`{"merchant_name":null,"user_notes":"   "}`),
+	)
+	request.Header.Set("Authorization", "Bearer valid")
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("response = %d %s", response.Code, response.Body.String())
+	}
+	if !repository.patch.MerchantName.Set || repository.patch.MerchantName.Value != nil ||
+		!repository.patch.UserNotes.Set || repository.patch.UserNotes.Value != nil {
+		t.Fatalf("nullable patch = %#v", repository.patch)
+	}
+}
+
+func TestPatchTransactionRejectsInvalidMerchantAndUserNotes(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "empty merchant", body: `{"merchant_name":"   "}`},
+		{name: "long merchant", body: fmt.Sprintf(`{"merchant_name":%q}`, strings.Repeat("m", 251))},
+		{name: "numeric merchant", body: `{"merchant_name":42}`},
+		{name: "long notes", body: fmt.Sprintf(`{"user_notes":%q}`, strings.Repeat("n", 4001))},
+		{name: "numeric notes", body: `{"user_notes":42}`},
+		{name: "wrong field name", body: `{"notes":"not the API field"}`},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			mux := authenticatedMux(t, &repositoryStub{}, uuid.New())
+			request := httptest.NewRequest(http.MethodPatch, "/v1/transactions/"+uuid.NewString(), strings.NewReader(testCase.body))
+			request.Header.Set("Authorization", "Bearer valid")
+			response := httptest.NewRecorder()
+			mux.ServeHTTP(response, request)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("response = %d %s", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
 func TestPatchTransactionRejectsNumericMoney(t *testing.T) {
 	mux := authenticatedMux(t, &repositoryStub{}, uuid.New())
 	response := httptest.NewRecorder()

@@ -244,6 +244,78 @@ func TestValidateLineItemRequiresIntegerQuantityAndSafeDetails(t *testing.T) {
 	}
 }
 
+func TestValidateParsedResponseRejectsLineItemBounds(t *testing.T) {
+	validItem := LineItem{
+		SchemaVersion: 1,
+		Description:   "Cloud hosting",
+		Quantity:      1,
+		Currency:      "USD",
+		Details:       json.RawMessage(`{}`),
+	}
+	tests := []struct {
+		name      string
+		lineItems []LineItem
+		want      string
+	}{
+		{
+			name: "more than one hundred items",
+			lineItems: func() []LineItem {
+				items := make([]LineItem, 101)
+				for index := range items {
+					items[index] = validItem
+				}
+				return items
+			}(),
+			want: "at most 100 items",
+		},
+		{
+			name: "description longer than two hundred fifty Unicode characters",
+			lineItems: []LineItem{{
+				SchemaVersion: 1,
+				Description:   strings.Repeat("界", 251),
+				Quantity:      1,
+				Currency:      "USD",
+				Details:       json.RawMessage(`{}`),
+			}},
+			want: "description must be at most 250 characters",
+		},
+		{
+			name: "serialized line items larger than two hundred fifty six kibibytes",
+			lineItems: []LineItem{{
+				SchemaVersion: 1,
+				Description:   "Oversized metadata",
+				Quantity:      1,
+				Currency:      "USD",
+				Details:       json.RawMessage(`{"blob":"` + strings.Repeat("x", 256*1024) + `"}`),
+			}},
+			want: "serialized line_items must not exceed 262144 bytes",
+		},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			candidate := validCandidate(time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC))
+			candidate.LineItems = testCase.lineItems
+			err := ValidateParsedResponse(ParsedResponse{Candidate: candidate})
+			if err == nil || !strings.Contains(err.Error(), testCase.want) {
+				t.Fatalf("ValidateParsedResponse() error = %v, want %q", err, testCase.want)
+			}
+		})
+	}
+}
+
+func TestValidateLineItemCountsUnicodeCharacters(t *testing.T) {
+	item := LineItem{
+		SchemaVersion: 1,
+		Description:   "  " + strings.Repeat("界", 250) + "  ",
+		Quantity:      1,
+		Currency:      "USD",
+		Details:       json.RawMessage(`{}`),
+	}
+	if err := ValidateLineItem(item); err != nil {
+		t.Fatalf("ValidateLineItem() rejected 250 trimmed Unicode characters: %v", err)
+	}
+}
+
 func TestValidateParsedResponseRequiresCitedCoreFields(t *testing.T) {
 	candidate := validCandidate(time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC))
 	err := ValidateParsedResponse(ParsedResponse{Candidate: candidate, Evidence: []FieldEvidence{{Field: "title", SourcePath: "subject", Confidence: 1}}})

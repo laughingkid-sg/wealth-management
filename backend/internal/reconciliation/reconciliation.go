@@ -29,9 +29,12 @@ const (
 	// MatchWindow is a supporting signal only; it can never create a match by itself.
 	MatchWindow = 10 * time.Minute
 
-	minimumCreateConfidence = 0.75
-	highMatchScore          = 90
-	ambiguousScoreDelta     = 10
+	minimumCreateConfidence     = 0.75
+	highMatchScore              = 90
+	ambiguousScoreDelta         = 10
+	maxTransactionLineItems     = 100
+	maxLineItemDescriptionRunes = 250
+	maxSerializedLineItemsBytes = 256 * 1024
 )
 
 // TransactionKind describes the direction relative to the linked account.
@@ -219,13 +222,36 @@ func ValidateCandidate(candidate Candidate) error {
 			break
 		}
 	}
-	for i, item := range candidate.LineItems {
+	if err := ValidateLineItems(candidate.LineItems); err != nil {
+		problems = append(problems, err.Error())
+	}
+	if len(problems) > 0 {
+		return errors.New(strings.Join(problems, "; "))
+	}
+	return nil
+}
+
+// ValidateLineItems enforces the transaction-level collection bound and the
+// versioned contract for every item before any database write is attempted.
+func ValidateLineItems(items []LineItem) error {
+	if len(items) > maxTransactionLineItems {
+		return fmt.Errorf("line_items must contain at most %d items", maxTransactionLineItems)
+	}
+	var problems []string
+	for index, item := range items {
 		if err := ValidateLineItem(item); err != nil {
-			problems = append(problems, fmt.Sprintf("line item %d: %v", i, err))
+			problems = append(problems, fmt.Sprintf("line_items[%d]: %v", index, err))
 		}
 	}
 	if len(problems) > 0 {
 		return errors.New(strings.Join(problems, "; "))
+	}
+	serialized, err := json.Marshal(items)
+	if err != nil {
+		return fmt.Errorf("line_items could not be serialized: %w", err)
+	}
+	if len(serialized) > maxSerializedLineItemsBytes {
+		return fmt.Errorf("serialized line_items must not exceed %d bytes", maxSerializedLineItemsBytes)
 	}
 	return nil
 }
@@ -236,8 +262,11 @@ func ValidateLineItem(item LineItem) error {
 	if item.SchemaVersion != 1 {
 		problems = append(problems, "schema version must be 1")
 	}
-	if strings.TrimSpace(item.Description) == "" {
+	description := strings.TrimSpace(item.Description)
+	if description == "" {
 		problems = append(problems, "description is required")
+	} else if utf8.RuneCountInString(description) > maxLineItemDescriptionRunes {
+		problems = append(problems, fmt.Sprintf("description must be at most %d characters", maxLineItemDescriptionRunes))
 	}
 	if item.Quantity <= 0 {
 		problems = append(problems, "quantity must be a positive integer")

@@ -57,10 +57,18 @@ type OptionalUUID struct {
 	Value *uuid.UUID
 }
 
+type OptionalString struct {
+	Set   bool
+	Value *string
+}
+
 // TransactionPatch represents only the canonical fields a user may edit.
-// Details, review workflow and evidence links are intentionally absent.
+// UserNotes is the only editable details key; source provenance, review
+// workflow, and evidence links are intentionally absent.
 type TransactionPatch struct {
 	Title               *string
+	MerchantName        OptionalString
+	UserNotes           OptionalString
 	AccountID           *uuid.UUID
 	OccurredAt          *time.Time
 	OriginalAmountMinor *int64
@@ -312,23 +320,30 @@ func (s *Store) PatchTransaction(ctx context.Context, userID, transactionID uuid
 	err = tx.QueryRow(ctx, `
 		update public.transactions transaction
 		set title = case when $3 then $4 else transaction.title end,
-			account_id = case when $5 then $6 else transaction.account_id end,
-			occurred_at = case when $7 then $8 else transaction.occurred_at end,
-			original_amount_minor = case when $9 then $10 else transaction.original_amount_minor end,
-			original_currency = case when $11 then $12 else transaction.original_currency end,
-			sgd_amount_minor = case when $13 then $14 else transaction.sgd_amount_minor end,
-			category_id = case when $15 then $16::uuid else transaction.category_id end,
-			line_items = case when $17 then $18::jsonb else transaction.line_items end,
+			merchant_name = case when $5 then $6::text else transaction.merchant_name end,
+			account_id = case when $7 then $8 else transaction.account_id end,
+			occurred_at = case when $9 then $10 else transaction.occurred_at end,
+			original_amount_minor = case when $11 then $12 else transaction.original_amount_minor end,
+			original_currency = case when $13 then $14 else transaction.original_currency end,
+			sgd_amount_minor = case when $15 then $16 else transaction.sgd_amount_minor end,
+			category_id = case when $17 then $18::uuid else transaction.category_id end,
+			line_items = case when $19 then $20::jsonb else transaction.line_items end,
+			details = case
+				when not $21 then transaction.details
+				when $22::text is null or $22::text = '' then transaction.details - 'user_notes'
+				else jsonb_set(transaction.details, '{user_notes}', to_jsonb($22::text), true)
+			end,
 			user_modified_at = now()
 		where transaction.id = $1 and transaction.user_id = $2
-			and (not $5 or exists (select 1 from public.accounts account where account.id = $6 and account.user_id = $2 and account.deleted_at is null))
-			and (not $15 or $16::uuid is null or exists (select 1 from public.transaction_categories category where category.id = $16::uuid and category.active))
+			and (not $7 or exists (select 1 from public.accounts account where account.id = $8 and account.user_id = $2 and account.deleted_at is null))
+			and (not $17 or $18::uuid is null or exists (select 1 from public.transaction_categories category where category.id = $18::uuid and category.active))
 		returning transaction.id, transaction.account_id, transaction.transaction_kind, transaction.title, transaction.merchant_name,
 			transaction.original_amount_minor, transaction.original_currency, transaction.sgd_amount_minor, transaction.occurred_at,
 			transaction.category_id, transaction.line_items, transaction.review_status, transaction.match_confidence,
 			transaction.created_at, transaction.updated_at`,
 		transactionID, userID,
 		patch.Title != nil, nullableString(patch.Title),
+		patch.MerchantName.Set, patch.MerchantName.Value,
 		patch.AccountID != nil, patch.AccountID,
 		patch.OccurredAt != nil, patch.OccurredAt,
 		patch.OriginalAmountMinor != nil, patch.OriginalAmountMinor,
@@ -336,6 +351,7 @@ func (s *Store) PatchTransaction(ctx context.Context, userID, transactionID uuid
 		patch.SGDAmountMinor.Set, patch.SGDAmountMinor.Value,
 		patch.CategoryID.Set, patch.CategoryID.Value,
 		patch.LineItems != nil, nullableJSONBytes(patch.LineItems),
+		patch.UserNotes.Set, patch.UserNotes.Value,
 	).Scan(transactionFields(&transaction)...)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Transaction{}, ErrTransactionNotFound

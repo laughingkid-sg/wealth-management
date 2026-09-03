@@ -1060,7 +1060,8 @@ func decodeTransactionPatch(w http.ResponseWriter, r *http.Request) (transaction
 		return transactionstore.TransactionPatch{}, errors.New("at least one editable field is required")
 	}
 	allowed := map[string]bool{
-		"title": true, "account_id": true, "occurred_at": true, "original_amount_minor": true,
+		"title": true, "merchant_name": true, "user_notes": true,
+		"account_id": true, "occurred_at": true, "original_amount_minor": true,
 		"original_currency": true, "sgd_amount_minor": true, "category_id": true, "line_items": true,
 	}
 	for name := range fields {
@@ -1075,6 +1076,32 @@ func decodeTransactionPatch(w http.ResponseWriter, r *http.Request) (transaction
 			return patch, errors.New("title must be 1 to 250 characters")
 		}
 		patch.Title = &value
+	}
+	if raw, present := fields["merchant_name"]; present {
+		patch.MerchantName.Set = true
+		if !isJSONNull(raw) {
+			value, err := requiredString(raw, "merchant_name")
+			if err != nil || utf8.RuneCountInString(value) > 250 {
+				return patch, errors.New("merchant_name must be null or a non-empty string of at most 250 characters")
+			}
+			patch.MerchantName.Value = &value
+		}
+	}
+	if raw, present := fields["user_notes"]; present {
+		patch.UserNotes.Set = true
+		if !isJSONNull(raw) {
+			var value string
+			if json.Unmarshal(raw, &value) != nil {
+				return patch, errors.New("user_notes must be a string or null")
+			}
+			value = strings.TrimSpace(value)
+			if utf8.RuneCountInString(value) > 4000 {
+				return patch, errors.New("user_notes must be at most 4000 characters")
+			}
+			if value != "" {
+				patch.UserNotes.Value = &value
+			}
+		}
 	}
 	if raw, present := fields["account_id"]; present {
 		value, err := requiredUUID(raw, "account_id")
@@ -1279,10 +1306,10 @@ func validateLineItems(raw json.RawMessage) (json.RawMessage, error) {
 		if err != nil {
 			return nil, fmt.Errorf("line_items[%d]: %w", index, err)
 		}
-		if err = reconciliation.ValidateLineItem(decoded); err != nil {
-			return nil, fmt.Errorf("line_items[%d]: %w", index, err)
-		}
 		result = append(result, decoded)
+	}
+	if err := reconciliation.ValidateLineItems(result); err != nil {
+		return nil, err
 	}
 	encoded, err := json.Marshal(result)
 	if err != nil {
@@ -1487,8 +1514,8 @@ type transactionJSON struct {
 }
 
 func lineItemsResponse(raw json.RawMessage) []lineItemResponse {
-	var stored []reconciliation.LineItem
-	if json.Unmarshal(raw, &stored) != nil {
+	stored, err := decodeStoredLineItems(raw)
+	if err != nil {
 		return []lineItemResponse{}
 	}
 	result := make([]lineItemResponse, 0, len(stored))
@@ -1501,6 +1528,100 @@ func lineItemsResponse(raw json.RawMessage) []lineItemResponse {
 		})
 	}
 	return result
+}
+
+// storedLineItem is deliberately separate from the write-boundary LineItem
+// type. Postgres permits bigint-safe decimal strings for browser-created rows,
+// while model and API writes continue to require their existing representations.
+type storedLineItem struct {
+	SchemaVersion  int             `json:"schema_version"`
+	Description    string          `json:"description"`
+	Quantity       int             `json:"quantity"`
+	UnitPriceMinor json.RawMessage `json:"unit_price_minor"`
+	LineTotalMinor json.RawMessage `json:"line_total_minor"`
+	TaxMinor       json.RawMessage `json:"tax_minor"`
+	DiscountMinor  json.RawMessage `json:"discount_minor"`
+	Currency       string          `json:"currency"`
+	Details        json.RawMessage `json:"details"`
+}
+
+func decodeStoredLineItems(raw json.RawMessage) ([]reconciliation.LineItem, error) {
+	var input []storedLineItem
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&input); err != nil || input == nil {
+		return nil, errors.New("stored line_items must be an array")
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return nil, errors.New("stored line_items must contain one JSON value")
+	}
+
+	result := make([]reconciliation.LineItem, 0, len(input))
+	for index, item := range input {
+		decoded := reconciliation.LineItem{
+			SchemaVersion: item.SchemaVersion,
+			Description:   item.Description,
+			Quantity:      item.Quantity,
+			Currency:      item.Currency,
+			Details:       item.Details,
+		}
+		for _, amount := range []struct {
+			name string
+			raw  json.RawMessage
+			out  **int64
+		}{
+			{"unit_price_minor", item.UnitPriceMinor, &decoded.UnitPriceMinor},
+			{"line_total_minor", item.LineTotalMinor, &decoded.LineTotalMinor},
+			{"tax_minor", item.TaxMinor, &decoded.TaxMinor},
+			{"discount_minor", item.DiscountMinor, &decoded.DiscountMinor},
+		} {
+			value, err := decodeStoredMinorAmount(amount.raw)
+			if err != nil {
+				return nil, fmt.Errorf("stored line_items[%d].%s: %w", index, amount.name, err)
+			}
+			*amount.out = value
+		}
+		result = append(result, decoded)
+	}
+	if err := reconciliation.ValidateLineItems(result); err != nil {
+		return nil, fmt.Errorf("stored line_items are invalid: %w", err)
+	}
+	return result, nil
+}
+
+func decodeStoredMinorAmount(raw json.RawMessage) (*int64, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil, nil
+	}
+
+	decimal := string(trimmed)
+	if trimmed[0] == '"' {
+		if err := json.Unmarshal(trimmed, &decimal); err != nil {
+			return nil, errors.New("must be a JSON integer, decimal-integer string, or null")
+		}
+	}
+	if decimal == "" {
+		return nil, errors.New("must be a non-negative decimal integer")
+	}
+	for _, digit := range decimal {
+		if digit < '0' || digit > '9' {
+			return nil, errors.New("must be a non-negative decimal integer")
+		}
+	}
+
+	canonical := strings.TrimLeft(decimal, "0")
+	if canonical == "" {
+		canonical = "0"
+	}
+	if len(canonical) > 19 {
+		return nil, errors.New("must fit in a signed 64-bit integer")
+	}
+	value, err := strconv.ParseInt(canonical, 10, 64)
+	if err != nil {
+		return nil, errors.New("must fit in a signed 64-bit integer")
+	}
+	return &value, nil
 }
 
 type lineItemResponse struct {
