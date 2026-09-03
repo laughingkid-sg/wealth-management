@@ -291,7 +291,7 @@ Transaction/source list cursors are versioned, scope-bound base64url values. Res
 
 ## React implementation
 
-The workspace navigation contains four independent Transactions pages: **Transactions**, **Settings**, **Global Settings**, and **Prompt Preview**. Their page components are `TransactionsPage.tsx`, `TransactionSettingsPage.tsx`, `GlobalTransactionSettingsPage.tsx`, and `PromptPreviewPage.tsx` under `frontend/src/features/transactions/`.
+The workspace navigation contains four independent Transactions pages: **Transactions**, **Prompt Preview**, **Global Settings**, and **Settings**. Their page components are `TransactionsPage.tsx`, `PromptPreviewPage.tsx`, `GlobalTransactionSettingsPage.tsx`, and `TransactionSettingsPage.tsx` under `frontend/src/features/transactions/`.
 
 - Transactions supports title/merchant search, debit/credit and review filters, cursor “load more,” original/SGD display, Account/category labels, evidence counts, and transfer badges.
 - **Add transaction** sits beside **Internal transfer** and opens a manual-entry dialog for any active owned Account. It validates debit/credit, required title/date/original money, optional merchant/SGD/category/notes, and at most 100 line items; runs the owner-scoped duplicate preflight; and inserts a confirmed row through Data REST after the user accepts any warning.

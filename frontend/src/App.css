@@ -1763,6 +1763,7 @@ footer {
 }
 .transaction-settings-page {
   display: grid;
+  min-width: 0;
   gap: 22px;
 }
 .transaction-settings-page > .page-header {
@@ -1788,6 +1789,7 @@ footer {
 }
 .settings-card {
   display: grid;
+  min-width: 0;
   gap: 18px;
   margin: 0;
   padding: 22px;
@@ -1984,11 +1986,19 @@ footer {
   background: #fff0ee;
   color: #8e2f1a;
 }
+.global-rule-list {
+  min-width: 0;
+  max-width: 100%;
+}
 .global-rule-list > li {
   align-items: flex-start;
+  min-width: 0;
+  max-width: 100%;
 }
 .global-rule-summary {
   flex: 1;
+  min-width: 0;
+  max-width: 100%;
 }
 .global-rule-prompt {
   max-width: 900px;
@@ -1998,9 +2008,16 @@ footer {
   white-space: pre-wrap;
 }
 .global-rule-config {
+  display: block;
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
   margin-top: 10px;
   color: var(--muted);
   font-size: 0.78rem;
+}
+.global-rule-config[open] {
+  overflow: hidden;
 }
 .global-rule-config summary,
 .prompt-selection-details summary {
@@ -2009,8 +2026,18 @@ footer {
   color: var(--brand-deep);
   font-weight: 700;
 }
+.global-rule-config summary {
+  max-width: 100%;
+  width: fit-content;
+  overflow-wrap: anywhere;
+}
 .global-rule-config pre {
-  overflow: auto;
+  display: block;
+  overflow-x: auto;
+  overflow-y: auto;
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
   max-height: 260px;
   margin: 9px 0 0;
   padding: 12px;
@@ -2019,6 +2046,8 @@ footer {
   background: #f7f6f4;
   color: var(--ink);
   font: 0.76rem/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: pre;
+  overflow-wrap: normal;
 }
 .prompt-preview-safety {
   display: flex;

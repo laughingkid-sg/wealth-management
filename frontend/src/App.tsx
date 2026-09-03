@@ -465,9 +465,9 @@ const navigation = [
 
 const transactionNavigation = [
   { label: "Transactions", icon: ArrowLeftRight, page: "transactions" as const },
-  { label: "Settings", icon: SlidersHorizontal, page: "transaction-settings" as const },
-  { label: "Global Settings", icon: Globe2, page: "transaction-global-settings" as const },
   { label: "Prompt Preview", icon: FileSearch, page: "transaction-prompt-preview" as const },
+  { label: "Global Settings", icon: Globe2, page: "transaction-global-settings" as const },
+  { label: "Settings", icon: SlidersHorizontal, page: "transaction-settings" as const },
 ];
 
 function SideNav({

@@ -125,9 +125,9 @@ Transaction detail supports editing title, merchant or payee, Account, date/time
 The Transactions navigation section contains four independent pages:
 
 - **Transactions**: the four-tab transaction/evidence workspace described above.
-- **Settings**: the current user's bounded default prompt, versioned Gmail source rules, and Account matching keys.
-- **Global Settings**: platform-wide Gmail source rules shared by every user.
 - **Prompt Preview**: read-only inspection of the exact assembled system prompt and provider request template.
+- **Global Settings**: platform-wide Gmail source rules shared by every user.
+- **Settings**: the current user's bounded default prompt, versioned Gmail source rules, and Account matching keys.
 
 Personal source rules require a sender condition (exact address, domain, or RE2 expression); optional subject and content RE2 expressions combine with it using AND semantics. The single highest-priority matching global rule and the single highest-priority matching user rule are selected independently. A tie at the highest matching priority is treated as a visible configuration failure rather than chosen arbitrarily. User guidance is subordinate to the immutable platform contract and cannot change the response schema, authorisation boundary, source-only evidence rules, or no-invention requirement.
 
