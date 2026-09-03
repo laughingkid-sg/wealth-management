@@ -1,8 +1,10 @@
 # Transactions technical implementation
 
+Focused design reference: [Wealth Builder Transactions — Prompt and Matching Design](https://rcnubep1n9x.sg.larksuite.com/docx/BVk8dHLivos0odxu9o6lJomigMb).
+
 ## Implementation status
 
-The React workspace, Go API, Go worker, database migrations, and automated-test fixtures described here are implemented on `codex/feat-transaction`. Migration `20260903014725_allow_manual_transaction_inserts.sql` passed a hosted dry run and exact transaction-wrapped rollback rehearsal, is applied after `20260902230003`, and appears in matching migration history. All 228 pgTAP assertions across nine suites pass; full Go tests, race tests, vet, and builds pass; and frontend lint, build, and all 10 focused tests pass. Authenticated-browser acceptance covers terminal-banner persistence, direct manual creation, the duplicate override, merchant/note editing, zero evidence, and fixture cleanup. Qwen was not called in this final verification.
+The React workspace, Go API, Go worker, database migrations, and automated-test fixtures described here are implemented on `codex/feat-transaction`. Migrations through `20260903055808_add_global_source_rule_editor_metadata.sql` passed hosted dry runs and exact transaction-wrapped rollback rehearsals, are applied to the hosted development project, and appear in matching local/remote history. All 244 pgTAP assertions across ten suites pass, and hosted database lint reports no schema warnings or errors for the private or public schema. The full Go test, vet, race, and API/worker build gates pass; the hosted global-rule ownership/optimistic-update integration test also passes through the transaction pooler. Frontend lint and production build pass together with eight focused prompt/global-rule tests. Authenticated-browser verification covers Global Settings, safe rule defaults and catch-all warning, the automatic preview empty state after evidence reset, manual preview output and placeholders, and zero console warnings or errors. Qwen was not called.
 
 ## Component boundary
 
@@ -10,10 +12,10 @@ Transactions uses four cooperating boundaries:
 
 | Component | Responsibility |
 | --- | --- |
-| React SPA | Supabase session, Transactions/Review/Dangling/Failed views, an independent Transaction Settings page, owner-only parse debugging, safe reference-data reads, progress monitoring and terminal-result dismissal, manual transaction insertion through authenticated Data REST, and all other user actions through Go. |
-| Go API (`backend/cmd/api`) | Authenticates the Supabase user, owns Gmail OAuth, starts sync runs, returns safe transaction/source/settings/audit projections, signs attachment access, stages evidence deletion, and performs invariant-preserving edits and multi-row mutations. It does not expose a manual-create route. |
-| Go worker (`backend/cmd/worker`) | Claims durable jobs, fetches Gmail, stores attachments, selects global and user parser rules, assembles Qwen prompts, stores the complete call audit, validates candidates, and reconciles sources. |
-| Hosted Supabase | Auth, Postgres, RLS-protected public projections, a least-privilege manual-transaction INSERT surface, non-exposed private operational tables, Realtime sync updates, and private attachment Storage. |
+| React SPA | Supabase session, Transactions/Review/Dangling/Failed views, independent personal and global settings pages, side-effect-free Prompt Preview, owner-only parse debugging, safe reference-data reads, progress monitoring and terminal-result dismissal, manual transaction insertion through authenticated Data REST, and all other user actions through Go. |
+| Go API (`backend/cmd/api`) | Authenticates the Supabase user, owns Gmail OAuth, starts sync runs, returns safe transaction/source/settings/audit projections, manages private global rules, assembles read-only prompt previews, signs attachment access, stages evidence deletion, and performs invariant-preserving edits and multi-row mutations. It does not expose a manual-create route. |
+| Go worker (`backend/cmd/worker`) | Claims durable jobs, fetches Gmail, stores attachments, selects global and user parser rules through the shared prompt-selection package, assembles Qwen prompts, stores the complete call audit, validates candidates, and reconciles sources. |
+| Hosted Supabase | Auth, Postgres, RLS-protected public projections, a least-privilege manual-transaction INSERT surface, non-exposed private operational and parser-configuration tables, Realtime sync updates, and private attachment Storage. |
 
 The browser uses Supabase Data REST for the user’s active Account choices, the global category catalogue, the existing Account-detail transaction lookup, the advisory manual-duplicate lookup, and one narrowly constrained manual transaction insert. It sends the signed-in user's JWT and publishable key; it never uses a service-role key. The main Transactions/source listings, canonical edits, and every privileged or multi-table operation go through Go. Gmail, Qwen, raw sources, evidence links, OAuth tokens, worker jobs, Storage service credentials, and attachment signing are never browser-side concerns.
 
@@ -89,13 +91,15 @@ If `pdftoppm`/`sips` is unavailable, conversion fails, times out, or produces an
 
 ## Parser and rule contract
 
-The platform prompt is immutable, versioned application code. Version 2 fixes the response schema, source-only evidence requirement, exact evidence-path grammar, no-invention rule, absence of Account data, and the rule that email/attachment content is evidence rather than instruction. Configured guidance is appended in this stable order and is explicitly subordinate to that contract:
+The platform prompt is the build-embedded asset `backend/internal/prompts/transactions/system_v2.txt`, loaded by `backend/internal/prompts/prompts.go` with Go `embed`. It is versioned with the binary and has no runtime edit path. Version 2 fixes the response schema, source-only evidence requirement, exact evidence-path grammar, no-invention rule, absence of Account data, and the rule that email/attachment content is evidence rather than instruction. `backend/internal/transactionprompt` is the shared selection/assembly boundary used by production parsing and Prompt Preview. Configured guidance is appended in this stable order and is explicitly subordinate to the platform contract:
 
 1. the single highest-priority matching global rule;
 2. the user's default instructions, when non-empty;
 3. the single highest-priority matching user source rule.
 
-Global rules live in `private.source_parser_rules`. They are system-managed, versioned, provider-specific RE2 matchers with optional deterministic constants/capture groups and a prompt fragment. The seeded OCBC v2 rule recognizes explicit SGD purchase/debit messages and may supply debit/SGD constants plus a card-last-four capture. A lower-priority generic masked-card rule captures source evidence such as line-broken `Mastercard (**** 2562)` without inferring issuer, owner, amount, or direction. Historical rule rows remain available for parse provenance.
+Global rules live in `private.source_parser_rules`. They are shared, versioned Gmail rules with optional sender/content RE2 matchers, a prompt fragment, priority, active state, and optional deterministic constants/capture groups in `extraction_config`. If both matchers are present, both must match. The seeded OCBC v2 rule recognizes explicit SGD purchase/debit messages and may supply debit/SGD constants plus a card-last-four capture. A lower-priority generic masked-card rule captures source evidence such as line-broken `Mastercard (**** 2562)` without inferring issuer, owner, amount, or direction. Historical rule rows remain available for parse provenance.
+
+During the current development phase, every authenticated user may list, create, and edit these shared rules through the trusted Go API. Editable fields are `name`, `sender_matcher`, `content_matcher`, `prompt_fragment`, `priority`, and `active`; the provider remains Gmail. Deterministic `extraction_config` is returned for inspection but omitted from mutation input, is preserved during updates, and starts as `{}` for a newly created rule. Updates require `expected_version`, increment the stored version, record the authenticated editor and update time, and return a conflict when another edit has already advanced the row. There is no hard-delete route: setting `active = false` preserves the rule and its historical provenance. Configuration changes affect future source parses and manually retried sources only; they do not enqueue historical reparsing.
 
 User defaults live in `private.user_parser_settings` and are capped at 4,000 characters. User source rules live in `private.user_source_parser_rules`. Each rule has a required Gmail sender condition (`exact`, `domain`, or RE2), optional subject and content RE2 conditions, a prompt fragment, active state, priority, and monotonically increasing version. Present conditions use AND semantics. Global and user winners are selected independently; if two matching rules share the highest priority within either class, parsing records a configuration failure instead of choosing by ID. Go validates every user-entered expression with its RE2-compatible regular-expression engine before storage.
 
@@ -104,6 +108,14 @@ The worker calls Alibaba Cloud Token Plan at the configured OpenAI-compatible ba
 The model receives normalized source evidence and eligible attachment images, but no Account catalogue, Account metadata, configured matching keys, or other users' data. The model response is treated as untrusted. Strict decoding rejects unknown fields and extra JSON values. The server—not the model—binds user ownership, auto-eligibility, and aggregate confidence. Populated decisive fields, including generic additional identifiers, must cite the exact grammar `received_at` or a path rooted at `subject`, `sender`, `text`, or `attachment` with dot-name and numeric-index segments; a candidate field name or extracted value is never a source path. Only server-applied rules may add a `rule:<id>:v<version>` citation. `received_at` is used only as an occurred-at fallback when no explicit event timestamp exists. Aggregate confidence is the minimum valid confidence among decisive citations so a strong citation cannot hide a weak required fact.
 
 Every parse attempt stores bounded, owner-private audit data: the assembled system prompt, normalized user input, exact JSON request sent to Alibaba, exact JSON response returned by Alibaba, exact model-output object, server-validated candidate, selected rule IDs/versions, prompt components, attachment usage, validation state, and redacted error. Authentication headers and API keys are never stored. Failed and invalid attempts retain every boundary reached, so the Debug view can distinguish provider, schema, evidence, and configuration failures.
+
+### Prompt Preview
+
+Prompt Preview is a read-only assembly path; it does not share the worker's execution or persistence boundary. **Automatic** mode accepts an owned Gmail source ID, loads the same normalized source/configuration input as the worker, and calls the same active global and personal rule selectors. **Manual** mode accepts optional global and owned personal rule IDs plus an `include_user_default` flag, then assembles those chosen components without evaluating their matchers; inactive rules remain selectable for inspection.
+
+Both modes return `assembled_system_prompt`, `prompt_components`, `provider_request`, optional selected-source metadata, and rule-selection metadata. `provider_request` uses the production Qwen request envelope—`qwen3.8-flash`, JSON Object response mode, and thinking disabled—but replaces the email user-message content with `<EMAIL CONTENT OMITTED FROM PREVIEW>`. It adds `<ELIGIBLE RECEIPT OR INVOICE IMAGE OMITTED FROM PREVIEW>` only when the selected source metadata contains an attachment that could pass the worker's pre-download receipt/invoice gate. The template therefore shows request shape rather than disclosing source content or claiming that a later download/render will succeed.
+
+Preview responses use `Cache-Control: no-store`. The preview handlers perform no Alibaba call and do not enqueue jobs, insert parse-attempt audit, update source status, retry/reparse evidence, or write transactions or links.
 
 The normalized candidate contains:
 
@@ -154,7 +166,7 @@ All monetary columns use `bigint` integer minor units. Timestamps use `timestamp
 | `private.gmail_connections` | Encrypted refresh token, token metadata, exact label, History cursor, status, last sync/error. One Gmail connection per user. |
 | `private.gmail_oauth_states` | Single-use state digest and encrypted PKCE verifier with expiry/consumption protections. |
 | `private.data_sources` | Durable generic evidence, provider identity, JSON payload, parser provenance/state, Account/transaction suggestions, and reconciliation reason. Current allowed types: `gmail_email`, `phone_notification`. |
-| `private.source_parser_rules` | Versioned global regex/rule configuration and priority. |
+| `private.source_parser_rules` | Shared versioned Gmail rules: name, optional sender/content matchers, prompt fragment, deterministic extraction configuration, priority, active state, last authenticated editor, and timestamps. |
 | `private.user_parser_settings` | One versioned, bounded default parser-instruction value per user. |
 | `private.user_source_parser_rules` | Versioned owner-specific Gmail sender/subject/content matching plus prompt guidance and priority. |
 | `private.account_matching_keys` | Typed, immutable Account identities with permanent per-user uniqueness and retire/reactivate lifecycle. |
@@ -173,6 +185,8 @@ Forward migration `20260902230003_keep_source_cleanup_retrying.sql` adds cumulat
 
 Migration `20260903014725_allow_manual_transaction_inserts.sql` adds the browser manual-insert grant and policy, the active-category trigger, and database validators for transaction line items and details. It was created through the imperative Supabase migration workflow, passed hosted dry-run and exact rollback rehearsal, and is applied after `20260902230003` without rewriting prior history. Focused coverage lives in `supabase/tests/transactions_manual_insert.test.sql`; the existing transaction RLS test distinguishes the allowed manual insert from still-denied browser UPDATE/DELETE operations. Both pass as part of the nine hosted pgTAP suites.
 
+Migration `20260903055808_add_global_source_rule_editor_metadata.sql` adds the required human-readable `name` and nullable `updated_by_user_id` foreign key to global rules, backfills stable names for the seeded rules, adds the editor lookup index and bounded-name check, and reasserts RLS plus revoked browser grants on the private table. Auth-user deletion clears the attribution while preserving the rule, extraction configuration, and version; the existing update trigger still advances `updated_at`. Focused schema/security coverage is in `supabase/tests/transactions_global_source_rules.test.sql`. The migration passed a hosted dry run and exact transaction-wrapped rollback rehearsal, is applied after `20260903014725`, and appears in matching local/remote migration history.
+
 ### Manual-entry extension inventory
 
 | Surface | Responsibility and current verification state |
@@ -181,7 +195,7 @@ Migration `20260903014725_allow_manual_transaction_inserts.sql` adds the browser
 | `TransactionDetailDialog.tsx`, Go PATCH decoding, and the transaction store | Edit `merchant_name` and `user_notes` for every canonical creation method; merge the notes key without replacing other details. Verified through Go tests and an authenticated edit that preserved line-item details. |
 | `syncBannerDismissal.ts` and `TransactionsPage.tsx` | Per-user/per-run terminal Gmail-result dismissal while active progress remains non-dismissible. Verified through focused frontend tests and persisted authenticated-browser dismissal. |
 | `20260903014725_allow_manual_transaction_inserts.sql` | Least-privilege insert authorization, active-category enforcement, and JSON validation. Rehearsed, applied, present in migration history, and covered by passing pgTAP. |
-| `transactions_manual_insert.test.sql` and the adjusted transaction RLS test | Owner success plus authorization, immutable-column, Account/category, JSON/size, forged-provenance, anonymous, UPDATE, and DELETE denials. Passing as part of 228 assertions across nine suites. |
+| `transactions_manual_insert.test.sql` and the adjusted transaction RLS test | Owner success plus authorization, immutable-column, Account/category, JSON/size, forged-provenance, anonymous, UPDATE, and DELETE denials. Passing within the current 244 assertions across ten suites. |
 
 ### Line-item JSON
 
@@ -261,11 +275,23 @@ Every route except the OAuth callback requires the authenticated Supabase bearer
 | `POST /v1/transactions/settings/matching-keys` | Creates a normalized matching key for an owned active Account; conflicts return `409`. |
 | `PATCH /v1/transactions/settings/matching-keys/{id}` | Retires or reactivates an immutable owned matching key using `{ "active": boolean }`. |
 
+### Global settings and prompt preview
+
+| Method and path | Behavior |
+| --- | --- |
+| `GET /v1/transactions/global-settings` | Returns every shared global Gmail source rule, including read-only `extraction_config`, version, editor attribution, and timestamps. |
+| `POST /v1/transactions/global-settings/source-rules` | Creates a version-1 global Gmail rule with an empty deterministic extraction configuration; returns `201`. |
+| `PUT /v1/transactions/global-settings/source-rules/{id}` | Replaces the editable fields, preserves deterministic extraction configuration, and increments the version. Requires `expected_version`; a stale version returns `409`. |
+| `GET /v1/transactions/prompt-preview/sources` | Returns the newest 100 Gmail source summaries owned by the caller: `id`, `subject`, `sender`, `received_at`, and `parse_status`. It returns no body or attachment content. |
+| `POST /v1/transactions/prompt-preview` | Builds a manual or automatic prompt preview and returns `mode`, `assembled_system_prompt`, `prompt_components`, `provider_request`, selected-source metadata when applicable, and rule-selection metadata. It performs no provider call or parse-pipeline write. |
+
+Automatic preview accepts only `{ "mode": "automatic", "data_source_id": "<owned-gmail-source-uuid>" }`; cross-owner, missing, or non-Gmail sources are not returned. Manual preview requires `include_user_default` and may add `global_rule_id` and an owner-scoped `user_rule_id`; it rejects `data_source_id`. An automatic highest-priority rule tie returns `409`. All global-settings and preview responses are private and carry `Cache-Control: no-store` plus `Pragma: no-cache`.
+
 Transaction/source list cursors are versioned, scope-bound base64url values. Results sort newest first using `(timestamp, id)` keysets. Default frontend pages contain 50 items. Responses serialize monetary values as decimal strings and reject malformed service contracts in the TypeScript client.
 
 ## React implementation
 
-The workspace navigation contains a Transactions section with two independent pages: the four-tab transaction workspace and `frontend/src/features/transactions/TransactionSettingsPage.tsx`.
+The workspace navigation contains four independent Transactions pages: **Transactions**, **Settings**, **Global Settings**, and **Prompt Preview**. Their page components are `TransactionsPage.tsx`, `TransactionSettingsPage.tsx`, `GlobalTransactionSettingsPage.tsx`, and `PromptPreviewPage.tsx` under `frontend/src/features/transactions/`.
 
 - Transactions supports title/merchant search, debit/credit and review filters, cursor “load more,” original/SGD display, Account/category labels, evidence counts, and transfer badges.
 - **Add transaction** sits beside **Internal transfer** and opens a manual-entry dialog for any active owned Account. It validates debit/credit, required title/date/original money, optional merchant/SGD/category/notes, and at most 100 line items; runs the owner-scoped duplicate preflight; and inserts a confirmed row through Data REST after the user accepts any warning.
@@ -275,6 +301,8 @@ The workspace navigation contains a Transactions section with two independent pa
 - Transaction detail edits canonical fields and versioned line items, including merchant/payee and user notes for manual, source-created, and internal-transfer records. It displays the transfer counterpart and active evidence and uses a confirmation step before unmatch.
 - Internal-transfer creation collects and validates both legs before one Go request, including outgoing, incoming, or both-leg evidence selection.
 - Transaction Settings edits the default parser instructions, versioned sender/subject/content rules, and immutable Account matching keys. It explains prompt precedence, RE2/AND semantics, normalized values, and retire/reactivate behavior.
+- Global Settings lists shared Gmail source rules, creates or edits their bounded fields, displays deterministic extraction configuration in a read-only disclosure, and surfaces stale-version `409` conflicts with a reload action. Disabling a rule is the only removal lifecycle exposed.
+- Prompt Preview loads global rules, personal settings, and recent owned email summaries. Automatic mode selects a past email and delegates matching to Go; manual mode selects optional global/default/personal components. Results render the exact assembled system message, the placeholder-based Qwen request structure, component provenance, and rule-selection reasons without exposing dynamic source content.
 - Dialogs trap focus, close with Escape, restore focus, and block background interaction. Tabs support arrow/Home/End keys, and the workspace has a mobile navigation drawer.
 
 The frontend reads owned Account options and global categories from Data REST with the publishable key plus user bearer token. The source-resolution candidate picker and manual duplicate preflight use existing RLS-protected transaction reads. Manual transaction creation is the sole direct browser insert; every source, attachment, OAuth, sync, reconciliation, canonical edit, multi-row mutation, and main list operation goes through Go.
@@ -314,7 +342,8 @@ The API and worker are separate processes and both need the backend environment.
 - The `private` schema has no `anon`/`authenticated` grants. Its tables also enable RLS as defense in depth.
 - Browser roles are explicitly blocked from `transaction-attachments`; only Go’s server key can access the private bucket.
 - Source, transaction, Account, link, sync, and attachment paths are checked against the authenticated user before reads or writes.
-- Parser settings, source-rule changes, matching keys, Debug records, and deletion plans are owner-scoped in SQL as well as at the HTTP boundary.
+- Personal parser settings and source-rule changes, matching keys, Debug records, preview email selection, and deletion plans are owner-scoped in SQL as well as at the HTTP boundary.
+- Global source rules remain in the non-exposed private schema and are writable only through authenticated Go handlers. As an explicit development-phase limitation, any authenticated user may currently change configuration shared by all users; a future admin authorization boundary is out of scope. Deterministic `extraction_config` cannot be supplied through these handlers.
 - Qwen never receives the Account catalogue or matching-key table. User guidance is appended beneath an immutable platform contract and email/attachment instructions are treated as untrusted content.
 - Raw deletion is database-first and owner-scoped. A per-user coordination lock prevents races with Gmail ingestion; database cascades clear source jobs, attempts, and links; transaction provenance limits automatic cleanup to a never-edited `automatic_source` record with no remaining active evidence or transfer link. Exact Storage paths are committed as leased cleanup work before any external call, a one-way provider digest prevents reingestion of deliberately deleted evidence, and cleanup failures or expired final leases remain queued with monitored cooldown until success.
 - Automatic canonical creation takes the same stable per-user transaction lock and repeats Account/nearby-transaction reconciliation inside the write transaction. Two workers holding stale create decisions therefore converge on one transaction and two evidence links rather than creating duplicates.
@@ -325,7 +354,9 @@ The API and worker are separate processes and both need the backend environment.
 
 ## Verification and release gate
 
-The repository contains focused Go tests for Auth, OAuth state/token storage, Gmail listing/history and parsing, attachment Storage/signing, ingestion idempotency, durable jobs/leases, parser-provider contracts, deterministic rules, semantic card corroboration, reconciliation races, HTTP validation, source actions, cleanup recovery, SQL store behavior, and browser-authored line-item decoding. All 228 pgTAP assertions across nine transaction suites pass, including the manual-insert grants, RLS, ownership, JSON, size, and immutability coverage.
+The repository contains focused Go tests for Auth, OAuth state/token storage, Gmail listing/history and parsing, attachment Storage/signing, ingestion idempotency, durable jobs/leases, parser-provider contracts, deterministic rules, semantic card corroboration, reconciliation races, HTTP validation, source actions, cleanup recovery, SQL store behavior, browser-authored line-item decoding, the embedded provider request template, shared prompt selection, and strict global-settings/preview HTTP contracts. All 244 pgTAP assertions across ten transaction suites pass, including global-rule schema/security, manual-insert grants, RLS, ownership, JSON, size, and immutability coverage.
+
+The hosted `TestGlobalSourceRuleOptimisticUpdatePreservesExtractionConfigAndPreviewOwnership` integration test passes through the configured transaction pooler. Frontend lint and production build pass, as do eight focused prompt/global-rule tests covering request construction and UI behavior.
 
 `backend/internal/transactione2e/harness_test.go` also provides a scoped, non-destructive live harness. It is disabled by default and claims only the newly created run. It normally requires exactly one active stored Gmail-connection owner. In development only, when no active connection exists and `GOOGLE_TEST_REFRESH_TOKEN` is configured, it may instead select exactly one distinct owner of an active Account and create a development-token-enabled run. Zero or multiple eligible owners fail closed; the token and selected UUID are never logged or persisted. Because the fallback deliberately creates no Gmail connection or cursor, a later fallback run repeats the bounded initial window; provider-message uniqueness keeps that replay idempotent. Run it only with reviewed hosted credentials and an intentionally labelled test message:
 
@@ -347,24 +378,25 @@ npm run lint
 npm run build
 ```
 
-For a future release rerun, validate each migration with a hosted dry run and transaction-wrapped rollback rehearsal, run the transaction pgTAP tests and Supabase security/performance advisors, perform the scoped live harness, and confirm local/remote migration history after any hosted application. Do not start local Supabase/Docker unless the user explicitly requests it. The current release results are recorded below.
+For a future release rerun, validate each migration with a hosted dry run and transaction-wrapped rollback rehearsal, run the transaction pgTAP tests and Supabase security/performance advisors, perform the scoped live harness, and confirm local/remote migration history after any hosted application. Do not start local Supabase/Docker unless the user explicitly requests it. The combined verified results are shown below.
 
 ### Status at this documentation update
 
 | Gate | Status |
 | --- | --- |
-| Go implementation and focused coverage | **Passed.** The full Go test suite, race suite, vet, and API/worker builds pass, including browser-authored line-item decoding and details-preserving merchant/notes edits. |
-| Frontend implementation and focused coverage | **Passed.** Frontend lint and production build pass, along with all 10 focused tests. |
-| Hosted migration rehearsal/application/history | **Passed.** `20260903014725_allow_manual_transaction_inserts.sql` passed a hosted dry run and exact transaction-wrapped rollback rehearsal, was applied after `20260902230003`, and local/remote migration histories match. No local Supabase or Docker instance was used. |
-| Hosted database validation | **Passed.** All 228 pgTAP assertions across nine suites pass, including manual-insert grants, RLS, ownership, active Account/category enforcement, JSON and size constraints, and browser UPDATE/DELETE denial. |
-| Hosted Go store integration | **Passed.** The race-enabled transaction-store integration suite passes through the configured transaction pooler, including serialized concurrent create decisions, deletion staging/tombstones, non-terminal cleanup retry and expired-lease recovery, source reingestion prevention, and bounded/exact Debug behavior. |
+| Prompt/global-settings extension | **Passed.** Hosted migration, database, Go, targeted frontend, and authenticated-browser gates pass. Manual preview showed the exact assembled system message and provider request placeholders; Qwen was not called. |
+| Go implementation and focused coverage | **Passed.** The full Go test suite, race suite, vet, and API/worker builds pass, including embedded prompt assembly, global-setting HTTP contracts, browser-authored line-item decoding, and details-preserving merchant/notes edits. |
+| Frontend implementation and focused coverage | **Passed.** Frontend lint and production build pass. Eight focused prompt/global-rule tests also pass. |
+| Hosted migration rehearsal/application/history | **Passed.** Both `20260903014725_allow_manual_transaction_inserts.sql` and `20260903055808_add_global_source_rule_editor_metadata.sql` passed hosted dry runs and exact transaction-wrapped rollback rehearsals, are applied in order, and appear in matching local/remote migration history. No local Supabase or Docker instance was used. |
+| Hosted database validation | **Passed.** All 244 pgTAP assertions across ten suites pass, including global-rule schema/security, manual-insert grants, RLS, ownership, active Account/category enforcement, JSON and size constraints, and browser UPDATE/DELETE denial. Hosted database lint reports no schema warnings or errors for either the private or public schema. |
+| Hosted Go store integration | **Passed.** The race-enabled transaction-store integration suite passes through the configured transaction pooler, including serialized concurrent create decisions, deletion staging/tombstones, non-terminal cleanup retry and expired-lease recovery, source reingestion prevention, and bounded/exact Debug behavior. The hosted `TestGlobalSourceRuleOptimisticUpdatePreservesExtractionConfigAndPreviewOwnership` test additionally verifies optimistic updates preserve deterministic extraction configuration and that preview sources remain owner-scoped. |
 | Live Gmail → private Storage ingestion | **Passed.** The initial scoped run fetched and stored five unique `odin-finance` sources, including one private attachment. |
 | Live Qwen parsing and reconciliation | **Not exercised in this final verification.** Parser, citation, invalid-category discard, and semantic card-corroboration behavior remain covered by automated tests; no fresh provider call is claimed. |
 | Idempotent replay | **Passed.** Repeating the same five-message run created zero duplicate sources. |
 | Five-minute signed attachment access | **Passed.** A live ranged download through the signed URL succeeded within its five-minute lifetime. |
 | Hosted anonymous/private-schema denial | **Passed for the exercised surfaces.** Anonymous REST requests to Transactions and sync data returned `401`; requesting the private source schema returned `406`. |
 | Signed-out browser, mobile, and accessibility controls | **Passed.** Desktop and mobile signed-out views and accessibility controls were exercised with no console warnings. |
-| Authenticated browser workflow | **Passed.** The terminal Gmail banner was dismissible and its dismissal persisted for that user/run. Direct authenticated Supabase creation accepted major-unit input and a line item, returned an immediately confirmed manual transaction with zero evidence, showed the exact advisory duplicate warning, and allowed **Create anyway**. The Go edit path updated merchant and `user_notes` while preserving line-item details. All three synthetic transaction rows and their associated links were removed after acceptance. |
+| Authenticated browser workflow | **Passed.** Global Settings loaded and saved rules with safe defaults and a catch-all warning when both optional matchers were empty. After transaction evidence was reset, automatic Prompt Preview showed its empty-source state; manual preview displayed the exact assembled system message and provider request placeholders without calling Qwen. The browser recorded zero console warnings or errors. Earlier acceptance also verified terminal Gmail-banner persistence, manual transaction creation and duplicate override, merchant/notes editing, zero evidence, and fixture cleanup. |
 | Cross-user source/transaction/sync/attachment denial | **Passed in automated RLS/owner tests; live second-user attempt unavailable.** The hosted project has only one user, so no live cross-user claim is made. |
 
-The manual-entry extension's recorded release gates are complete. The unavailable live second-user check remains covered by automated ownership and RLS tests, and Qwen was not exercised in this final verification.
+The manual-entry and prompt/global-settings release gates are complete. The unavailable live second-user check remains covered by automated ownership and RLS tests. Qwen was not exercised during prompt-preview verification or the prior final acceptance.
