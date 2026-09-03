@@ -139,11 +139,15 @@ Card keys remove whitespace and common masking characters but must yield exactly
 
 - No Account evidence or no owned match → `dangling`.
 - More than one owned Account match → `review_required`.
-- Exactly one Account match → consider same-user, same-Account, same-kind transactions within ±24 hours of the source time.
+- Exactly one Account match → evaluate automatic pairing before automatic-creation eligibility.
 
-Candidate scoring is explainable: Account 50, shared reference 60, exact amount 25, exact currency 15, normalized merchant 12, and within-ten-minutes time 15. A score of at least 90 still cannot automatically attach unless either an exact reference is shared or amount/currency/normalized merchant match exactly within ten minutes. A second candidate within ten score points makes the result ambiguous. Any plausible but unsafe existing match goes to Review.
+The automatic-pairing candidate set contains only transactions with the same owner and resolved Account, the same debit/credit kind, the exact original amount, and an absolute timestamp difference of at most ten minutes inclusive. Currency is compatible unless both the parsed candidate and existing transaction have known, different currencies; equal currencies or a missing currency on either side are accepted.
 
-With no existing candidate, cited confidence of at least 0.75 and server-derived source corroboration creates a confirmed Account-linked transaction; otherwise the source goes to Review. Corroboration requires source text to contain a bounded Account identifier, exact ISO-scaled currency-qualified amount, and merchant or reference; it does not trust attachment-only facts, bare digits, bare `$`, or model citations. Automatic and user-created transactions preserve reference/Account evidence in the transaction `details` JSON. Optional categories are applied only when exactly one active leaf matches; otherwise the transaction remains uncategorized.
+Exactly one pairing candidate attaches the source, including when server-derived source corroboration would not permit automatic creation. More than one candidate returns `review_required`. No candidate proceeds to the existing strict automatic-creation path. Shared references, normalized merchants, and scores are not automatic fallbacks and do not disambiguate multiple candidates.
+
+On the no-candidate path, cited confidence of at least 0.75 and server-derived source corroboration creates a confirmed Account-linked transaction; otherwise the source goes to Review. Corroboration requires source text to contain a bounded Account identifier, exact ISO-scaled currency-qualified amount, and merchant or reference; it does not trust attachment-only facts, bare digits, bare `$`, or model citations. Automatic and user-created transactions preserve reference/Account evidence in the transaction `details` JSON. Optional categories are applied only when exactly one active leaf matches; otherwise the transaction remains uncategorized.
+
+This reconciliation refactor requires no schema migration or historical backfill. Development transaction/source data will be cleared and rerun through the updated worker behavior.
 
 ## Database shape
 
