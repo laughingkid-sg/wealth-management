@@ -17,6 +17,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/zhengteck/wealth-builder/backend/internal/attachmentstorage"
 	"github.com/zhengteck/wealth-builder/backend/internal/auth"
+	"github.com/zhengteck/wealth-builder/backend/internal/parserrules"
+	"github.com/zhengteck/wealth-builder/backend/internal/providers"
 	"github.com/zhengteck/wealth-builder/backend/internal/transactionstore"
 )
 
@@ -27,47 +29,61 @@ func (f verifierFunc) Verify(ctx context.Context, token string) (auth.User, erro
 }
 
 type repositoryStub struct {
-	run               transactionstore.SyncRun
-	createErr         error
-	latestErr         error
-	connection        transactionstore.GmailConnectionStatus
-	sources           []transactionstore.SourceSummary
-	sourcePage        transactionstore.SourcePage
-	sourceStatus      string
-	sourceCursor      *transactionstore.SourcePageCursor
-	sourceLimit       int
-	attachments       []transactionstore.AttachmentRecord
-	transactionPage   transactionstore.TransactionPage
-	transactionFilter transactionstore.TransactionListFilter
-	transfer          transactionstore.InternalTransfer
-	transferInput     transactionstore.InternalTransferInput
-	evidenceSources   []transactionstore.SourceEvidence
-	transaction       transactionstore.Transaction
-	actionErr         error
-	attachedSourceID  uuid.UUID
-	attachedToID      uuid.UUID
-	createdSourceID   uuid.UUID
-	createdAccountID  uuid.UUID
-	unmatchedLinkID   uuid.UUID
-	retriedSourceID   uuid.UUID
-	patchedID         uuid.UUID
-	patch             transactionstore.TransactionPatch
-	settings          transactionstore.TransactionSettings
-	defaultSaved      transactionstore.DefaultParserInstructions
-	rule              transactionstore.UserSourceParserRule
-	ruleInput         transactionstore.UserSourceParserRuleInput
-	ruleID            uuid.UUID
-	matchingKey       transactionstore.AccountMatchingKey
-	matchingKeyInput  transactionstore.AccountMatchingKeyInput
-	matchingKeyID     uuid.UUID
-	matchingKeyActive bool
-	debug             transactionstore.SourceParseDebug
-	debugField        transactionstore.SourceParseAuditField
-	debugSourceID     uuid.UUID
-	debugAttemptID    uuid.UUID
-	debugFieldName    string
-	deletionResult    transactionstore.SourceDeletionResult
-	stagedSourceID    uuid.UUID
+	run                  transactionstore.SyncRun
+	createErr            error
+	latestErr            error
+	connection           transactionstore.GmailConnectionStatus
+	sources              []transactionstore.SourceSummary
+	sourcePage           transactionstore.SourcePage
+	sourceStatus         string
+	sourceCursor         *transactionstore.SourcePageCursor
+	sourceLimit          int
+	attachments          []transactionstore.AttachmentRecord
+	transactionPage      transactionstore.TransactionPage
+	transactionFilter    transactionstore.TransactionListFilter
+	transfer             transactionstore.InternalTransfer
+	transferInput        transactionstore.InternalTransferInput
+	evidenceSources      []transactionstore.SourceEvidence
+	transaction          transactionstore.Transaction
+	actionErr            error
+	attachedSourceID     uuid.UUID
+	attachedToID         uuid.UUID
+	createdSourceID      uuid.UUID
+	createdAccountID     uuid.UUID
+	unmatchedLinkID      uuid.UUID
+	retriedSourceID      uuid.UUID
+	patchedID            uuid.UUID
+	patch                transactionstore.TransactionPatch
+	settings             transactionstore.TransactionSettings
+	globalRules          []transactionstore.GlobalSourceParserRule
+	globalRule           transactionstore.GlobalSourceParserRule
+	globalRuleInput      transactionstore.GlobalSourceParserRuleInput
+	globalRuleID         uuid.UUID
+	globalEditorID       uuid.UUID
+	defaultLoaded        transactionstore.DefaultParserInstructions
+	defaultLoadedUserID  uuid.UUID
+	previewSources       []transactionstore.PromptPreviewSource
+	previewSourceLimit   int
+	parseInput           transactionstore.SourceParseInput
+	parseInputUserID     uuid.UUID
+	parseInputSourceID   uuid.UUID
+	loadedUserRuleUserID uuid.UUID
+	mutationCalls        int
+	defaultSaved         transactionstore.DefaultParserInstructions
+	rule                 transactionstore.UserSourceParserRule
+	ruleInput            transactionstore.UserSourceParserRuleInput
+	ruleID               uuid.UUID
+	matchingKey          transactionstore.AccountMatchingKey
+	matchingKeyInput     transactionstore.AccountMatchingKeyInput
+	matchingKeyID        uuid.UUID
+	matchingKeyActive    bool
+	debug                transactionstore.SourceParseDebug
+	debugField           transactionstore.SourceParseAuditField
+	debugSourceID        uuid.UUID
+	debugAttemptID       uuid.UUID
+	debugFieldName       string
+	deletionResult       transactionstore.SourceDeletionResult
+	stagedSourceID       uuid.UUID
 }
 
 type attachmentSignerStub struct {
@@ -101,6 +117,7 @@ func (s *oauthStub) Complete(_ context.Context, state, code string) error {
 }
 
 func (r *repositoryStub) CreateSyncRun(context.Context, uuid.UUID, bool) (transactionstore.SyncRun, error) {
+	r.mutationCalls++
 	return r.run, r.createErr
 }
 func (r *repositoryStub) GetSyncRun(context.Context, uuid.UUID, uuid.UUID) (transactionstore.SyncRun, error) {
@@ -120,6 +137,7 @@ func (r *repositoryStub) ListSourcesPage(_ context.Context, _ uuid.UUID, status 
 	return transactionstore.SourcePage{Items: r.sources}, nil
 }
 func (r *repositoryStub) RetrySourceParse(_ context.Context, _ uuid.UUID, sourceID uuid.UUID) error {
+	r.mutationCalls++
 	r.retriedSourceID = sourceID
 	return r.actionErr
 }
@@ -137,49 +155,93 @@ func (r *repositoryStub) ListTransactionSources(context.Context, uuid.UUID, uuid
 	return r.evidenceSources, r.actionErr
 }
 func (r *repositoryStub) AttachSource(_ context.Context, _ uuid.UUID, sourceID, transactionID uuid.UUID) (uuid.UUID, error) {
+	r.mutationCalls++
 	r.attachedSourceID, r.attachedToID = sourceID, transactionID
 	return uuid.New(), r.actionErr
 }
 func (r *repositoryStub) CreateTransactionFromSource(_ context.Context, _ uuid.UUID, sourceID, accountID uuid.UUID) (transactionstore.Transaction, error) {
+	r.mutationCalls++
 	r.createdSourceID, r.createdAccountID = sourceID, accountID
 	return r.transaction, r.actionErr
 }
 func (r *repositoryStub) UnmatchSourceLink(_ context.Context, _ uuid.UUID, linkID uuid.UUID) error {
+	r.mutationCalls++
 	r.unmatchedLinkID = linkID
 	return r.actionErr
 }
 func (r *repositoryStub) PatchTransaction(_ context.Context, _ uuid.UUID, transactionID uuid.UUID, patch transactionstore.TransactionPatch) (transactionstore.Transaction, error) {
+	r.mutationCalls++
 	r.patchedID, r.patch = transactionID, patch
 	return r.transaction, r.actionErr
 }
 func (r *repositoryStub) CreateInternalTransfer(_ context.Context, _ uuid.UUID, input transactionstore.InternalTransferInput) (transactionstore.InternalTransfer, error) {
+	r.mutationCalls++
 	r.transferInput = input
 	return r.transfer, r.actionErr
 }
 func (r *repositoryStub) GetTransactionSettings(context.Context, uuid.UUID) (transactionstore.TransactionSettings, error) {
 	return r.settings, r.actionErr
 }
+func (r *repositoryStub) ListGlobalSourceParserRules(context.Context) ([]transactionstore.GlobalSourceParserRule, error) {
+	return r.globalRules, r.actionErr
+}
+func (r *repositoryStub) GetGlobalSourceParserRule(_ context.Context, ruleID uuid.UUID) (transactionstore.GlobalSourceParserRule, error) {
+	r.globalRuleID = ruleID
+	return r.globalRule, r.actionErr
+}
+func (r *repositoryStub) CreateGlobalSourceParserRule(_ context.Context, userID uuid.UUID, input transactionstore.GlobalSourceParserRuleInput) (transactionstore.GlobalSourceParserRule, error) {
+	r.mutationCalls++
+	r.globalEditorID, r.globalRuleInput = userID, input
+	return r.globalRule, r.actionErr
+}
+func (r *repositoryStub) UpdateGlobalSourceParserRule(_ context.Context, userID, ruleID uuid.UUID, input transactionstore.GlobalSourceParserRuleInput) (transactionstore.GlobalSourceParserRule, error) {
+	r.mutationCalls++
+	r.globalEditorID, r.globalRuleID, r.globalRuleInput = userID, ruleID, input
+	return r.globalRule, r.actionErr
+}
+func (r *repositoryStub) GetDefaultParserInstructions(_ context.Context, userID uuid.UUID) (transactionstore.DefaultParserInstructions, error) {
+	r.defaultLoadedUserID = userID
+	return r.defaultLoaded, r.actionErr
+}
+func (r *repositoryStub) GetUserSourceParserRule(_ context.Context, userID, ruleID uuid.UUID) (transactionstore.UserSourceParserRule, error) {
+	r.loadedUserRuleUserID, r.ruleID = userID, ruleID
+	return r.rule, r.actionErr
+}
+func (r *repositoryStub) ListPromptPreviewSources(_ context.Context, _ uuid.UUID, limit int) ([]transactionstore.PromptPreviewSource, error) {
+	r.previewSourceLimit = limit
+	return r.previewSources, r.actionErr
+}
+func (r *repositoryStub) LoadSourceParseInput(_ context.Context, userID, sourceID uuid.UUID) (transactionstore.SourceParseInput, error) {
+	r.parseInputUserID, r.parseInputSourceID = userID, sourceID
+	return r.parseInput, r.actionErr
+}
 func (r *repositoryStub) PutDefaultParserInstructions(_ context.Context, _ uuid.UUID, instructions string) (transactionstore.DefaultParserInstructions, error) {
+	r.mutationCalls++
 	r.defaultSaved.DefaultInstructions = instructions
 	return r.defaultSaved, r.actionErr
 }
 func (r *repositoryStub) CreateUserSourceParserRule(_ context.Context, _ uuid.UUID, input transactionstore.UserSourceParserRuleInput) (transactionstore.UserSourceParserRule, error) {
+	r.mutationCalls++
 	r.ruleInput = input
 	return r.rule, r.actionErr
 }
 func (r *repositoryStub) UpdateUserSourceParserRule(_ context.Context, _ uuid.UUID, ruleID uuid.UUID, input transactionstore.UserSourceParserRuleInput) (transactionstore.UserSourceParserRule, error) {
+	r.mutationCalls++
 	r.ruleID, r.ruleInput = ruleID, input
 	return r.rule, r.actionErr
 }
 func (r *repositoryStub) RetireUserSourceParserRule(_ context.Context, _ uuid.UUID, ruleID uuid.UUID) error {
+	r.mutationCalls++
 	r.ruleID = ruleID
 	return r.actionErr
 }
 func (r *repositoryStub) CreateAccountMatchingKey(_ context.Context, _ uuid.UUID, input transactionstore.AccountMatchingKeyInput) (transactionstore.AccountMatchingKey, error) {
+	r.mutationCalls++
 	r.matchingKeyInput = input
 	return r.matchingKey, r.actionErr
 }
 func (r *repositoryStub) SetAccountMatchingKeyActive(_ context.Context, _ uuid.UUID, keyID uuid.UUID, active bool) (transactionstore.AccountMatchingKey, error) {
+	r.mutationCalls++
 	r.matchingKeyID, r.matchingKeyActive = keyID, active
 	return r.matchingKey, r.actionErr
 }
@@ -191,6 +253,7 @@ func (r *repositoryStub) GetSourceParseAuditField(_ context.Context, _ uuid.UUID
 	return r.debugField, r.actionErr
 }
 func (r *repositoryStub) StageSourceDeletion(_ context.Context, _ uuid.UUID, sourceID uuid.UUID) (transactionstore.SourceDeletionResult, error) {
+	r.mutationCalls++
 	r.stagedSourceID = sourceID
 	return r.deletionResult, r.actionErr
 }
@@ -1125,6 +1188,271 @@ func TestSourceDeletionWithoutAttachmentsCompletesImmediately(t *testing.T) {
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"status":"completed"`) ||
 		!strings.Contains(response.Body.String(), `"cleanup_pending":false`) {
 		t.Fatalf("response=%d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestGlobalSettingsListsExactRuleProjectionWithoutCaching(t *testing.T) {
+	userID, ruleID := uuid.New(), uuid.New()
+	updatedBy := uuid.New()
+	repository := &repositoryStub{globalRules: []transactionstore.GlobalSourceParserRule{{
+		ID: ruleID, Name: "Masked card", Provider: "gmail",
+		SenderMatcher: stringPointer(`@example\.test$`), ContentMatcher: stringPointer(`\*{4} 2562`),
+		PromptFragment: "Read the payment method.", ExtractionConfig: json.RawMessage(`{"extractors":{}}`),
+		Version: 3, Priority: 50, Active: true, UpdatedByUserID: &updatedBy,
+		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}}}
+	mux := authenticatedMux(t, repository, userID)
+	request := httptest.NewRequest(http.MethodGet, "/v1/transactions/global-settings", nil)
+	request.Header.Set("Authorization", "Bearer valid")
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("response = %d headers=%v body=%s", response.Code, response.Header(), response.Body.String())
+	}
+	var body struct {
+		Rules []transactionstore.GlobalSourceParserRule `json:"rules"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil || len(body.Rules) != 1 {
+		t.Fatalf("decode error=%v body=%s", err, response.Body.String())
+	}
+	if body.Rules[0].ID != ruleID || body.Rules[0].Name != "Masked card" ||
+		string(body.Rules[0].ExtractionConfig) != `{"extractors":{}}` ||
+		body.Rules[0].UpdatedByUserID == nil || *body.Rules[0].UpdatedByUserID != updatedBy {
+		t.Fatalf("rule projection = %#v", body.Rules[0])
+	}
+}
+
+func TestCreateGlobalSourceRuleValidatesAndBindsAuthenticatedEditor(t *testing.T) {
+	userID := uuid.New()
+	repository := &repositoryStub{globalRule: transactionstore.GlobalSourceParserRule{ID: uuid.New(), Name: "FairPrice", Provider: "gmail"}}
+	mux := authenticatedMux(t, repository, userID)
+	body := `{
+		"name":"  FairPrice  ","provider":"gmail",
+		"sender_matcher":"  @fairprice\\.com\\.sg$  ",
+		"content_matcher":"  Mastercard  ",
+		"prompt_fragment":"  Read the receipt.  ",
+		"priority":50,"active":true
+	}`
+	request := httptest.NewRequest(http.MethodPost, "/v1/transactions/global-settings/source-rules", strings.NewReader(body))
+	request.Header.Set("Authorization", "Bearer valid")
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("response = %d %s", response.Code, response.Body.String())
+	}
+	input := repository.globalRuleInput
+	if repository.globalEditorID != userID || input.Name != "FairPrice" || input.Provider != "gmail" ||
+		input.SenderMatcher == nil || *input.SenderMatcher != `@fairprice\.com\.sg$` ||
+		input.ContentMatcher == nil || *input.ContentMatcher != "Mastercard" ||
+		input.PromptFragment != "Read the receipt." || input.Priority != 50 || !input.Active ||
+		input.ExpectedVersion != 0 {
+		t.Fatalf("editor=%s input=%#v", repository.globalEditorID, input)
+	}
+	if repository.mutationCalls != 1 {
+		t.Fatalf("mutation calls = %d", repository.mutationCalls)
+	}
+}
+
+func TestGlobalSourceRuleRejectsInvalidMatcherAndReadOnlyExtractionConfig(t *testing.T) {
+	for name, body := range map[string]string{
+		"invalid RE2":                 `{"name":"Rule","provider":"gmail","sender_matcher":"[","prompt_fragment":"","priority":0,"active":true}`,
+		"read-only extraction config": `{"name":"Rule","provider":"gmail","prompt_fragment":"","extraction_config":{},"priority":0,"active":true}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			repository := &repositoryStub{}
+			mux := authenticatedMux(t, repository, uuid.New())
+			request := httptest.NewRequest(http.MethodPost, "/v1/transactions/global-settings/source-rules", strings.NewReader(body))
+			request.Header.Set("Authorization", "Bearer valid")
+			response := httptest.NewRecorder()
+			mux.ServeHTTP(response, request)
+			if response.Code != http.StatusBadRequest || repository.mutationCalls != 0 {
+				t.Fatalf("response=%d mutations=%d body=%s", response.Code, repository.mutationCalls, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestUpdateGlobalSourceRuleMapsOptimisticConflictTo409(t *testing.T) {
+	ruleID := uuid.New()
+	repository := &repositoryStub{actionErr: transactionstore.ErrGlobalSourceRuleConflict}
+	mux := authenticatedMux(t, repository, uuid.New())
+	body := `{"name":"Rule","provider":"gmail","prompt_fragment":"","priority":0,"active":false,"expected_version":4}`
+	request := httptest.NewRequest(http.MethodPut, "/v1/transactions/global-settings/source-rules/"+ruleID.String(), strings.NewReader(body))
+	request.Header.Set("Authorization", "Bearer valid")
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusConflict || repository.globalRuleID != ruleID ||
+		repository.globalRuleInput.ExpectedVersion != 4 || !strings.Contains(response.Body.String(), "Reload") {
+		t.Fatalf("response=%d id=%s input=%#v body=%s", response.Code, repository.globalRuleID, repository.globalRuleInput, response.Body.String())
+	}
+}
+
+func TestPromptPreviewSourcesUsesOwnedRecentEmailContract(t *testing.T) {
+	userID, sourceID := uuid.New(), uuid.New()
+	repository := &repositoryStub{previewSources: []transactionstore.PromptPreviewSource{{
+		ID: sourceID, Subject: "Receipt", Sender: "store@example.test",
+		ReceivedAt: time.Date(2026, 9, 3, 1, 2, 3, 0, time.UTC), ParseStatus: "parsed",
+	}}}
+	mux := authenticatedMux(t, repository, userID)
+	request := httptest.NewRequest(http.MethodGet, "/v1/transactions/prompt-preview/sources", nil)
+	request.Header.Set("Authorization", "Bearer valid")
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "no-store" || repository.previewSourceLimit != 100 {
+		t.Fatalf("response=%d limit=%d headers=%v body=%s", response.Code, repository.previewSourceLimit, response.Header(), response.Body.String())
+	}
+	var body struct {
+		Sources []transactionstore.PromptPreviewSource `json:"sources"`
+		Items   json.RawMessage                        `json:"items"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil || len(body.Sources) != 1 || body.Items != nil || body.Sources[0].ID != sourceID {
+		t.Fatalf("decode error=%v response=%#v body=%s", err, body, response.Body.String())
+	}
+}
+
+func TestAutomaticPromptPreviewReusesProductionSelectionAndOmitsDynamicContent(t *testing.T) {
+	userID, sourceID := uuid.New(), uuid.New()
+	globalID, userRuleID := uuid.NewString(), uuid.NewString()
+	repository := &repositoryStub{parseInput: transactionstore.SourceParseInput{
+		ID: sourceID, Subject: "Your FairPrice Group app receipt",
+		Sender: "FairPrice <receipt@fairprice.com.sg>", Content: "BODY-SHOULD-NOT-APPEAR Mastercard (**** 2562)",
+		ReceivedAt: time.Date(2026, 9, 3, 1, 2, 3, 0, time.UTC), ParseStatus: "parsed",
+		NormalizedContent:   "subject: Your FairPrice Group app receipt\nsender: FairPrice <receipt@fairprice.com.sg>\ntext: BODY-SHOULD-NOT-APPEAR Mastercard (**** 2562)",
+		DefaultInstructions: "Prefer explicit source facts.", DefaultInstructionsVersion: 3,
+		Rules: []parserrules.Rule{
+			{ID: uuid.NewString(), Name: "Higher non-match", Version: 1, Priority: 100, ContentMatcher: "DigitalOcean", ExtractionConfig: json.RawMessage(`{}`)},
+			{ID: globalID, Name: "Masked card", Version: 2, Priority: 50, ContentMatcher: `Mastercard \(\*{4} 2562\)`, PromptFragment: "Read the payment method.", ExtractionConfig: json.RawMessage(`{}`)},
+		},
+		UserRules: []parserrules.UserRule{{
+			ID: userRuleID, Name: "FairPrice", Version: 4, Priority: 10,
+			SenderMatchType: "domain", SenderMatchValue: "fairprice.com.sg",
+			SubjectMatcher: "app receipt", PromptFragment: "Use item details.",
+		}},
+		Attachments: []transactionstore.SourceAttachment{{
+			Filename: "receipt.png", MIMEType: "image/png", ObjectPath: userID.String() + "/" + sourceID.String() + "/receipt.png",
+			StorageStatus: "stored", ParseEligible: true,
+		}},
+	}}
+	mux := authenticatedMux(t, repository, userID)
+	request := httptest.NewRequest(http.MethodPost, "/v1/transactions/prompt-preview", strings.NewReader(`{"mode":"automatic","data_source_id":"`+sourceID.String()+`"}`))
+	request.Header.Set("Authorization", "Bearer valid")
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("response=%d headers=%v body=%s", response.Code, response.Header(), response.Body.String())
+	}
+	if repository.parseInputUserID != userID || repository.parseInputSourceID != sourceID || repository.mutationCalls != 0 {
+		t.Fatalf("load owner=%s source=%s mutations=%d", repository.parseInputUserID, repository.parseInputSourceID, repository.mutationCalls)
+	}
+	if strings.Contains(response.Body.String(), "BODY-SHOULD-NOT-APPEAR") {
+		t.Fatalf("dynamic email content leaked: %s", response.Body.String())
+	}
+	var body struct {
+		AssembledSystemPrompt string                               `json:"assembled_system_prompt"`
+		SelectedSource        transactionstore.PromptPreviewSource `json:"selected_source"`
+		Selection             struct {
+			GlobalRule *promptPreviewSelectionItem `json:"global_rule"`
+			UserRule   *promptPreviewSelectionItem `json:"user_rule"`
+		} `json:"selection"`
+		ProviderRequest struct {
+			Model          string `json:"model"`
+			EnableThinking bool   `json:"enable_thinking"`
+			ResponseFormat struct {
+				Type string `json:"type"`
+			} `json:"response_format"`
+			Messages []struct {
+				Role    string          `json:"role"`
+				Content json.RawMessage `json:"content"`
+			} `json:"messages"`
+		} `json:"provider_request"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.SelectedSource.ID != sourceID || body.Selection.GlobalRule == nil || body.Selection.GlobalRule.ID != globalID ||
+		body.Selection.UserRule == nil || body.Selection.UserRule.ID != userRuleID {
+		t.Fatalf("preview selection = %#v source=%#v", body.Selection, body.SelectedSource)
+	}
+	if body.ProviderRequest.Model != "qwen3.8-flash" || body.ProviderRequest.EnableThinking || body.ProviderRequest.ResponseFormat.Type != "json_object" || len(body.ProviderRequest.Messages) != 2 {
+		t.Fatalf("provider request = %#v", body.ProviderRequest)
+	}
+	var systemPrompt string
+	if err := json.Unmarshal(body.ProviderRequest.Messages[0].Content, &systemPrompt); err != nil || systemPrompt != body.AssembledSystemPrompt {
+		t.Fatalf("system prompt mismatch error=%v", err)
+	}
+	var userParts []struct {
+		Text     string `json:"text"`
+		ImageURL *struct {
+			URL string `json:"url"`
+		} `json:"image_url"`
+	}
+	if err := json.Unmarshal(body.ProviderRequest.Messages[1].Content, &userParts); err != nil || len(userParts) != 2 ||
+		userParts[0].Text != providers.PreviewEmailContentPlaceholder || userParts[1].ImageURL == nil ||
+		userParts[1].ImageURL.URL != providers.PreviewAttachmentPlaceholder {
+		t.Fatalf("provider placeholders missing: parts=%#v error=%v", userParts, err)
+	}
+}
+
+func TestManualPromptPreviewLoadsOnlyOwnedConfigurationAndAllowsInactiveRules(t *testing.T) {
+	userID, globalID, userRuleID := uuid.New(), uuid.New(), uuid.New()
+	repository := &repositoryStub{
+		globalRule: transactionstore.GlobalSourceParserRule{
+			ID: globalID, Name: "Inactive global", Version: 2, Active: false, PromptFragment: "Global guidance.",
+		},
+		defaultLoaded: transactionstore.DefaultParserInstructions{DefaultInstructions: "Default guidance.", DefaultInstructionsVersion: 3},
+		rule: transactionstore.UserSourceParserRule{
+			ID: userRuleID, Name: "Inactive user", Version: 4, Active: false, PromptFragment: "User guidance.",
+		},
+	}
+	mux := authenticatedMux(t, repository, userID)
+	body := `{"mode":"manual","global_rule_id":"` + globalID.String() + `","include_user_default":true,"user_rule_id":"` + userRuleID.String() + `"}`
+	request := httptest.NewRequest(http.MethodPost, "/v1/transactions/prompt-preview", strings.NewReader(body))
+	request.Header.Set("Authorization", "Bearer valid")
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || repository.globalRuleID != globalID || repository.ruleID != userRuleID ||
+		repository.defaultLoadedUserID != userID || repository.loadedUserRuleUserID != userID || repository.mutationCalls != 0 {
+		t.Fatalf("response=%d global=%s user=%s defaultOwner=%s ruleOwner=%s mutations=%d body=%s",
+			response.Code, repository.globalRuleID, repository.ruleID, repository.defaultLoadedUserID,
+			repository.loadedUserRuleUserID, repository.mutationCalls, response.Body.String())
+	}
+	for _, fragment := range []string{"Global guidance.", "Default guidance.", "User guidance."} {
+		if !strings.Contains(response.Body.String(), fragment) {
+			t.Fatalf("preview omitted %q: %s", fragment, response.Body.String())
+		}
+	}
+}
+
+func TestPromptPreviewHidesCrossOwnerSourceAndRule(t *testing.T) {
+	for name, testCase := range map[string]struct {
+		body string
+		err  error
+	}{
+		"automatic source": {body: `{"mode":"automatic","data_source_id":"` + uuid.NewString() + `"}`, err: pgx.ErrNoRows},
+		"manual user rule": {body: `{"mode":"manual","include_user_default":false,"user_rule_id":"` + uuid.NewString() + `"}`, err: transactionstore.ErrUserSourceRuleNotFound},
+	} {
+		t.Run(name, func(t *testing.T) {
+			repository := &repositoryStub{actionErr: testCase.err}
+			mux := authenticatedMux(t, repository, uuid.New())
+			request := httptest.NewRequest(http.MethodPost, "/v1/transactions/prompt-preview", strings.NewReader(testCase.body))
+			request.Header.Set("Authorization", "Bearer valid")
+			response := httptest.NewRecorder()
+			mux.ServeHTTP(response, request)
+			if response.Code != http.StatusNotFound || repository.mutationCalls != 0 {
+				t.Fatalf("response=%d mutations=%d body=%s", response.Code, repository.mutationCalls, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestPromptPreviewRequiresAuthentication(t *testing.T) {
+	repository := &repositoryStub{}
+	mux := authenticatedMux(t, repository, uuid.New())
+	request := httptest.NewRequest(http.MethodPost, "/v1/transactions/prompt-preview", strings.NewReader(`{"mode":"manual","include_user_default":false}`))
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized || repository.mutationCalls != 0 {
+		t.Fatalf("response=%d mutations=%d body=%s", response.Code, repository.mutationCalls, response.Body.String())
 	}
 }
 

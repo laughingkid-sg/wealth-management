@@ -17,6 +17,7 @@ var ErrAmbiguousTopPriority = errors.New("multiple matching parser rules share t
 
 type Rule struct {
 	ID               string
+	Name             string
 	Version          int
 	Priority         int
 	SenderMatcher    string
@@ -37,6 +38,7 @@ type CaptureField struct {
 
 type AppliedRule struct {
 	ID             string
+	Name           string
 	Version        int
 	Priority       int
 	PromptFragment string
@@ -124,7 +126,7 @@ func applyOne(sender, content string, rule Rule) (AppliedRule, bool) {
 		}
 	}
 	return AppliedRule{
-		ID: rule.ID, Version: rule.Version, Priority: rule.Priority,
+		ID: rule.ID, Name: rule.Name, Version: rule.Version, Priority: rule.Priority,
 		PromptFragment: strings.TrimSpace(rule.PromptFragment), Values: values,
 	}, true
 }

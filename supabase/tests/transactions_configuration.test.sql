@@ -67,11 +67,80 @@ select is(
   'raw provider and model JSON uses the lexical-preserving json type'
 );
 
+-- Use transaction-local fixtures so editable hosted rule rows cannot change
+-- parser behavior asserted by this suite.
+insert into private.source_parser_rules (
+  id,
+  name,
+  provider,
+  sender_matcher,
+  content_matcher,
+  extraction_config,
+  prompt_fragment,
+  version,
+  priority,
+  active
+) values
+  (
+    'a1010101-0101-4101-8101-010101010101',
+    'Test masked card evidence',
+    'gmail',
+    null,
+    '(?is)(?:^|[^A-Za-z0-9_])(?:mastercard|master\s*card|visa|amex|american\s+express|card)(?:$|[^A-Za-z0-9_]).{0,255}?(?:\(\s*)?(?:\*{2,}|x{2,}|•{2,})\s*([0-9]{4})(?:$|[^0-9])',
+    jsonb_build_object(
+      'extractors', jsonb_build_object(
+        'card_last_four', jsonb_build_object(
+          'pattern', '(?is)(?:^|[^A-Za-z0-9_])(?:mastercard|master\s*card|visa|amex|american\s+express|card)(?:$|[^A-Za-z0-9_]).{0,255}?(?:\(\s*)?(?:\*{2,}|x{2,}|•{2,})\s*([0-9]{4})(?:$|[^0-9])',
+          'group', 1
+        )
+      )
+    ),
+    'Treat a masked card ending as Account evidence only.',
+    1,
+    50,
+    true
+  ),
+  (
+    'a2020202-0202-4202-8202-020202020202',
+    'Test OCBC legacy rule',
+    'gmail',
+    '(?i)@(?:[a-z0-9-]+\.)*ocbc\.com(?:\.sg)?(?:>|$)',
+    '(?is)\b(?:charged|purchase|spent|debited)\b.*\bSGD\b',
+    jsonb_build_object(
+      'constants', jsonb_build_object(
+        'transaction_kind', 'debit',
+        'original_currency', 'SGD'
+      )
+    ),
+    'Legacy OCBC fixture guidance.',
+    1,
+    100,
+    false
+  ),
+  (
+    'a3030303-0303-4303-8303-030303030303',
+    'Test OCBC current rule',
+    'gmail',
+    '(?i)@(?:[a-z0-9-]+\.)*ocbc\.com(?:\.sg)?(?:>|$)',
+    '(?is)\b(?:charged|purchase|spent|debited)\b.*\bSGD\b',
+    jsonb_build_object(
+      'constants', jsonb_build_object(
+        'transaction_kind', 'debit',
+        'original_currency', 'SGD'
+      )
+    ),
+    'Current OCBC fixture guidance.',
+    2,
+    100,
+    true
+  );
+
 select ok(
   exists (
     select 1
     from private.source_parser_rules rule
-    where rule.provider = 'gmail'
+    where rule.id = 'a1010101-0101-4101-8101-010101010101'
+      and rule.provider = 'gmail'
       and rule.active
       and (regexp_match(
         E'subject: Your FairPrice Group app receipt\ntext: Mastercard\n   (**** 2562)',
@@ -86,7 +155,8 @@ select ok(
   exists (
     select 1
     from private.source_parser_rules
-    where provider = 'gmail'
+    where id = 'a2020202-0202-4202-8202-020202020202'
+      and provider = 'gmail'
       and not active
       and sender_matcher = '(?i)@(?:[a-z0-9-]+\.)*ocbc\.com(?:\.sg)?(?:>|$)'
       and version = 1
@@ -94,7 +164,8 @@ select ok(
   and exists (
     select 1
     from private.source_parser_rules
-    where provider = 'gmail'
+    where id = 'a3030303-0303-4303-8303-030303030303'
+      and provider = 'gmail'
       and active
       and sender_matcher = '(?i)@(?:[a-z0-9-]+\.)*ocbc\.com(?:\.sg)?(?:>|$)'
       and version = 2
@@ -104,12 +175,16 @@ select ok(
   and (
     select count(*)
     from private.source_parser_rules
-    where provider = 'gmail'
+    where id in (
+        'a2020202-0202-4202-8202-020202020202',
+        'a3030303-0303-4303-8303-030303030303'
+      )
+      and provider = 'gmail'
       and active
       and priority = 100
       and sender_matcher = '(?i)@(?:[a-z0-9-]+\.)*ocbc\.com(?:\.sg)?(?:>|$)'
   ) = 1,
-  'OCBC v1 remains for provenance while exactly one prompt-bearing v2 rule is active'
+  'the OCBC fixtures preserve v1 provenance while exactly one prompt-bearing v2 rule is active'
 );
 
 select results_eq(
@@ -504,9 +579,7 @@ select lives_ok(
       '61616161-6161-6161-6161-616161616161',
       '11111111-1111-1111-1111-111111111111',
       '41414141-4141-4141-4141-414141414141',
-      (select id from private.source_parser_rules
-        where extraction_config -> 'extractors' ? 'card_last_four'
-        order by priority asc, id limit 1),
+      'a1010101-0101-4101-8101-010101010101',
       1,
       'qwen3.8-flash', '{"provider":"alibaba"}', '{}', 'valid',
       'Base prompt plus user configuration',

@@ -25,6 +25,7 @@ type SourceParseInput struct {
 	Sender                     string
 	Content                    string
 	ReceivedAt                 time.Time
+	ParseStatus                string
 	NormalizedContent          string
 	Rules                      []parserrules.Rule
 	UserRules                  []parserrules.UserRule
@@ -102,9 +103,9 @@ func (s *Store) LoadSourceParseInput(ctx context.Context, userID, sourceID uuid.
 	var rawData []byte
 	err := s.pool.QueryRow(ctx, `
 		select id, coalesce(raw_data ->> 'subject', ''), coalesce(raw_data ->> 'sender', ''),
-			coalesce(raw_data ->> 'text', ''), coalesce(raw_data ->> 'html_sanitized', ''), raw_data, received_at
+			coalesce(raw_data ->> 'text', ''), coalesce(raw_data ->> 'html_sanitized', ''), raw_data, received_at, parse_status
 		from private.data_sources
-		where id = $1 and user_id = $2 and source_type = 'gmail_email'`, sourceID, userID).Scan(&input.ID, &subject, &sender, &text, &sanitizedHTML, &rawData, &input.ReceivedAt)
+		where id = $1 and user_id = $2 and source_type = 'gmail_email' and provider = 'gmail'`, sourceID, userID).Scan(&input.ID, &subject, &sender, &text, &sanitizedHTML, &rawData, &input.ReceivedAt, &input.ParseStatus)
 	if err != nil {
 		return SourceParseInput{}, err
 	}
@@ -179,7 +180,7 @@ func sourceAttachmentMetadata(raw []byte) []SourceAttachment {
 
 func (s *Store) loadActiveGmailParserRules(ctx context.Context) ([]parserrules.Rule, error) {
 	rows, err := s.pool.Query(ctx, `
-		select id, version, priority, coalesce(sender_matcher, ''), coalesce(content_matcher, ''),
+		select id, name, version, priority, coalesce(sender_matcher, ''), coalesce(content_matcher, ''),
 			coalesce(prompt_fragment, ''), extraction_config
 		from private.source_parser_rules
 		where provider = 'gmail' and active = true
@@ -191,7 +192,7 @@ func (s *Store) loadActiveGmailParserRules(ctx context.Context) ([]parserrules.R
 	rules := make([]parserrules.Rule, 0)
 	for rows.Next() {
 		var rule parserrules.Rule
-		if err := rows.Scan(&rule.ID, &rule.Version, &rule.Priority, &rule.SenderMatcher, &rule.ContentMatcher, &rule.PromptFragment, &rule.ExtractionConfig); err != nil {
+		if err := rows.Scan(&rule.ID, &rule.Name, &rule.Version, &rule.Priority, &rule.SenderMatcher, &rule.ContentMatcher, &rule.PromptFragment, &rule.ExtractionConfig); err != nil {
 			return nil, err
 		}
 		rules = append(rules, rule)

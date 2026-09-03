@@ -40,7 +40,7 @@ func TestAlibabaQwenClientSendsBoundedMultimodalJSONRequest(t *testing.T) {
 			t.Fatalf("unexpected messages %#v", request.Messages)
 		}
 		var systemPrompt string
-		if err := json.Unmarshal(request.Messages[0].Content, &systemPrompt); err != nil || systemPrompt != parserSystemPrompt {
+		if err := json.Unmarshal(request.Messages[0].Content, &systemPrompt); err != nil || systemPrompt != ParserPlatformPrompt() {
 			t.Fatal("request did not send the strict parser system prompt")
 		}
 		var parts []struct {
@@ -64,7 +64,7 @@ func TestAlibabaQwenClientSendsBoundedMultimodalJSONRequest(t *testing.T) {
 	defer server.Close()
 
 	client := newTestAlibabaClient(t, server)
-	result, err := client.ParseTransactionEvidence(context.Background(), parserSystemPrompt, "subject: receipt", []AttachmentInput{{
+	result, err := client.ParseTransactionEvidence(context.Background(), ParserPlatformPrompt(), "subject: receipt", []AttachmentInput{{
 		Filename: "receipt.png", MIMEType: "image/png; charset=binary", Content: []byte{1, 2},
 	}})
 	if err != nil {
@@ -108,7 +108,7 @@ func TestParserSystemPromptDefinesStrictNestedJSONContract(t *testing.T) {
 		"omit category_leaf_name and its evidence entry",
 	}
 	for _, snippet := range required {
-		if !strings.Contains(parserSystemPrompt, snippet) {
+		if !strings.Contains(ParserPlatformPrompt(), snippet) {
 			t.Fatalf("parser prompt is missing strict contract clause %q", snippet)
 		}
 	}
@@ -121,13 +121,62 @@ func TestAssembleParserSystemPromptKeepsSourceOutOfSystemMessage(t *testing.T) {
 	prompt := AssembleParserSystemPrompt(ParserPromptFragments{
 		GlobalRule: "global fragment", DefaultUser: "default fragment", UserSourceRule: "source-rule fragment",
 	})
-	for _, value := range []string{parserSystemPrompt, "GLOBAL SOURCE GUIDANCE:\nglobal fragment", "USER DEFAULT INSTRUCTIONS:\ndefault fragment", "USER SOURCE-RULE GUIDANCE:\nsource-rule fragment"} {
+	for _, value := range []string{ParserPlatformPrompt(), "GLOBAL SOURCE GUIDANCE:\nglobal fragment", "USER DEFAULT INSTRUCTIONS:\ndefault fragment", "USER SOURCE-RULE GUIDANCE:\nsource-rule fragment"} {
 		if !strings.Contains(prompt, value) {
 			t.Fatalf("assembled prompt omitted %q", value)
 		}
 	}
 	if strings.Contains(prompt, "subject: private receipt") {
 		t.Fatal("source content appeared in the system prompt")
+	}
+}
+
+func TestBuildTransactionParserRequestTemplateUsesProductionEnvelopeAndPlaceholders(t *testing.T) {
+	assembled := AssembleParserSystemPrompt(ParserPromptFragments{GlobalRule: "receipt guidance"})
+	template, err := BuildTransactionParserRequestTemplate(assembled, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var request struct {
+		Model          string `json:"model"`
+		EnableThinking bool   `json:"enable_thinking"`
+		ResponseFormat struct {
+			Type string `json:"type"`
+		} `json:"response_format"`
+		Messages []struct {
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if err = json.Unmarshal(template, &request); err != nil {
+		t.Fatal(err)
+	}
+	if request.Model != "qwen3.8-flash" || request.EnableThinking || request.ResponseFormat.Type != "json_object" {
+		t.Fatalf("unsafe preview envelope: %#v", request)
+	}
+	if len(request.Messages) != 2 || request.Messages[0].Role != "system" || request.Messages[1].Role != "user" {
+		t.Fatalf("preview messages = %#v", request.Messages)
+	}
+	var system string
+	if err = json.Unmarshal(request.Messages[0].Content, &system); err != nil || system != assembled {
+		t.Fatalf("system prompt = %q, error = %v", system, err)
+	}
+	var parts []chatContentPart
+	if err = json.Unmarshal(request.Messages[1].Content, &parts); err != nil {
+		t.Fatal(err)
+	}
+	if len(parts) != 2 || parts[0].Text != PreviewEmailContentPlaceholder ||
+		parts[1].ImageURL == nil || parts[1].ImageURL.URL != PreviewAttachmentPlaceholder {
+		t.Fatalf("preview parts = %#v", parts)
+	}
+	if strings.Contains(string(template), "private receipt body") {
+		t.Fatal("dynamic source content leaked into preview request")
+	}
+}
+
+func TestBuildTransactionParserRequestTemplateRejectsBlankPrompt(t *testing.T) {
+	if _, err := BuildTransactionParserRequestTemplate(" \t", false); err == nil {
+		t.Fatal("expected blank system prompt rejection")
 	}
 }
 
@@ -155,7 +204,7 @@ func TestAlibabaQwenClientRejectsUnsafeInputsBeforeNetwork(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if _, err := client.ParseTransactionEvidence(context.Background(), parserSystemPrompt, test.evidence, test.attachments); err == nil {
+			if _, err := client.ParseTransactionEvidence(context.Background(), ParserPlatformPrompt(), test.evidence, test.attachments); err == nil {
 				t.Fatal("expected rejection")
 			}
 		})
@@ -184,7 +233,7 @@ func TestAlibabaQwenClientRejectsUntrustedResponsesWithoutLeakingBody(t *testing
 			}))
 			defer server.Close()
 			client := newTestAlibabaClient(t, server)
-			_, err := client.ParseTransactionEvidence(context.Background(), parserSystemPrompt, "receipt", nil)
+			_, err := client.ParseTransactionEvidence(context.Background(), ParserPlatformPrompt(), "receipt", nil)
 			if err == nil {
 				t.Fatal("expected rejection")
 			}
@@ -203,7 +252,7 @@ func TestAlibabaQwenClientHonorsCallerContext(t *testing.T) {
 	client := newTestAlibabaClient(t, server)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := client.ParseTransactionEvidence(ctx, parserSystemPrompt, "receipt", nil); err == nil {
+	if _, err := client.ParseTransactionEvidence(ctx, ParserPlatformPrompt(), "receipt", nil); err == nil {
 		t.Fatal("expected cancelled request")
 	}
 }

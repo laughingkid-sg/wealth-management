@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strings"
 
 	"github.com/google/uuid"
 	"github.com/zhengteck/wealth-builder/backend/internal/attachmentstorage"
@@ -17,6 +16,7 @@ import (
 	"github.com/zhengteck/wealth-builder/backend/internal/parserrules"
 	"github.com/zhengteck/wealth-builder/backend/internal/providers"
 	"github.com/zhengteck/wealth-builder/backend/internal/reconciliation"
+	"github.com/zhengteck/wealth-builder/backend/internal/transactionprompt"
 	"github.com/zhengteck/wealth-builder/backend/internal/transactionstore"
 )
 
@@ -112,22 +112,15 @@ func (h Handler) handleSourceParse(ctx context.Context, job jobs.Job) error {
 	if err != nil {
 		return fmt.Errorf("load source for parsing: %w", err)
 	}
-	matchedRule, hasRule, ruleErr := parserrules.MatchAndApply(input.Sender, input.NormalizedContent, input.Rules)
-	matchedUserRule, hasUserRule, userRuleErr := parserrules.MatchUserRule(input.Sender, input.Subject, input.Content, input.UserRules)
-	components := promptComponents(input.DefaultInstructions, input.DefaultInstructionsVersion, matchedRule, hasRule, matchedUserRule, hasUserRule)
-	encodedComponents, _ := json.Marshal(components)
-	assembledPrompt := providers.AssembleParserSystemPrompt(providers.ParserPromptFragments{
-		GlobalRule: matchedRule.PromptFragment, DefaultUser: input.DefaultInstructions,
-		UserSourceRule: matchedUserRule.PromptFragment,
-	})
+	selection, configurationErr := transactionprompt.SelectAutomatic(input)
+	encodedComponents, _ := json.Marshal(selection.Components)
 	audit := transactionstore.SourceParseAudit{
-		SourceID: sourceID, Model: "qwen3.8-flash", AssembledSystemPrompt: assembledPrompt,
+		SourceID: sourceID, Model: "qwen3.8-flash", AssembledSystemPrompt: selection.AssembledSystemPrompt,
 		NormalizedInput: input.NormalizedContent, PromptComponents: encodedComponents,
-		RuleID: ruleID(matchedRule, hasRule), RuleVersion: ruleVersion(matchedRule, hasRule),
-		UserRuleID: userRuleID(matchedUserRule, hasUserRule), UserRuleVersion: userRuleVersion(matchedUserRule, hasUserRule),
+		RuleID: ruleID(selection.GlobalRule, selection.HasGlobalRule), RuleVersion: ruleVersion(selection.GlobalRule, selection.HasGlobalRule),
+		UserRuleID: userRuleID(selection.UserRule, selection.HasUserRule), UserRuleVersion: userRuleVersion(selection.UserRule, selection.HasUserRule),
 	}
-	if ruleErr != nil || userRuleErr != nil {
-		configurationErr := errors.Join(ruleErr, userRuleErr)
+	if configurationErr != nil {
 		if recordErr := h.Repository.RecordFailedSourceParse(ctx, job.UserID, audit, configurationErr); recordErr != nil {
 			return fmt.Errorf("record parser configuration failure: %w", recordErr)
 		}
@@ -143,7 +136,7 @@ func (h Handler) handleSourceParse(ctx context.Context, job jobs.Job) error {
 		return fmt.Errorf("load parse attachments: %w", err)
 	}
 	audit.AttachmentUsage = usage
-	modelResult, err := h.Parser.ParseTransactionEvidence(ctx, assembledPrompt, input.NormalizedContent, attachments)
+	modelResult, err := h.Parser.ParseTransactionEvidence(ctx, selection.AssembledSystemPrompt, input.NormalizedContent, attachments)
 	if modelResult.Model != "" {
 		audit.Model = modelResult.Model
 	}
@@ -168,8 +161,8 @@ func (h Handler) handleSourceParse(ctx context.Context, job jobs.Job) error {
 		// requested from or accepted from the model response.
 		parsed.Candidate.UserID = job.UserID.String()
 		parsed.Candidate.Confidence = reconciliation.AggregateConfidence(parsed.Evidence)
-		if hasRule {
-			err = applyDeterministicRule(&parsed.Candidate, &parsed.Evidence, matchedRule)
+		if selection.HasGlobalRule {
+			err = applyDeterministicRule(&parsed.Candidate, &parsed.Evidence, selection.GlobalRule)
 		}
 		if err == nil {
 			parsed.Candidate.AccountEvidence = reconciliation.SanitizeAccountEvidenceForMatching(parsed.Candidate.AccountEvidence, input.NormalizedContent)
@@ -200,22 +193,6 @@ func (h Handler) handleSourceParse(ctx context.Context, job jobs.Job) error {
 	return nil
 }
 
-func promptComponents(defaultInstructions string, defaultVersion int, global parserrules.AppliedRule, hasGlobal bool, user parserrules.UserRule, hasUser bool) transactionstore.PromptComponents {
-	result := transactionstore.PromptComponents{Platform: transactionstore.PromptComponent{
-		ID: "wealth-builder-transaction-parser", Version: providers.ParserPlatformPromptVersion, Content: providers.ParserPlatformPrompt(),
-	}}
-	if hasGlobal {
-		result.GlobalRule = &transactionstore.PromptComponent{ID: global.ID, Version: global.Version, Content: global.PromptFragment}
-	}
-	if strings.TrimSpace(defaultInstructions) != "" {
-		result.UserDefault = &transactionstore.PromptComponent{ID: "user-parser-settings", Version: defaultVersion, Content: strings.TrimSpace(defaultInstructions)}
-	}
-	if hasUser {
-		result.UserSourceRule = &transactionstore.PromptComponent{ID: user.ID, Name: user.Name, Version: user.Version, Content: strings.TrimSpace(user.PromptFragment)}
-	}
-	return result
-}
-
 func jsonObjectAudit(raw []byte, fallbackField string) json.RawMessage {
 	if len(raw) == 0 {
 		return nil
@@ -239,7 +216,7 @@ func (h Handler) loadParseAttachments(ctx context.Context, userID, sourceID uuid
 		if len(attachments) >= 5 {
 			break
 		}
-		if item.StorageStatus != "stored" || !item.ParseEligible || !receiptOrInvoice(item.Filename) || strings.TrimSpace(item.ObjectPath) == "" {
+		if !transactionprompt.VisualAttachmentMetadataEligible(item) {
 			continue
 		}
 		content, err := h.Attachments.Download(ctx, attachmentstorage.ObjectRequest{UserID: userID, SourceID: sourceID, ObjectPath: item.ObjectPath})
@@ -261,11 +238,6 @@ func (h Handler) loadParseAttachments(ctx context.Context, userID, sourceID uuid
 		}
 	}
 	return attachments, usage, nil
-}
-
-func receiptOrInvoice(filename string) bool {
-	lower := strings.ToLower(filename)
-	return strings.Contains(lower, "receipt") || strings.Contains(lower, "invoice")
 }
 
 func canonicalParsedJSON(parsed reconciliation.ParsedResponse) json.RawMessage {
