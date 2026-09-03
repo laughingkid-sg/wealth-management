@@ -105,7 +105,7 @@ test("provider request parser rejects drift in model, thinking, schema, or promp
       { ...validProviderRequest(), model: "another-model" },
       "assembled prompt",
     ),
-    /qwen3\.8-flash/,
+    /model is unsupported/,
   );
   assert.throws(
     () => parseQwenPromptPreviewRequest(

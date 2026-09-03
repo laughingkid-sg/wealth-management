@@ -197,7 +197,7 @@ export function PromptPreviewPage({ session }: { session: Session }) {
           <p className="eyebrow">TRANSACTION PARSER INSPECTION</p>
           <h1>Prompt Preview</h1>
           <p className="muted">
-            Inspect how immutable platform guidance and configurable rules assemble before Qwen sees a source.
+            Inspect how immutable platform guidance and configurable rules assemble before the LLM receives a source.
           </p>
         </div>
         <FileSearch aria-hidden="true" className="settings-page-icon" size={34} />
@@ -208,7 +208,7 @@ export function PromptPreviewPage({ session }: { session: Session }) {
         <div>
           <strong>Safe preview only</strong>
           <p>
-            This page does not call Qwen, queue a job, create a parse audit, or write transaction data.
+            This page does not call the LLM, queue a job, create a parse audit, or write transaction data.
             Email and eligible attachment content are replaced by explicit placeholders in the request template.
           </p>
         </div>
@@ -364,7 +364,7 @@ export function PromptPreviewPage({ session }: { session: Session }) {
           <article className="settings-card prompt-output-card">
             <div className="settings-card-heading">
               <div>
-                <p className="eyebrow">QWEN REQUEST TEMPLATE</p>
+                <p className="eyebrow">LLM REQUEST TEMPLATE</p>
                 <h2>Provider request structure</h2>
                 <p>Dynamic email and eligible attachment content appears only as placeholders.</p>
               </div>

@@ -59,7 +59,7 @@ export function parseQwenPromptPreviewRequest(
 ): QwenPromptPreviewRequest {
   const request = record(value, "provider_request");
   if (request.model !== "qwen3.8-flash") {
-    throw new Error("provider_request.model must be qwen3.8-flash");
+    throw new Error("provider_request.model is unsupported");
   }
   if (request.enable_thinking !== false) {
     throw new Error("provider_request.enable_thinking must be false");
