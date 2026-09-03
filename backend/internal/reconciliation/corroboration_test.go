@@ -56,13 +56,33 @@ func TestSanitizeAccountEvidenceForMatchingRequiresOneContextualCardSuffix(t *te
 	}
 }
 
-func TestReconcileBlocksAutomaticActionsWhenIneligible(t *testing.T) {
+func TestReconcileBlocksAutomaticCreationWhenIneligible(t *testing.T) {
 	candidate := validCandidate(time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC))
 	candidate.AccountEvidence.CardLastFour = "1234"
 	candidate.AutoEligible = false
 	decision, err := Reconcile(candidate, []AccountIdentity{accountIdentity("account", "user-1", "card_last_four", "1234")}, nil)
 	if err != nil || decision.Outcome != OutcomeReview {
 		t.Fatalf("create gate = %#v, %v", decision, err)
+	}
+}
+
+func TestReconcileAttachesUniquePairBeforeAutoEligibilityGate(t *testing.T) {
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	candidate := validCandidate(now)
+	candidate.AccountEvidence.CardLastFour = "2562"
+	candidate.AutoEligible = false
+	candidate.OriginalAmountMinor = 1095
+	candidate.OriginalCurrency = "SGD"
+
+	decision, err := Reconcile(candidate, []AccountIdentity{accountIdentity("citi-rewards", "user-1", "card_last_four", "2562")}, []Transaction{{
+		ID: "existing", UserID: "user-1", AccountID: "citi-rewards", Kind: KindDebit,
+		OriginalAmountMinor: 1095, OriginalCurrency: "SGD", OccurredAt: now.Add(2 * time.Second),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Outcome != OutcomeAttach || decision.TransactionID != "existing" {
+		t.Fatalf("Reconcile() = %#v, want attachment before automatic-creation eligibility", decision)
 	}
 }
 

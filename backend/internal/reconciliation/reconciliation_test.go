@@ -7,11 +7,10 @@ import (
 	"time"
 )
 
-func TestReconcileAttachesHighConfidenceMatch(t *testing.T) {
+func TestReconcileAttachesUniquePairingMatch(t *testing.T) {
 	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
 	candidate := validCandidate(now)
 	candidate.AccountEvidence.CardLastFour = "•••• 4242"
-	candidate.References = []string{"bank-123"}
 
 	decision, err := Reconcile(candidate, []AccountIdentity{accountIdentity("account-1", "user-1", "card_last_four", "4242")}, []Transaction{{
 		ID:                  "transaction-1",
@@ -22,16 +21,12 @@ func TestReconcileAttachesHighConfidenceMatch(t *testing.T) {
 		OriginalAmountMinor: 648,
 		OriginalCurrency:    "USD",
 		OccurredAt:          now.Add(8 * time.Minute),
-		References:          []string{"BANK-123"},
 	}})
 	if err != nil {
 		t.Fatalf("Reconcile() error = %v", err)
 	}
 	if decision.Outcome != OutcomeAttach || decision.TransactionID != "transaction-1" {
 		t.Fatalf("Reconcile() = %#v, want attachment to transaction-1", decision)
-	}
-	if decision.Score.Total() != 177 {
-		t.Fatalf("match score = %d, want 177", decision.Score.Total())
 	}
 }
 
@@ -72,7 +67,7 @@ func TestReconcileCreatesReliableUnmatchedCandidate(t *testing.T) {
 	}
 }
 
-func TestReconcileUsesTenMinuteWindowOnlyAsSupportingSignal(t *testing.T) {
+func TestReconcileDoesNotPairOnTimeAlone(t *testing.T) {
 	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
 	candidate := validCandidate(now)
 	candidate.AccountEvidence.CardLastFour = "4242"
@@ -118,43 +113,165 @@ func TestReconcileUnrelatedSameAccountActivityDoesNotSuppressCreation(t *testing
 	}
 }
 
-func TestReconcilePlausibleAmountCurrencyAndTimeCollisionRequiresReview(t *testing.T) {
+func TestReconcileAttachesFairPriceLikeMerchantMismatch(t *testing.T) {
 	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
 	candidate := validCandidate(now)
-	candidate.AccountEvidence.CardLastFour = "4242"
-	candidate.MerchantName = ""
+	candidate.AccountEvidence.CardLastFour = "2562"
+	candidate.Title = "FairPrice Group App Receipt"
+	candidate.MerchantName = "FairPrice Group"
+	candidate.OriginalAmountMinor = 1095
+	candidate.OriginalCurrency = "SGD"
 
 	decision, err := Reconcile(candidate, []AccountIdentity{
-		accountIdentity("account-1", "user-1", "card_last_four", "4242"),
+		accountIdentity("citi-rewards", "user-1", "card_last_four", "2562"),
 	}, []Transaction{{
-		ID: "plausible", UserID: "user-1", AccountID: "account-1", Kind: KindDebit,
-		OriginalAmountMinor: candidate.OriginalAmountMinor, OriginalCurrency: candidate.OriginalCurrency,
-		OccurredAt: now.Add(5 * time.Minute),
+		ID: "citi-transaction", UserID: "user-1", AccountID: "citi-rewards", Kind: KindDebit,
+		MerchantName:        "NTUC FairPrice App Pay Singapore SGP",
+		OriginalAmountMinor: 1095, OriginalCurrency: "SGD",
+		OccurredAt: now.Add(2 * time.Second),
 	}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if decision.Outcome != OutcomeReview || decision.TransactionID != "" {
-		t.Fatalf("Reconcile() = %#v, want review for a plausible but unsafe collision", decision)
+	if decision.Outcome != OutcomeAttach || decision.TransactionID != "citi-transaction" {
+		t.Fatalf("Reconcile() = %#v, want FairPrice receipt attached despite merchant mismatch", decision)
 	}
 }
 
-func TestReconcileDoesNotAutoAttachOnAccountAmountAndCurrencyOnly(t *testing.T) {
+func TestReconcileCurrencyCompatibility(t *testing.T) {
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	for _, testCase := range []struct {
+		name                string
+		transactionCurrency string
+		want                Outcome
+	}{
+		{name: "same currency", transactionCurrency: "USD", want: OutcomeAttach},
+		{name: "existing currency missing", transactionCurrency: "", want: OutcomeAttach},
+		{name: "different currencies", transactionCurrency: "SGD", want: OutcomeCreate},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			candidate := validCandidate(now)
+			candidate.AccountEvidence.CardLastFour = "4242"
+			decision, err := Reconcile(candidate, []AccountIdentity{accountIdentity("account-1", "user-1", "card_last_four", "4242")}, []Transaction{{
+				ID: "transaction-1", UserID: "user-1", AccountID: "account-1", Kind: KindDebit,
+				OriginalAmountMinor: candidate.OriginalAmountMinor, OriginalCurrency: testCase.transactionCurrency, OccurredAt: now,
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if decision.Outcome != testCase.want {
+				t.Fatalf("Reconcile() = %#v, want %s", decision, testCase.want)
+			}
+		})
+	}
+}
+
+func TestCurrenciesCompatibleAcceptsEitherMissingAndSame(t *testing.T) {
+	for _, testCase := range []struct {
+		left  string
+		right string
+		want  bool
+	}{
+		{left: "SGD", right: "SGD", want: true},
+		{left: "", right: "SGD", want: true},
+		{left: "SGD", right: "", want: true},
+		{left: "", right: "", want: true},
+		{left: "SGD", right: "USD", want: false},
+	} {
+		if got := currenciesCompatible(testCase.left, testCase.right); got != testCase.want {
+			t.Fatalf("currenciesCompatible(%q, %q) = %t, want %t", testCase.left, testCase.right, got, testCase.want)
+		}
+	}
+}
+
+func TestReconcileUsesInclusiveTenMinutePairingWindow(t *testing.T) {
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	for _, testCase := range []struct {
+		name   string
+		offset time.Duration
+		want   Outcome
+	}{
+		{name: "positive boundary", offset: MatchWindow, want: OutcomeAttach},
+		{name: "negative boundary", offset: -MatchWindow, want: OutcomeAttach},
+		{name: "outside boundary", offset: MatchWindow + time.Nanosecond, want: OutcomeCreate},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			candidate := validCandidate(now)
+			candidate.AccountEvidence.CardLastFour = "4242"
+			decision, err := Reconcile(candidate, []AccountIdentity{accountIdentity("account-1", "user-1", "card_last_four", "4242")}, []Transaction{{
+				ID: "transaction-1", UserID: "user-1", AccountID: "account-1", Kind: KindDebit,
+				OriginalAmountMinor: candidate.OriginalAmountMinor, OriginalCurrency: candidate.OriginalCurrency,
+				OccurredAt: now.Add(testCase.offset),
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if decision.Outcome != testCase.want {
+				t.Fatalf("Reconcile() = %#v, want %s", decision, testCase.want)
+			}
+		})
+	}
+}
+
+func TestReconcileReviewsMultiplePairingCandidatesWithoutDisambiguation(t *testing.T) {
 	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
 	candidate := validCandidate(now)
 	candidate.AccountEvidence.CardLastFour = "4242"
-	candidate.OriginalAmountMinor = 648
-	candidate.OriginalCurrency = "USD"
-	candidate.MerchantName = ""
+	candidate.References = []string{"matches-only-first"}
+
+	decision, err := Reconcile(candidate, []AccountIdentity{accountIdentity("account-1", "user-1", "card_last_four", "4242")}, []Transaction{
+		{
+			ID: "transaction-with-reference", UserID: "user-1", AccountID: "account-1", Kind: KindDebit,
+			OriginalAmountMinor: candidate.OriginalAmountMinor, OriginalCurrency: candidate.OriginalCurrency,
+			OccurredAt: now.Add(time.Minute), References: []string{"MATCHES-ONLY-FIRST"},
+		},
+		{
+			ID: "transaction-without-reference", UserID: "user-1", AccountID: "account-1", Kind: KindDebit,
+			MerchantName: "DigitalOcean", OriginalAmountMinor: candidate.OriginalAmountMinor, OriginalCurrency: "",
+			OccurredAt: now.Add(2 * time.Minute),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Outcome != OutcomeReview || decision.TransactionID != "" || !strings.Contains(decision.Reason, "multiple") {
+		t.Fatalf("Reconcile() = %#v, want ambiguous pairing review", decision)
+	}
+}
+
+func TestReconcileDoesNotUseSharedReferenceAsPairingFallback(t *testing.T) {
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	candidate := validCandidate(now)
+	candidate.AccountEvidence.CardLastFour = "4242"
+	candidate.References = []string{"shared-reference"}
+
 	decision, err := Reconcile(candidate, []AccountIdentity{accountIdentity("account-1", "user-1", "card_last_four", "4242")}, []Transaction{{
-		ID: "transaction-1", UserID: "user-1", AccountID: "account-1", Kind: KindDebit,
-		OriginalAmountMinor: 648, OriginalCurrency: "USD", OccurredAt: now,
+		ID: "different-transaction", UserID: "user-1", AccountID: "account-1", Kind: KindDebit,
+		OriginalAmountMinor: candidate.OriginalAmountMinor + 1, OriginalCurrency: candidate.OriginalCurrency,
+		OccurredAt: now, References: []string{"SHARED-REFERENCE"},
 	}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if decision.Outcome != OutcomeReview {
-		t.Fatalf("Reconcile() = %#v, want review for unsafe account+amount+currency match", decision)
+	if decision.Outcome != OutcomeCreate || decision.TransactionID != "" {
+		t.Fatalf("Reconcile() = %#v, want reliable candidate creation without reference fallback", decision)
+	}
+}
+
+func TestReconcileRequiresSameTransactionDirection(t *testing.T) {
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	candidate := validCandidate(now)
+	candidate.AccountEvidence.CardLastFour = "4242"
+
+	decision, err := Reconcile(candidate, []AccountIdentity{accountIdentity("account-1", "user-1", "card_last_four", "4242")}, []Transaction{{
+		ID: "opposite-direction", UserID: "user-1", AccountID: "account-1", Kind: KindCredit,
+		OriginalAmountMinor: candidate.OriginalAmountMinor, OriginalCurrency: candidate.OriginalCurrency, OccurredAt: now,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Outcome != OutcomeCreate || decision.TransactionID != "" {
+		t.Fatalf("Reconcile() = %#v, want creation rather than opposite-direction pairing", decision)
 	}
 }
 

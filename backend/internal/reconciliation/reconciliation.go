@@ -26,12 +26,11 @@ var (
 )
 
 const (
-	// MatchWindow is a supporting signal only; it can never create a match by itself.
+	// MatchWindow is the inclusive maximum distance between source evidence and
+	// an existing transaction considered for automatic pairing.
 	MatchWindow = 10 * time.Minute
 
 	minimumCreateConfidence     = 0.75
-	highMatchScore              = 90
-	ambiguousScoreDelta         = 10
 	maxTransactionLineItems     = 100
 	maxLineItemDescriptionRunes = 250
 	maxSerializedLineItemsBytes = 256 * 1024
@@ -501,9 +500,10 @@ func decodeParsedResponse(raw []byte) (ParsedResponse, error) {
 	return response, nil
 }
 
-// Reconcile returns the safe action for a parsed candidate. It never matches
-// from merchant, amount, or time alone: account evidence must resolve exactly
-// one owned account before attachment or creation is possible.
+// Reconcile returns the safe action for a parsed candidate. Account evidence
+// must resolve exactly one owned account before attachment or creation is
+// possible. Automatic pairing then uses only account, direction, exact amount,
+// compatible currency, and the inclusive time window.
 func Reconcile(candidate Candidate, accounts []AccountIdentity, transactions []Transaction) (Decision, error) {
 	if err := ValidateCandidate(candidate); err != nil {
 		return Decision{}, err
@@ -518,31 +518,35 @@ func Reconcile(candidate Candidate, accounts []AccountIdentity, transactions []T
 	case accountAmbiguous:
 		return Decision{Outcome: OutcomeReview, Reason: "account evidence matches more than one account"}, nil
 	}
-	if !candidate.AutoEligible {
-		return Decision{Outcome: OutcomeReview, AccountID: accountID, Reason: "source evidence is not sufficiently corroborated for automatic action"}, nil
-	}
 
-	possible := make([]scoredTransaction, 0)
+	matches := make([]Transaction, 0)
 	for _, transaction := range transactions {
 		if transaction.UserID != candidate.UserID || transaction.AccountID != accountID || transaction.Kind != candidate.Kind {
 			continue
 		}
-		if !plausibleExistingMatch(candidate, transaction) {
+		if transaction.OriginalAmountMinor != candidate.OriginalAmountMinor ||
+			!currenciesCompatible(candidate.OriginalCurrency, transaction.OriginalCurrency) ||
+			absoluteDuration(candidate.OccurredAt.Sub(transaction.OccurredAt)) > MatchWindow {
 			continue
 		}
-		score := scoreCandidate(candidate, transaction)
-		possible = append(possible, scoredTransaction{transaction: transaction, score: score})
+		matches = append(matches, transaction)
 	}
-	sort.Slice(possible, func(i, j int) bool { return possible[i].score.Total() > possible[j].score.Total() })
 
-	if len(possible) > 0 && possible[0].score.Total() >= highMatchScore && safeAutomaticAttach(candidate, possible[0].transaction) {
-		if len(possible) > 1 && possible[0].score.Total()-possible[1].score.Total() <= ambiguousScoreDelta {
-			return Decision{Outcome: OutcomeReview, AccountID: accountID, Score: possible[0].score, Reason: "multiple plausible transaction matches"}, nil
-		}
-		return Decision{Outcome: OutcomeAttach, AccountID: accountID, TransactionID: possible[0].transaction.ID, Score: possible[0].score, Reason: "high-confidence source match"}, nil
+	if len(matches) == 1 {
+		match := matches[0]
+		return Decision{
+			Outcome:       OutcomeAttach,
+			AccountID:     accountID,
+			TransactionID: match.ID,
+			Score:         scoreCandidate(candidate, match),
+			Reason:        "unique account, amount, direction, currency, and time match",
+		}, nil
 	}
-	if len(possible) > 0 {
-		return Decision{Outcome: OutcomeReview, AccountID: accountID, Score: possible[0].score, Reason: "existing transaction match is below confidence threshold"}, nil
+	if len(matches) > 1 {
+		return Decision{Outcome: OutcomeReview, AccountID: accountID, Reason: "multiple account, amount, direction, currency, and time matches"}, nil
+	}
+	if !candidate.AutoEligible {
+		return Decision{Outcome: OutcomeReview, AccountID: accountID, Reason: "source evidence is not sufficiently corroborated for automatic creation"}, nil
 	}
 	if candidate.Confidence < minimumCreateConfidence {
 		return Decision{Outcome: OutcomeReview, AccountID: accountID, Reason: "candidate confidence is below creation threshold"}, nil
@@ -550,36 +554,13 @@ func Reconcile(candidate Candidate, accounts []AccountIdentity, transactions []T
 	return Decision{Outcome: OutcomeCreate, AccountID: accountID, Reason: "reliable unmatched candidate"}, nil
 }
 
-// plausibleExistingMatch prevents ordinary account activity from suppressing
-// creation merely because it falls inside the broad database lookup window.
-// A candidate needs an exact shared reference, or matching amount/currency
-// plus at least one merchant/time signal, before a below-threshold collision
-// is meaningful enough to send to review.
-func plausibleExistingMatch(candidate Candidate, transaction Transaction) bool {
-	if hasSharedReference(candidate.References, transaction.References) {
-		return true
-	}
-	if candidate.OriginalAmountMinor != transaction.OriginalAmountMinor || candidate.OriginalCurrency != transaction.OriginalCurrency {
-		return false
-	}
-	merchantMatches := normalizeMerchant(candidate.MerchantName) != "" &&
-		normalizeMerchant(candidate.MerchantName) == normalizeMerchant(transaction.MerchantName)
-	withinWindow := absoluteDuration(candidate.OccurredAt.Sub(transaction.OccurredAt)) <= MatchWindow
-	return merchantMatches || withinWindow
-}
-
-// safeAutomaticAttach requires a resolved account plus an unambiguous source
-// identity signal. Amount and currency alone are common across subscriptions
-// and must stay in review even if they produce a high numeric score.
-func safeAutomaticAttach(candidate Candidate, transaction Transaction) bool {
-	if hasSharedReference(candidate.References, transaction.References) {
-		return true
-	}
-	return candidate.OriginalAmountMinor == transaction.OriginalAmountMinor &&
-		candidate.OriginalCurrency == transaction.OriginalCurrency &&
-		normalizeMerchant(candidate.MerchantName) != "" &&
-		normalizeMerchant(candidate.MerchantName) == normalizeMerchant(transaction.MerchantName) &&
-		absoluteDuration(candidate.OccurredAt.Sub(transaction.OccurredAt)) <= MatchWindow
+// currenciesCompatible rejects a pair only when both sides identify different
+// currencies. Canonical candidates still require a valid ISO currency; the
+// empty-value cases support older or incomplete existing transactions.
+func currenciesCompatible(left, right string) bool {
+	left = strings.TrimSpace(left)
+	right = strings.TrimSpace(right)
+	return left == "" || right == "" || strings.EqualFold(left, right)
 }
 
 type accountResolution int
@@ -681,11 +662,6 @@ func NormalizeAccountMatchingKey(keyType, value string) (string, error) {
 	default:
 		return "", errors.New("matching key type must be card_last_four or bank_account_suffix")
 	}
-}
-
-type scoredTransaction struct {
-	transaction Transaction
-	score       MatchScore
 }
 
 func scoreCandidate(candidate Candidate, transaction Transaction) MatchScore {
