@@ -2,11 +2,11 @@
 
 ## User goal
 
-> I can refresh finance-labelled Gmail messages, turn reliable evidence into account-linked transactions, inspect every supporting source, and resolve uncertain, failed, or unmatched evidence without losing the original data.
+> I can add account-linked transactions myself, refresh finance-labelled Gmail messages, turn reliable evidence into canonical transactions, inspect every supporting source, and resolve uncertain, failed, or unmatched evidence without losing the original data.
 
 ## Delivery status
 
-The Transactions product flow is implemented on `codex/feat-transaction`: Gmail OAuth and refresh, durable asynchronous processing, configurable Qwen guidance, typed Account matching keys, account-aware reconciliation, exact parse-call audit, transaction and source review views, attachment inspection, editing, unmatching, raw-source deletion, retry, and internal-transfer creation all have frontend and Go implementations. See [technical implementation](technical.md) for exact migration and verification evidence.
+The Transactions product flow is implemented on `codex/feat-transaction`: Gmail OAuth and refresh, durable asynchronous processing, configurable Qwen guidance, typed Account matching keys, account-aware reconciliation, exact parse-call audit, transaction and source review views, attachment inspection, editing, unmatching, raw-source deletion, retry, internal-transfer creation, direct manual creation, merchant/user-note editing, and dismissible terminal Gmail results. Migration `20260903014725_allow_manual_transaction_inserts.sql` is applied to the hosted development project, and the integrated database, Go, frontend, and authenticated-browser checks pass. This final acceptance did not call Qwen; exact verification evidence is recorded in [technical implementation](technical.md).
 
 ## Product model
 
@@ -27,7 +27,7 @@ Raw sources are durable evidence, not canonical transactions. Every canonical tr
 7. The UI reports progress asynchronously through Supabase Realtime with secure polling as a fallback. The user can leave and return while the server-side work continues.
 8. The user can inspect email and attachment evidence, attach a source to an existing transaction, create a transaction from it, retry parsing, edit canonical fields, or unmatch evidence. Unmatching retains the source and its audit history.
 
-Only one Gmail refresh may be active for a user at a time. Failures are surfaced without deleting already stored evidence.
+Only one Gmail refresh may be active for a user at a time. Failures are surfaced without deleting already stored evidence. Progress for a queued or running refresh remains visible and cannot be dismissed. Once that run completes or fails, its result banner may be dismissed independently for that user and run; dismissing one terminal result does not hide a later refresh.
 
 ## Transaction semantics
 
@@ -39,16 +39,33 @@ Only one Gmail refresh may be active for a user at a time. Failures are surfaced
 
 Each transfer leg keeps its own Account, amount, currency, time, category, line items, and optional source evidence. Both legs and their link are created atomically. The two Accounts must be distinct. A source ordinarily has at most one active evidence link. The sole exception is that the same source may support exactly both legs of one internal-transfer pair; it cannot support unrelated transactions. The transfer UI lets the user assign evidence to the outgoing leg, incoming leg, or both legs where that exception applies.
 
+### Manual transaction entry
+
+The Transactions header places **Add transaction** beside **Internal transfer**. A manual transaction may use any active Account owned by the signed-in user and records:
+
+- debit or credit direction;
+- a required title and date/time, plus an optional merchant or payee;
+- a positive original amount and three-letter currency, plus an optional SGD amount;
+- an optional active category;
+- up to 100 optional line items; and
+- optional user notes of at most 4,000 characters.
+
+The form accepts money in major units and converts it exactly to stored integer minor units. If the original currency is SGD, the SGD field mirrors the original amount and is not independently editable. For another currency, the SGD amount remains optional; the product never estimates one.
+
+Before insertion, the browser performs an advisory duplicate check over the user's visible transactions. A likely duplicate has the same Account, debit/credit kind, exact original amount and currency, and a transaction time within ten minutes in either direction. The user sees the matching records and may review the form or select **Create anyway**. This warning does not impose a uniqueness rule and cannot guarantee that another concurrent insert will not race the check.
+
+A successful manual insert is immediately `confirmed`, uses `creation_method = manual`, has no match confidence or evidence link, and has not yet been marked as user-modified. The creation form cannot write parser references, Account evidence, or other server-owned provenance into transaction details.
+
 ### Money
 
 - Amounts are positive integer minor units; direction is represented by `transaction_kind`, not by a signed amount.
 - Every transaction stores `original_amount_minor` and its ISO 4217 `original_currency`.
-- `sgd_amount_minor` is optional and is populated only when a source supplies the SGD value. The product does not invent an exchange rate.
-- For a foreign purchase, the UI displays the original-currency amount and the source-supplied SGD amount when both exist.
+- `sgd_amount_minor` is optional for foreign-currency transactions and is populated only when a source or the user supplies the SGD value. For an original SGD transaction, it mirrors `original_amount_minor`. The product does not invent an exchange rate.
+- For a foreign purchase, the UI displays the original-currency amount and the supplied SGD amount when both exist.
 
 ### Line items and flexible details
 
-Line items are optional. When present, each item uses schema version 1, has a non-empty description, a positive integer quantity, an ISO currency, optional non-negative integer minor-unit price/total/tax/discount fields, and a JSON object for flexible provider-specific details. Transaction-level non-core facts and source payloads also use JSON objects so later providers can retain data that does not belong in canonical columns. React renders known fields and safe JSON values, never provider HTML.
+Line items are optional and are capped at 100 per transaction. When present, each item uses schema version 1, has a non-empty description, a positive integer quantity, an ISO currency, optional non-negative integer minor-unit price/total/tax/discount fields, and a JSON object for flexible provider-specific details. Transaction-level non-core facts and source payloads also use JSON objects so later providers can retain data that does not belong in canonical columns. React renders known fields and safe JSON values, never provider HTML.
 
 ## Matching and deduplication rules
 
@@ -99,7 +116,7 @@ The responsive Transactions workspace has four keyboard-accessible tabs:
 - **Dangling**: sources without a reliable Account or sources returned here after unmatching.
 - **Failed**: stored sources whose parsing or terminal processing failed, showing a safe failure reason and retrying from the retained source without refetching Gmail.
 
-Transaction detail supports editing title, Account, date/time, original amount/currency, optional SGD amount, category, and line items. It shows active evidence, lets the user inspect each source, and requires confirmation before unmatching. Source detail shows sanitized email, private attachments, parse facts/errors, Account selection, same-Account transaction search, attach/create actions, and retry where applicable. An owner-only **Debug** view shows the latest ten attempt summaries with bounded previews; any shortened prompt, input, provider request/response, model output, validated candidate, or rule provenance field can be loaded individually in its exact stored lexical form. A separate dialog creates the two linked legs of an internal transfer and supports outgoing, incoming, or both-leg evidence selection.
+Transaction detail supports editing title, merchant or payee, Account, date/time, original amount/currency, optional SGD amount, category, line items, and user notes. Merchant and `user_notes` are editable for every canonical transaction, whether it was created manually, from source evidence, or as an internal-transfer leg; editing notes must not replace server-owned provenance in the same details object. Transaction detail also shows active evidence, lets the user inspect each source, and requires confirmation before unmatching. Source detail shows sanitized email, private attachments, parse facts/errors, Account selection, same-Account transaction search, attach/create actions, and retry where applicable. An owner-only **Debug** view shows the latest ten attempt summaries with bounded previews; any shortened prompt, input, provider request/response, model output, validated candidate, or rule provenance field can be loaded individually in its exact stored lexical form. Separate dialogs create one manual transaction or the two linked legs of an internal transfer; the latter supports outgoing, incoming, or both-leg evidence selection.
 
 Transactions has an independent **Settings** page within its navigation section. The user can edit a bounded default prompt, create versioned Gmail source rules, and create or retire matching keys for active Accounts. Source rules require a sender condition (exact address, domain, or RE2 expression); optional subject and content RE2 expressions combine with it using AND semantics. The single highest-priority matching global rule and the single highest-priority matching user rule are selected independently. A tie at the highest matching priority is treated as a visible configuration failure rather than chosen arbitrarily. User guidance is subordinate to the immutable platform contract and cannot change the response schema, authorisation boundary, source-only evidence rules, or no-invention requirement.
 
@@ -131,7 +148,7 @@ The category catalogue is global and system-managed.
 
 ## Out of scope
 
-- Automatic exchange-rate conversion when no source supplies an SGD amount.
+- Automatic exchange-rate conversion when neither the source nor the user supplies an SGD amount.
 - Phone-notification ingestion or the unspecified third source channel in this delivery.
 - User-managed category definitions.
 - Financial-provider APIs or imports other than Gmail.
@@ -145,17 +162,23 @@ The category catalogue is global and system-managed.
 | Acceptance criterion | Implementation status |
 | --- | --- |
 | Unauthenticated or cross-user callers cannot access sources, transactions, attachments, sync progress, or Gmail connection data. | Verified through Supabase session validation, owner-scoped SQL, RLS/owner tests, and Go ownership checks. Hosted anonymous REST requests to Transactions and sync data returned `401`, and the private source schema was unavailable with `406`. The hosted project contains only one user, so cross-user denial is verified by automated RLS/owner tests rather than a live second-user attempt. |
-| A user can connect Gmail, trigger a refresh, and see asynchronous progress and completion. | OAuth/PKCE, durable sync runs/jobs, Realtime, and polling fallback are implemented; a live initial run reached completion with no active or failed work. An authenticated owner-session pass loaded the Transactions workspace, Settings, Failed source inspection, sanitized email evidence, and Debug audit on desktop/mobile without console errors. Mutating controls were deliberately not exercised in that read-only browser pass. |
+| A user can connect Gmail, trigger a refresh, and see asynchronous progress and completion. | OAuth/PKCE, durable sync runs/jobs, Realtime, and polling fallback are implemented; a live initial run reached completion with no active or failed work. Authenticated owner-session passes loaded the Transactions workspace, Settings, Failed source inspection, sanitized email evidence, and Debug audit on desktop/mobile without console errors, and the final pass verified persisted terminal-banner dismissal alongside the manual create, duplicate-override, and edit paths. |
 | Labelled messages are persisted at most once per user and retry does not lose stored evidence. | Verified live: the first run stored five unique `odin-finance` sources and an idempotent five-message rerun created zero duplicate sources. Deterministic attachment paths, idempotent queueing, bounded retry, and lease recovery also have automated coverage. |
 | A reliable source creates or supports an Account-linked transaction; ambiguous/no-account evidence goes to Review or Dangling. | Parser and reconciliation tests cover account-linked creation and ambiguous handling. The live run correctly ended with five Dangling sources, zero Failed sources, and no active work because its evidence matched no Account; all three scoped parser retries subsequently parsed and reconciled successfully. |
 | Multiple sources can support one transaction and can be inspected, unmatched, or reattached. | Implemented through the evidence junction table and source/transaction dialogs. |
 | Account resolution uses explicit owner-scoped matching keys without exposing Account data to Qwen. | Implemented with typed private keys, permanent per-user uniqueness, legacy metadata backfill, exact typed comparison, and owner-scoped API validation. |
 | A user can configure default and source-specific parser guidance without overriding platform safety rules. | Implemented through the independent Settings page, versioned private configuration, deterministic priority handling, and immutable prompt-prefix assembly. |
 | The owner can inspect the exact Qwen input/output trail for a source. | Implemented through bounded private audit columns, capped latest-attempt previews, and owner-scoped on-demand exact-field loading; provider authentication headers are never stored. |
+| The owner can add a debit or credit manually against any active owned Account, with the confirmed fields, major-unit money entry, no source evidence, and an immediately confirmed result. | Verified through authenticated browser acceptance using direct Supabase Data REST: a major-unit transaction with a line item was created as confirmed/manual with zero evidence. |
+| Manual creation warns about a same-Account, same-kind, exact-amount/currency transaction within ten minutes without blocking an intentional duplicate. | Verified in the authenticated browser: the exact advisory warning appeared and **Create anyway** created the intentional duplicate. |
+| Merchant/payee and user notes can be edited on every owned canonical transaction without overwriting source provenance. | Verified through the Go PATCH path: merchant and `user_notes` changed while the existing line-item details remained intact. |
+| Active Gmail progress remains visible, while each completed or failed result can be dismissed for only that user and run. | Verified in the authenticated browser: terminal dismissal persisted for that user/run, while the active-progress path remains non-dismissible. |
 | Explicit raw-source deletion removes related database and Storage evidence without deleting a manually created or edited transaction. | Verified through hosted integration tests and 37 focused database assertions: one transaction atomically deletes database evidence, preserves protected canonical transactions, tombstones provider identity, and enqueues exact paths for Storage cleanup outside the transaction. Cleanup cannot be terminally abandoned: failures and expired final leases requeue with cooldown until object deletion succeeds. |
 | An internal transfer creates exactly one debit leg, one credit leg, and one junction link atomically. | Verified by the Go integration suite and database integrity assertions. |
 | The owner can safely view sanitized email and supported private attachments. | Verified with server-side sanitization, sandboxed rendering, private Storage, ownership checks, and a live five-minute signed attachment URL whose ranged download succeeded. |
-| Monetary and line-item contracts use integer minor units and preserve original and optional SGD values. | Implemented at the Go boundary, database constraints, parser validation, and strict TypeScript API parsing. |
+| Monetary and line-item contracts use integer minor units and preserve original and optional SGD values. | Verified across database, Go, frontend, and browser checks, including exact major-unit conversion and browser-authored decimal-string line-item amounts. The Go storage decoder preserves those amounts and their line-item details. |
 | Review, Dangling, and Failed queues support resolution and retry without deleting source evidence. | Implemented in the Go actions and React workspace. |
+
+The authenticated acceptance fixtures were temporary: all three synthetic transaction rows and any associated links were removed after verification.
 
 See [technical implementation](technical.md) for the exact component, schema, route, runtime, configuration, and verification contracts.

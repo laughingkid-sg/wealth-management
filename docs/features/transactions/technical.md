@@ -2,7 +2,7 @@
 
 ## Implementation status
 
-The React workspace, Go API, Go worker, database migrations, and automated-test fixtures described here are implemented on `codex/feat-transaction`. Migrations through `20260902230003` are applied to the hosted development project, migration histories match, hosted database lint and all 189 pgTAP assertions pass, the hosted transaction-store race/integration suite passes, and the final Go/frontend release checks pass. Earlier scoped Gmail → Storage → Qwen → reconciliation, replay-idempotency, and signed-attachment checks also passed. The current FairPrice/Citi `2562` reparse is recorded separately below because sending the retained source to Qwen requires an explicit outbound-data approval.
+The React workspace, Go API, Go worker, database migrations, and automated-test fixtures described here are implemented on `codex/feat-transaction`. Migration `20260903014725_allow_manual_transaction_inserts.sql` passed a hosted dry run and exact transaction-wrapped rollback rehearsal, is applied after `20260902230003`, and appears in matching migration history. All 228 pgTAP assertions across nine suites pass; full Go tests, race tests, vet, and builds pass; and frontend lint, build, and all 10 focused tests pass. Authenticated-browser acceptance covers terminal-banner persistence, direct manual creation, the duplicate override, merchant/note editing, zero evidence, and fixture cleanup. Qwen was not called in this final verification.
 
 ## Component boundary
 
@@ -10,12 +10,12 @@ Transactions uses four cooperating boundaries:
 
 | Component | Responsibility |
 | --- | --- |
-| React SPA | Supabase session, Transactions/Review/Dangling/Failed views, an independent Transaction Settings page, owner-only parse debugging, safe reference-data reads, progress monitoring, and user actions through Go. |
-| Go API (`backend/cmd/api`) | Authenticates the Supabase user, owns Gmail OAuth, starts sync runs, returns safe transaction/source/settings/audit projections, signs attachment access, stages evidence deletion, and performs invariant-preserving mutations. |
+| React SPA | Supabase session, Transactions/Review/Dangling/Failed views, an independent Transaction Settings page, owner-only parse debugging, safe reference-data reads, progress monitoring and terminal-result dismissal, manual transaction insertion through authenticated Data REST, and all other user actions through Go. |
+| Go API (`backend/cmd/api`) | Authenticates the Supabase user, owns Gmail OAuth, starts sync runs, returns safe transaction/source/settings/audit projections, signs attachment access, stages evidence deletion, and performs invariant-preserving edits and multi-row mutations. It does not expose a manual-create route. |
 | Go worker (`backend/cmd/worker`) | Claims durable jobs, fetches Gmail, stores attachments, selects global and user parser rules, assembles Qwen prompts, stores the complete call audit, validates candidates, and reconciles sources. |
-| Hosted Supabase | Auth, Postgres, RLS-protected public projections, non-exposed private operational tables, Realtime sync updates, and private attachment Storage. |
+| Hosted Supabase | Auth, Postgres, RLS-protected public projections, a least-privilege manual-transaction INSERT surface, non-exposed private operational tables, Realtime sync updates, and private attachment Storage. |
 
-The browser uses Supabase Data REST only for the user’s active Account choices, the global category catalogue, and the existing Account-detail transaction lookup. The main Transactions/source listings and every privileged or multi-table operation go through Go. Gmail, Qwen, raw sources, evidence links, OAuth tokens, worker jobs, Storage service credentials, and attachment signing are never browser-side concerns.
+The browser uses Supabase Data REST for the user’s active Account choices, the global category catalogue, the existing Account-detail transaction lookup, the advisory manual-duplicate lookup, and one narrowly constrained manual transaction insert. It sends the signed-in user's JWT and publishable key; it never uses a service-role key. The main Transactions/source listings, canonical edits, and every privileged or multi-table operation go through Go. Gmail, Qwen, raw sources, evidence links, OAuth tokens, worker jobs, Storage service credentials, and attachment signing are never browser-side concerns.
 
 ## Identity and OAuth
 
@@ -44,7 +44,7 @@ React POST /gmail/sync-runs
 
 Only one `queued` or `running` sync run is allowed per user. Jobs support `gmail_ingestion`, `source_parsing`, `reconciliation`, and `source_attachment_cleanup`, use exponential retry delay, and are claimed with `FOR UPDATE SKIP LOCKED`. Ordinary jobs have a maximum of five attempts; cleanup jobs retry in five-attempt bursts and enter a fifteen-minute cooldown between bursts until their exact objects are deleted. The worker records lease ownership and heartbeats/completes only its own lease. It does not hold a transaction while calling Gmail, Storage, or Qwen. A crashed worker’s expired lease can be reclaimed; an expired final cleanup lease requeues with the same durable payload while other final attempts become safely visible failures.
 
-Ingestion has its own completion timestamp. A run becomes terminal only after ingestion is complete and all child jobs are no longer queued/running. A terminal Gmail-ingestion failure sets the run to `failed`. Source-level terminal failures remain visible and can produce a completed run with a redacted error summary. The safe progress projection includes discovered messages, saved sources, parsed sources, failed sources, transactions created, sources linked, review count, dangling count, and lifecycle timestamps.
+Ingestion has its own completion timestamp. A run becomes terminal only after ingestion is complete and all child jobs are no longer queued/running. A terminal Gmail-ingestion failure sets the run to `failed`. Source-level terminal failures remain visible and can produce a completed run with a redacted error summary. The safe progress projection includes discovered messages, saved sources, parsed sources, failed sources, transactions created, sources linked, review count, dangling count, and lifecycle timestamps. Queued/running progress cannot be dismissed. A completed or failed banner can be dismissed using a local key scoped to the authenticated user UUID and sync-run UUID, so a dismissal neither crosses users nor suppresses the next run; an in-memory dismissal still works when browser storage is unavailable.
 
 ## Gmail ingestion and cursors
 
@@ -142,10 +142,10 @@ All monetary columns use `bigint` integer minor units. Timestamps use `timestamp
 | Table | Purpose and important fields |
 | --- | --- |
 | `public.transaction_categories` | Global, system-managed category catalogue: `parent_name`, `name`, `emoji`, `sort_order`, `active`. Authenticated users can select only. |
-| `public.transactions` | Canonical records: required owner/Account, `transaction_kind`, title/merchant, original amount/currency, optional SGD, time, optional category, `line_items` array, `details` object, review/confidence, `creation_method`, optional `user_modified_at`, and timestamps. Browser users can select only; Go performs writes. |
+| `public.transactions` | Canonical records: required owner/Account, `transaction_kind`, title/merchant, original amount/currency, optional SGD, time, optional category, `line_items` array, `details` object, review/confidence, `creation_method`, optional `user_modified_at`, and timestamps. Browser users can select and have column-scoped INSERT permission only for confirmed manual creation; Go performs edits and all other writes. |
 | `public.transaction_sync_runs` | Owner-safe async projection: lifecycle state/timestamps, ingestion-complete marker, message/source/progress/outcome counts, redacted error summary. Owner-select only and published to Supabase Realtime. |
 
-`public.transactions` references an active Account owned by the same user; a trigger also blocks inserts/Account changes to soft-deleted Accounts. `transaction_kind` stores only `debit` or `credit`, and amounts remain positive. Where a transaction is linked as an internal-transfer leg, database integrity checks protect the pair from being made a same-Account transfer.
+`public.transactions` references an active Account owned by the same user; a trigger also blocks inserts/Account changes to soft-deleted Accounts. A separate trigger rejects any supplied category that is missing or inactive. `transaction_kind` stores only `debit` or `credit`, and amounts remain positive. Where a transaction is linked as an internal-transfer leg, database integrity checks protect the pair from being made a same-Account transfer.
 
 ### Non-exposed private operational schema
 
@@ -171,9 +171,21 @@ Forward migration `20260902230002_add_durable_source_deletion.sql` adds the per-
 
 Forward migration `20260902230003_keep_source_cleanup_retrying.sql` adds cumulative cleanup-failure monitoring, recovers any prior terminal cleanup row, and changes the monitoring index without rewriting either applied predecessor. The worker must be deployed after this migration because its retry path writes the new column.
 
+Migration `20260903014725_allow_manual_transaction_inserts.sql` adds the browser manual-insert grant and policy, the active-category trigger, and database validators for transaction line items and details. It was created through the imperative Supabase migration workflow, passed hosted dry-run and exact rollback rehearsal, and is applied after `20260902230003` without rewriting prior history. Focused coverage lives in `supabase/tests/transactions_manual_insert.test.sql`; the existing transaction RLS test distinguishes the allowed manual insert from still-denied browser UPDATE/DELETE operations. Both pass as part of the nine hosted pgTAP suites.
+
+### Manual-entry extension inventory
+
+| Surface | Responsibility and current verification state |
+| --- | --- |
+| `ManualTransactionDialog.tsx`, `manualTransactionModel.ts`, and the Data REST client | Major-unit form validation, active reference choices, duplicate preflight, explicit confirmed insert, and returned-row parsing. Verified through focused frontend tests and authenticated-browser acceptance. |
+| `TransactionDetailDialog.tsx`, Go PATCH decoding, and the transaction store | Edit `merchant_name` and `user_notes` for every canonical creation method; merge the notes key without replacing other details. Verified through Go tests and an authenticated edit that preserved line-item details. |
+| `syncBannerDismissal.ts` and `TransactionsPage.tsx` | Per-user/per-run terminal Gmail-result dismissal while active progress remains non-dismissible. Verified through focused frontend tests and persisted authenticated-browser dismissal. |
+| `20260903014725_allow_manual_transaction_inserts.sql` | Least-privilege insert authorization, active-category enforcement, and JSON validation. Rehearsed, applied, present in migration history, and covered by passing pgTAP. |
+| `transactions_manual_insert.test.sql` and the adjusted transaction RLS test | Owner success plus authorization, immutable-column, Account/category, JSON/size, forged-provenance, anonymous, UPDATE, and DELETE denials. Passing as part of 228 assertions across nine suites. |
+
 ### Line-item JSON
 
-`transactions.line_items` is always a JSON array. The Go API and parser validate every item before save:
+`transactions.line_items` is always a JSON array with no more than 100 items and no more than 262,144 serialized bytes. The Go API and parser validate every item before save, and a database check applies the same v1 boundary to direct inserts:
 
 ```json
 {
@@ -189,7 +201,19 @@ Forward migration `20260902230003_keep_source_cleanup_retrying.sql` adds cumulat
 }
 ```
 
-The HTTP contract serializes all minor-unit values as decimal strings to avoid JavaScript precision loss; Postgres and Go use `bigint`/`int64`. `quantity` is a positive integer. Optional item amounts may be zero. `details` must be an object and is rendered as safe scalar/JSON content, never HTML.
+Every item must be an object containing only the v1 keys shown above: `schema_version`, `description`, `quantity`, `currency`, `details`, and the four optional amount keys. Version is exactly 1, description is nonblank and at most 250 characters, quantity is a positive integer within the Postgres `bigint` range, currency is three uppercase letters, and item `details` is an object. Optional item amounts may be zero and may arrive as Go-written JSON integer numbers, frontend-written decimal-integer strings, or JSON null; non-integer, negative, and out-of-`bigint` values fail validation.
+
+Transaction `details` must be an object whose serialized form is at most 16,384 bytes. Its optional `user_notes` value must be a string of at most 4,000 characters. The general check deliberately permits server-owned provenance keys, while browser-insert RLS permits no key except `user_notes`.
+
+HTTP responses serialize all minor-unit values as decimal strings to avoid JavaScript precision loss; Postgres and Go use `bigint`/`int64`. UI forms accept major-unit decimal strings and convert major ↔ minor values with string parsing and `BigInt`, never binary floating-point arithmetic. The current frontend also rejects a converted minor-unit value above `Number.MAX_SAFE_INTEGER` because Data REST may return Postgres numerics as JSON numbers; this is a browser transport limitation, not the database `bigint` limit. The Go storage decoder accepts both Go-written JSON integer amounts and browser-written bigint-safe decimal strings, canonicalizes them for the response contract, and preserves line-item details; this compatibility fix prevents browser-created items from disappearing on a later Go read or edit response.
+
+## Manual transaction creation through Data REST
+
+There is intentionally no Go manual-create route. React sends one `POST /rest/v1/transactions?select=...` request with the Supabase publishable key and the current user's bearer token, and requests `return=representation`. The payload includes only `user_id`, `account_id`, `transaction_kind`, `title`, `merchant_name`, `original_amount_minor`, `original_currency`, `sgd_amount_minor`, `occurred_at`, `category_id`, `line_items`, `details`, and an explicit `review_status = confirmed`. It omits `creation_method`, allowing the existing `manual` default to apply.
+
+The `authenticated` role receives INSERT only on those columns. It receives no INSERT grant for `id`, `creation_method`, `match_confidence`, `user_modified_at`, `created_at`, or `updated_at`, and still receives no table UPDATE or DELETE grant. The INSERT policy requires a non-null `auth.uid()` equal to `user_id`, `creation_method = 'manual'`, `review_status = 'confirmed'`, null match confidence, null `user_modified_at`, and `(details - 'user_notes') = '{}'::jsonb`. Existing ownership enforcement rejects a missing, deleted, or cross-owner Account, the category trigger rejects a missing/inactive category, and the JSON checks above validate browser-supplied line items and details. Because this path cannot write the private evidence junction, the created canonical row has no source evidence.
+
+Before posting, React uses the existing owner-RLS SELECT surface to query the same Account, transaction kind, exact original minor amount and currency, and `occurred_at` within ±10 minutes. Matches produce an advisory warning and a **Create anyway** path. This preflight is not a database uniqueness constraint and intentionally does not block an accepted duplicate or claim race-free deduplication.
 
 ## Go HTTP API
 
@@ -212,7 +236,7 @@ Every route except the OAuth callback requires the authenticated Supabase bearer
 | --- | --- |
 | `GET /v1/transactions` | Keyset-paginated records with Account/category labels, line items/details, source count, and transfer counterpart. Filters: `kind`, `review`, `account_id`, `search`, `limit` (1–100), `cursor`. |
 | `GET /v1/transactions/{id}/sources` | Active safe evidence summaries plus source-link IDs for one owned transaction. |
-| `PATCH /v1/transactions/{id}` | Edits only title, active Account, time, original amount/currency, optional SGD amount, optional category, and line items. |
+| `PATCH /v1/transactions/{id}` | Edits title, optional `merchant_name`, active Account, time, original amount/currency, optional SGD amount, optional category, line items, and optional `user_notes`. Notes are merged into `details`; null/blank removes only that key and preserves server-owned provenance. Every successful edit sets `user_modified_at`. |
 | `POST /v1/transactions/internal-transfers` | Atomically creates validated debit and credit legs plus their `internal_transfer` link; optional owned source IDs can support the outgoing leg, incoming leg, or both legs of that one pair. |
 | `GET /v1/transactions/sources` | Keyset-paginated `dangling`, `review`, or `failed` source summaries with parsed suggestions/reasons. Defaults to dangling. |
 | `GET /v1/transactions/sources/{id}/email` | Owner-scoped sanitized HTML/plain text. |
@@ -244,15 +268,16 @@ Transaction/source list cursors are versioned, scope-bound base64url values. Res
 The workspace navigation contains a Transactions section with two independent pages: the four-tab transaction workspace and `frontend/src/features/transactions/TransactionSettingsPage.tsx`.
 
 - Transactions supports title/merchant search, debit/credit and review filters, cursor “load more,” original/SGD display, Account/category labels, evidence counts, and transfer badges.
-- Sync startup restores the latest run. Active runs subscribe to owner-readable `transaction_sync_runs` changes and also poll every ten seconds when Realtime is ready or every three seconds when it is not. Monitoring pauses after 40 checks while server work continues and can be resumed.
+- **Add transaction** sits beside **Internal transfer** and opens a manual-entry dialog for any active owned Account. It validates debit/credit, required title/date/original money, optional merchant/SGD/category/notes, and at most 100 line items; runs the owner-scoped duplicate preflight; and inserts a confirmed row through Data REST after the user accepts any warning.
+- Sync startup restores the latest run. Active runs subscribe to owner-readable `transaction_sync_runs` changes and also poll every ten seconds when Realtime is ready or every three seconds when it is not. Monitoring pauses after 40 checks while server work continues and can be resumed. Queued/running banners are not dismissible; completed/failed banners can be dismissed and use a browser-local key scoped to the current user and run.
 - Source inspection loads sanitized email and private signed attachments, previews PDF/images, and supports Failed retry with a safe error summary or Review/Dangling attach/create resolution.
 - Source inspection exposes an explicit Debug panel with bounded latest-attempt previews and on-demand exact-field loading for the complete owner-only Qwen audit. A separate destructive-confirmation flow reports whether durable raw-source Storage cleanup is pending.
-- Transaction detail edits canonical fields and versioned line items, displays the transfer counterpart and active evidence, and uses a confirmation step before unmatch.
+- Transaction detail edits canonical fields and versioned line items, including merchant/payee and user notes for manual, source-created, and internal-transfer records. It displays the transfer counterpart and active evidence and uses a confirmation step before unmatch.
 - Internal-transfer creation collects and validates both legs before one Go request, including outgoing, incoming, or both-leg evidence selection.
 - Transaction Settings edits the default parser instructions, versioned sender/subject/content rules, and immutable Account matching keys. It explains prompt precedence, RE2/AND semantics, normalized values, and retire/reactivate behavior.
 - Dialogs trap focus, close with Escape, restore focus, and block background interaction. Tabs support arrow/Home/End keys, and the workspace has a mobile navigation drawer.
 
-The frontend reads owned Account options and global categories from Data REST with the publishable key plus user bearer token. The source-resolution candidate picker uses the existing RLS-protected Account transaction query; every source, attachment, OAuth, sync, reconciliation, mutation, and main list operation goes through Go.
+The frontend reads owned Account options and global categories from Data REST with the publishable key plus user bearer token. The source-resolution candidate picker and manual duplicate preflight use existing RLS-protected transaction reads. Manual transaction creation is the sole direct browser insert; every source, attachment, OAuth, sync, reconciliation, canonical edit, multi-row mutation, and main list operation goes through Go.
 
 ## Runtime configuration
 
@@ -285,7 +310,7 @@ The API and worker are separate processes and both need the backend environment.
 
 ## Security controls
 
-- `public.transaction_categories`, `public.transactions`, and `public.transaction_sync_runs` have RLS. Owner data uses `(select auth.uid()) = user_id`; authenticated browser grants are select-only for this feature.
+- `public.transaction_categories`, `public.transactions`, and `public.transaction_sync_runs` have RLS. Owner data uses `(select auth.uid()) = user_id`. Authenticated browser grants remain select-only except for the explicit column-level `transactions` INSERT grant used by confirmed manual creation; browser UPDATE/DELETE remain denied.
 - The `private` schema has no `anon`/`authenticated` grants. Its tables also enable RLS as defense in depth.
 - Browser roles are explicitly blocked from `transaction-attachments`; only Go’s server key can access the private bucket.
 - Source, transaction, Account, link, sync, and attachment paths are checked against the authenticated user before reads or writes.
@@ -294,13 +319,13 @@ The API and worker are separate processes and both need the backend environment.
 - Raw deletion is database-first and owner-scoped. A per-user coordination lock prevents races with Gmail ingestion; database cascades clear source jobs, attempts, and links; transaction provenance limits automatic cleanup to a never-edited `automatic_source` record with no remaining active evidence or transfer link. Exact Storage paths are committed as leased cleanup work before any external call, a one-way provider digest prevents reingestion of deliberately deleted evidence, and cleanup failures or expired final leases remain queued with monitored cooldown until success.
 - Automatic canonical creation takes the same stable per-user transaction lock and repeats Account/nearby-transaction reconciliation inside the write transaction. Two workers holding stale create decisions therefore converge on one transaction and two evidence links rather than creating duplicates.
 - The model never chooses user ownership. Gmail/provider content, HTML, filenames, parser output, category names, and cursor values are validated before use.
-- Transactions and internal-transfer legs can reference only active same-user Accounts. Transfer pair integrity is enforced in both Go and a deferred database trigger.
+- Transactions and internal-transfer legs can reference only active same-user Accounts. Any supplied transaction category must also be active. Transfer pair integrity is enforced in both Go and a deferred database trigger.
 - OAuth state is expiring/single-use, PKCE is required, refresh tokens are encrypted at rest by the application, and secrets/errors are not returned to the browser.
 - Public-table grants are explicit, so the feature does not depend on automatic Data API exposure behavior.
 
 ## Verification and release gate
 
-The repository contains focused Go tests for Auth, OAuth state/token storage, Gmail listing/history and parsing, attachment Storage/signing, ingestion idempotency, durable jobs/leases, parser-provider contracts, deterministic rules, semantic card corroboration, reconciliation races, HTTP validation, source actions, cleanup recovery, and SQL store behavior. It also contains pgTAP coverage for transaction schema/RLS/storage and the operational migrations.
+The repository contains focused Go tests for Auth, OAuth state/token storage, Gmail listing/history and parsing, attachment Storage/signing, ingestion idempotency, durable jobs/leases, parser-provider contracts, deterministic rules, semantic card corroboration, reconciliation races, HTTP validation, source actions, cleanup recovery, SQL store behavior, and browser-authored line-item decoding. All 228 pgTAP assertions across nine transaction suites pass, including the manual-insert grants, RLS, ownership, JSON, size, and immutability coverage.
 
 `backend/internal/transactione2e/harness_test.go` also provides a scoped, non-destructive live harness. It is disabled by default and claims only the newly created run. It normally requires exactly one active stored Gmail-connection owner. In development only, when no active connection exists and `GOOGLE_TEST_REFRESH_TOKEN` is configured, it may instead select exactly one distinct owner of an active Account and create a development-token-enabled run. Zero or multiple eligible owners fail closed; the token and selected UUID are never logged or persisted. Because the fallback deliberately creates no Gmail connection or cursor, a later fallback run repeats the bounded initial window; provider-message uniqueness keeps that replay idempotent. Run it only with reviewed hosted credentials and an intentionally labelled test message:
 
@@ -328,17 +353,18 @@ For a future release rerun, validate each migration with a hosted dry run and tr
 
 | Gate | Status |
 | --- | --- |
-| React/Go implementation and focused coverage | **Passed.** Go/frontend build and lint, Go race checks, and integration coverage passed in the completed verification runs. |
-| Hosted migration rehearsal/application/history | **Passed.** `20260902230003_keep_source_cleanup_retrying.sql` passed dry run and transaction-wrapped rollback rehearsal, is applied after `20260902230002`, and local/remote histories match through `20260902230003`. No local Supabase or Docker instance was used. |
-| Hosted database validation | **Passed.** Database lint reports no schema errors; all 189 pgTAP assertions pass and roll back their fixtures, including 28 source-deletion and 9 cleanup-recovery assertions. |
+| Go implementation and focused coverage | **Passed.** The full Go test suite, race suite, vet, and API/worker builds pass, including browser-authored line-item decoding and details-preserving merchant/notes edits. |
+| Frontend implementation and focused coverage | **Passed.** Frontend lint and production build pass, along with all 10 focused tests. |
+| Hosted migration rehearsal/application/history | **Passed.** `20260903014725_allow_manual_transaction_inserts.sql` passed a hosted dry run and exact transaction-wrapped rollback rehearsal, was applied after `20260902230003`, and local/remote migration histories match. No local Supabase or Docker instance was used. |
+| Hosted database validation | **Passed.** All 228 pgTAP assertions across nine suites pass, including manual-insert grants, RLS, ownership, active Account/category enforcement, JSON and size constraints, and browser UPDATE/DELETE denial. |
 | Hosted Go store integration | **Passed.** The race-enabled transaction-store integration suite passes through the configured transaction pooler, including serialized concurrent create decisions, deletion staging/tombstones, non-terminal cleanup retry and expired-lease recovery, source reingestion prevention, and bounded/exact Debug behavior. |
 | Live Gmail → private Storage ingestion | **Passed.** The initial scoped run fetched and stored five unique `odin-finance` sources, including one private attachment. |
-| Live Qwen parsing and reconciliation | **Baseline passed; current targeted check awaiting explicit approval.** Earlier `qwen3.8-flash` checks reached the provider with thinking disabled and reconciled the five-source backfill. The exact FairPrice invalid-category response is now covered by a worker regression: optional category/citation is discarded while semantically corroborated masked-card evidence `Mastercard (**** 2562)` remains; a bare or conflicting four-digit value is demoted, and required or other populated-field citation failures still fail. A fresh retained-source call is not claimed until outbound-data approval is granted. |
+| Live Qwen parsing and reconciliation | **Not exercised in this final verification.** Parser, citation, invalid-category discard, and semantic card-corroboration behavior remain covered by automated tests; no fresh provider call is claimed. |
 | Idempotent replay | **Passed.** Repeating the same five-message run created zero duplicate sources. |
 | Five-minute signed attachment access | **Passed.** A live ranged download through the signed URL succeeded within its five-minute lifetime. |
 | Hosted anonymous/private-schema denial | **Passed for the exercised surfaces.** Anonymous REST requests to Transactions and sync data returned `401`; requesting the private source schema returned `406`. |
 | Signed-out browser, mobile, and accessibility controls | **Passed.** Desktop and mobile signed-out views and accessibility controls were exercised with no console warnings. |
-| Authenticated browser workflow | **Passed for read-only acceptance paths.** Using the existing owner session, desktop and mobile navigation reached the independent Transaction Settings page; Account options, the active Citi `2562` matching key, Failed source inspection, sanitized email rendering, and the three-attempt Debug audit loaded without console errors or warnings. Destructive and configuration-save controls were deliberately not invoked during this read-only pass. |
+| Authenticated browser workflow | **Passed.** The terminal Gmail banner was dismissible and its dismissal persisted for that user/run. Direct authenticated Supabase creation accepted major-unit input and a line item, returned an immediately confirmed manual transaction with zero evidence, showed the exact advisory duplicate warning, and allowed **Create anyway**. The Go edit path updated merchant and `user_notes` while preserving line-item details. All three synthetic transaction rows and their associated links were removed after acceptance. |
 | Cross-user source/transaction/sync/attachment denial | **Passed in automated RLS/owner tests; live second-user attempt unavailable.** The hosted project has only one user, so no live cross-user claim is made. |
 
-The implementation is release-ready on the completed automated, hosted-schema, authenticated-browser, and prior provider evidence above, subject to the explicitly identified current-source approval and the unavailable live second-user check. Neither is implied as a pass.
+The manual-entry extension's recorded release gates are complete. The unavailable live second-user check remains covered by automated ownership and RLS tests, and Qwen was not exercised in this final verification.
