@@ -11,7 +11,8 @@ Accounts owns a user-owned account directory. It does not calculate balances, cu
 - The application restores the Supabase session at startup and listens for auth-state changes.
 - Unauthenticated users see sign-in; no registration UI is rendered.
 - The Accounts page queries, inserts, and updates `accounts` directly.
-- Account rows are grouped by side and can expand to display metadata as safe text.
+- Account rows are grouped by side. The complete header surface—icon, text, and whitespace—toggles expansion, while header action buttons remain independent and the expanded detail region does not toggle the row.
+- The Account Add/Edit popup handles Escape as a close action only while no save is in progress.
 - The visible sort options are name A–Z and Z–A. `sort_order` remains an internal stable database value and is not editable in the UI.
 - Other sidebar features are outside the Accounts boundary; Transactions is implemented and documented separately.
 

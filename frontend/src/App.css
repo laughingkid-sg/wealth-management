@@ -1528,6 +1528,11 @@ footer {
   align-items: center;
   gap: 14px;
   padding: 17px 22px;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+.account-row-main:hover {
+  background: #fbfaf9;
 }
 .account-row.expanded .account-row-main {
   border-bottom: 1px solid var(--border);

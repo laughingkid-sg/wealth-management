@@ -43,6 +43,7 @@ import {
   type AccountDraft,
   type MetadataEntry,
 } from "./features/accounts/validation";
+import { shouldDismissAccountForm } from "./features/accounts/interactions";
 import { isSupabaseConfigured, supabase } from "./lib/supabase";
 import "./App.css";
 
@@ -195,6 +196,16 @@ function AccountForm({
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [requestError, setRequestError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
+  useEffect(() => {
+    const handleEscape = (event: KeyboardEvent) => {
+      if (!shouldDismissAccountForm(event.key, savingRef.current)) return;
+      event.preventDefault();
+      close();
+    };
+    document.addEventListener("keydown", handleEscape);
+    return () => document.removeEventListener("keydown", handleEscape);
+  }, [close]);
   const changeMetadata = (
     index: number,
     field: keyof MetadataEntry,
@@ -208,9 +219,11 @@ function AccountForm({
     }));
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (savingRef.current) return;
     const fieldErrors = validateAccountDraft(draft);
     setErrors(fieldErrors);
     if (Object.keys(fieldErrors).length) return;
+    savingRef.current = true;
     setSaving(true);
     setRequestError(null);
     const values = {
@@ -223,19 +236,27 @@ function AccountForm({
       metadata: buildMetadata(draft.metadataEntries),
       sort_order: draft.sort_order,
     };
-    const response = account
-      ? await supabase.from("accounts").update(values).eq("id", account.id)
-      : await supabase.from("accounts").insert({
-          ...values,
-          user_id: (await supabase.auth.getUser()).data.user?.id ?? "",
-        });
-    setSaving(false);
-    if (response.error) {
-      setRequestError(response.error.message);
-      return;
+    let savedSuccessfully = false;
+    try {
+      const response = account
+        ? await supabase.from("accounts").update(values).eq("id", account.id)
+        : await supabase.from("accounts").insert({
+            ...values,
+            user_id: (await supabase.auth.getUser()).data.user?.id ?? "",
+          });
+      if (response.error) {
+        setRequestError(response.error.message);
+        return;
+      }
+      await saved();
+      savedSuccessfully = true;
+    } catch (error: unknown) {
+      setRequestError(error instanceof Error ? error.message : "Couldn’t save this account.");
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
     }
-    await saved();
-    close();
+    if (savedSuccessfully) close();
   }
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={close}>
@@ -257,6 +278,7 @@ function AccountForm({
             className="icon-button"
             onClick={close}
             aria-label="Close account form"
+            type="button"
           >
             <X size={20} />
           </button>
@@ -759,7 +781,14 @@ function AccountsPage({
                 className={`account-row${isExpanded ? " expanded" : ""}`}
                 key={account.id}
               >
-                <div className="account-row-main">
+                <div
+                  className="account-row-main"
+                  onClick={(event) => {
+                    const target = event.target;
+                    if (target instanceof Element && target.closest("button")) return;
+                    toggleExpanded(account.id);
+                  }}
+                >
                   <div className={`account-mark ${account.side}`}>
                     {account.name.slice(0, 1).toUpperCase()}
                   </div>
