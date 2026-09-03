@@ -1849,8 +1849,12 @@ footer {
 .matching-key-form {
   display: grid;
   grid-template-columns: minmax(180px, 1.3fr) minmax(160px, 1fr) minmax(180px, 1.2fr) auto;
-  align-items: end;
+  align-items: start;
   gap: 12px;
+}
+.matching-key-form > .button {
+  align-self: start;
+  margin-top: 33px;
 }
 .settings-caution {
   margin: 0;
@@ -2255,6 +2259,9 @@ footer {
   .matching-key-form,
   .settings-form-grid {
     grid-template-columns: 1fr;
+  }
+  .matching-key-form > .button {
+    margin-top: 0;
   }
   .settings-grid-wide {
     grid-column: 1;
