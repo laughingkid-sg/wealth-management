@@ -56,6 +56,49 @@ func TestSanitizeAccountEvidenceForMatchingRequiresOneContextualCardSuffix(t *te
 	}
 }
 
+func TestSanitizeAccountEvidenceForMatchingAcceptsBoundedSixDigitAmexEnding(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		source      string
+		wantCard    string
+		wantAudited bool
+	}{
+		{name: "six digit card ending", source: "Card ending: 721001", wantCard: "1001"},
+		{name: "six unlabelled digits", source: "Reference: 721001", wantAudited: true},
+		{name: "contradictory last four label", source: "Card last four: 721001", wantAudited: true},
+		{name: "different final four", source: "Card ending: 729876", wantAudited: true},
+		{name: "conflicting card endings", source: "Card ending: 721001; Card ending: 729876", wantAudited: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			evidence := SanitizeAccountEvidenceForMatching(AccountEvidence{CardLastFour: "1001"}, test.source)
+			if evidence.CardLastFour != test.wantCard {
+				t.Fatalf("card_last_four = %q, want %q", evidence.CardLastFour, test.wantCard)
+			}
+			audited := len(evidence.AdditionalIdentifiers) == 1 && evidence.AdditionalIdentifiers[0] == "1001"
+			if audited != test.wantAudited {
+				t.Fatalf("additional identifiers = %#v, want audited=%t", evidence.AdditionalIdentifiers, test.wantAudited)
+			}
+		})
+	}
+}
+
+func TestAmexCompactAlertIsEligibleAfterAccountSanitization(t *testing.T) {
+	candidate := Candidate{
+		AccountEvidence:     AccountEvidence{CardLastFour: "1001"},
+		OriginalAmountMinor: 700,
+		OriginalCurrency:    "SGD",
+		MerchantName:        "SUSHI EXPRESS AMK",
+	}
+	source := "A transaction of SGD7 has been approved on your American Express Card ending: 721001 at SUSHI EXPRESS AMK."
+	candidate.AccountEvidence = SanitizeAccountEvidenceForMatching(candidate.AccountEvidence, source)
+	if candidate.AccountEvidence.CardLastFour != "1001" {
+		t.Fatalf("card_last_four = %q, want 1001", candidate.AccountEvidence.CardLastFour)
+	}
+	if !DeriveAutoEligibility(candidate, source) {
+		t.Fatal("Amex compact alert was not eligible after account sanitization")
+	}
+}
+
 func TestReconcileBlocksAutomaticCreationWhenIneligible(t *testing.T) {
 	candidate := validCandidate(time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC))
 	candidate.AccountEvidence.CardLastFour = "1234"
@@ -98,5 +141,59 @@ func TestDeriveAutoEligibilityUsesISOMinorUnitsAndGroupedAmounts(t *testing.T) {
 		if !DeriveAutoEligibility(test.candidate, test.source) {
 			t.Fatalf("corroboration rejected %q", test.source)
 		}
+	}
+}
+
+func TestHasQualifiedAmountAcceptsOmittedTrailingFractionalZeroes(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		minor  int64
+		code   string
+		source string
+	}{
+		{name: "compact ISO whole", minor: 700, code: "SGD", source: "Paid SGD7"},
+		{name: "spaced ISO whole", minor: 700, code: "SGD", source: "Paid SGD 7"},
+		{name: "one decimal", minor: 700, code: "SGD", source: "Paid SGD7.0"},
+		{name: "canonical decimals", minor: 700, code: "SGD", source: "Paid SGD 7.00"},
+		{name: "currency after amount", minor: 700, code: "SGD", source: "Paid 7 SGD"},
+		{name: "symbol whole", minor: 700, code: "SGD", source: "Paid S$7"},
+		{name: "trailing sentence punctuation", minor: 700, code: "SGD", source: "Paid SGD7, at the counter"},
+		{name: "leading sentence punctuation", minor: 700, code: "SGD", source: "Paid (7 SGD)"},
+		{name: "grouped whole", minor: 123400, code: "SGD", source: "Paid SGD 1,234"},
+		{name: "zero decimal currency", minor: 700, code: "JPY", source: "Paid JPY700"},
+		{name: "three decimals omit one zero", minor: 6480, code: "KWD", source: "Paid KWD6.48"},
+		{name: "three decimals omit all zeroes", minor: 7000, code: "KWD", source: "Paid KWD 7"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if !hasQualifiedAmount(test.minor, test.code, test.source) {
+				t.Fatalf("hasQualifiedAmount(%d, %q, %q) = false", test.minor, test.code, test.source)
+			}
+		})
+	}
+}
+
+func TestHasQualifiedAmountRejectsDifferentNumericAmounts(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		minor  int64
+		code   string
+		source string
+	}{
+		{name: "extra whole digit", minor: 700, code: "SGD", source: "Paid SGD70"},
+		{name: "different fractional amount", minor: 700, code: "SGD", source: "Paid SGD7.01"},
+		{name: "grouped larger amount", minor: 700, code: "SGD", source: "Paid SGD7,000"},
+		{name: "alphabetic suffix", minor: 700, code: "SGD", source: "Paid SGD7abc"},
+		{name: "alphabetic prefix", minor: 700, code: "SGD", source: "Paid abc7 SGD"},
+		{name: "nonzero fractional digit omitted", minor: 701, code: "SGD", source: "Paid SGD7"},
+		{name: "zero decimal rejects fraction", minor: 700, code: "JPY", source: "Paid JPY700.0"},
+		{name: "three decimal nonzero digit omitted", minor: 6481, code: "KWD", source: "Paid KWD6.48"},
+		{name: "ambiguous dollar symbol", minor: 700, code: "SGD", source: "Paid $7"},
+		{name: "different safe symbol", minor: 700, code: "SGD", source: "Paid US$7"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if hasQualifiedAmount(test.minor, test.code, test.source) {
+				t.Fatalf("hasQualifiedAmount(%d, %q, %q) = true", test.minor, test.code, test.source)
+			}
+		})
 	}
 }
