@@ -17,8 +17,8 @@ Accounts is a user-owned directory only. It stores descriptive identity and meta
 - Required account name and institution/platform.
 - Optional account identification, notes, and user-defined key/value metadata.
 - Fixed account types:
-  - Assets: Bank Account, Brokerage, Digital Wallet, Crypto Wallet, Crypto Exchange, RSU.
-  - Liabilities: Credit Card, Personal Loan.
+  - Assets: Bank Account, Brokerage, Digital Wallet, Crypto Wallet, Crypto Exchange, RSU, Robo Advisors, Retirement Account, Others.
+  - Liabilities: Credit Card, Personal Loan, Others.
 - A responsive Accounts page with a sidebar, top bar, loading, empty, no-results, validation, and request-error states.
 
 ### Not included
