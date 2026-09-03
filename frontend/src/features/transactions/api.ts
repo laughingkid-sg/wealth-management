@@ -6,11 +6,18 @@ import type {
   DefaultParserInstructions,
   ExactSourceDebugField,
   GmailConnection,
+  GlobalSourceParserRule,
+  GlobalSourceParserRuleInput,
+  GlobalTransactionSettings,
   InternalTransferInput,
   JsonValue,
   ManualTransactionInput,
   MinorUnitAmount,
   OwnedAccountOption,
+  PromptPreviewInput,
+  PromptPreviewResult,
+  PromptPreviewSource,
+  QwenPromptPreviewRequest,
   SourceAttachment,
   SourceParserRule,
   SourceParserRuleInput,
@@ -33,6 +40,10 @@ import type {
   TransactionSyncRun,
 } from "./model";
 import { isISO4217Currency } from "./model";
+import {
+  assertPromptPreviewSourceRelationship,
+  parseQwenPromptPreviewRequest,
+} from "./promptPreviewModel";
 import {
   buildManualDuplicatePreflightParams,
   buildManualTransactionInsertPayload,
@@ -545,6 +556,115 @@ export function parseTransactionSettings(value: unknown): TransactionSettings {
     matching_keys: settings.matching_keys.map((item, index) =>
       parseAccountMatchingKey(item, `transaction_settings.matching_keys[${index}]`),
     ),
+  };
+}
+
+function parseGlobalSourceParserRule(
+  value: unknown,
+  field = "global_source_rule",
+): GlobalSourceParserRule {
+  const item = requiredRecord(value, field);
+  return {
+    id: requiredString(item.id, `${field}.id`),
+    name: requiredString(item.name, `${field}.name`),
+    provider: enumValue(item.provider, ["gmail"], `${field}.provider`),
+    sender_matcher: optionalString(item.sender_matcher, `${field}.sender_matcher`),
+    content_matcher: optionalString(item.content_matcher, `${field}.content_matcher`),
+    prompt_fragment: stringValue(item.prompt_fragment, `${field}.prompt_fragment`),
+    extraction_config: jsonObject(item.extraction_config, `${field}.extraction_config`),
+    version: requiredInteger(item.version, `${field}.version`, 1),
+    priority: requiredInt32(item.priority, `${field}.priority`),
+    active: requiredBoolean(item.active, `${field}.active`),
+    updated_by_user_id: optionalString(
+      item.updated_by_user_id,
+      `${field}.updated_by_user_id`,
+    ),
+    created_at: requiredDate(item.created_at, `${field}.created_at`),
+    updated_at: requiredDate(item.updated_at, `${field}.updated_at`),
+  };
+}
+
+export function parseGlobalTransactionSettings(value: unknown): GlobalTransactionSettings {
+  const settings = requiredRecord(unwrapData(value), "global_transaction_settings");
+  if (!Array.isArray(settings.rules)) {
+    contractError("global_transaction_settings.rules must be an array");
+  }
+  return {
+    rules: settings.rules.map((item, index) =>
+      parseGlobalSourceParserRule(item, `global_transaction_settings.rules[${index}]`),
+    ),
+  };
+}
+
+function parsePromptPreviewSource(
+  value: unknown,
+  field = "prompt_preview_source",
+): PromptPreviewSource {
+  const item = requiredRecord(value, field);
+  return {
+    id: requiredString(item.id, `${field}.id`),
+    subject: optionalString(item.subject, `${field}.subject`),
+    sender: optionalString(item.sender, `${field}.sender`),
+    received_at: requiredDate(item.received_at, `${field}.received_at`),
+    parse_status: enumValue<SourceStatus>(
+      item.parse_status,
+      ["pending", "parsing", "parsed", "review_required", "dangling", "failed"],
+      `${field}.parse_status`,
+    ),
+  };
+}
+
+export function parsePromptPreviewSources(value: unknown): PromptPreviewSource[] {
+  const response = requiredRecord(unwrapData(value), "prompt_preview_sources");
+  if (!Array.isArray(response.sources)) {
+    contractError("prompt_preview_sources.sources must be an array");
+  }
+  return response.sources.map((item, index) =>
+    parsePromptPreviewSource(item, `prompt_preview_sources.sources[${index}]`),
+  );
+}
+
+export function parsePromptPreviewResult(value: unknown): PromptPreviewResult {
+  const preview = requiredRecord(unwrapData(value), "prompt_preview");
+  const mode = enumValue(preview.mode, ["manual", "automatic"], "prompt_preview.mode");
+  const assembledSystemPrompt = stringValue(
+    preview.assembled_system_prompt,
+    "prompt_preview.assembled_system_prompt",
+  );
+  if (!("selected_source" in preview)) {
+    contractError("prompt_preview.selected_source is required");
+  }
+  const selectedSource = preview.selected_source;
+  const parsedSelectedSource =
+    selectedSource === undefined || selectedSource === null
+      ? null
+      : parsePromptPreviewSource(selectedSource, "prompt_preview.selected_source");
+  try {
+    assertPromptPreviewSourceRelationship(mode, parsedSelectedSource);
+  } catch (error: unknown) {
+    contractError(
+      `prompt_preview.${error instanceof Error ? error.message : "selected_source is invalid"}`,
+    );
+  }
+  let providerRequest: QwenPromptPreviewRequest;
+  try {
+    providerRequest = parseQwenPromptPreviewRequest(
+      preview.provider_request,
+      assembledSystemPrompt,
+    );
+  } catch (error: unknown) {
+    contractError(error instanceof Error ? error.message : "provider_request is invalid");
+  }
+  return {
+    mode,
+    assembled_system_prompt: assembledSystemPrompt,
+    prompt_components: jsonObject(
+      preview.prompt_components,
+      "prompt_preview.prompt_components",
+    ),
+    provider_request: providerRequest,
+    selected_source: parsedSelectedSource,
+    selection: jsonObject(preview.selection, "prompt_preview.selection"),
   };
 }
 
@@ -1106,6 +1226,75 @@ export async function getTransactionSettings(
 ): Promise<TransactionSettings> {
   return parseTransactionSettings(
     await request(session, "/v1/transactions/settings", { signal }),
+  );
+}
+
+export async function getGlobalTransactionSettings(
+  session: Session,
+  signal?: AbortSignal,
+): Promise<GlobalTransactionSettings> {
+  return parseGlobalTransactionSettings(
+    await request(session, "/v1/transactions/global-settings", { signal }),
+  );
+}
+
+export async function createGlobalSourceParserRule(
+  session: Session,
+  input: GlobalSourceParserRuleInput,
+): Promise<GlobalSourceParserRule> {
+  return parseGlobalSourceParserRule(
+    unwrapData(
+      await request(session, "/v1/transactions/global-settings/source-rules", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(input),
+      }),
+    ),
+  );
+}
+
+export async function updateGlobalSourceParserRule(
+  session: Session,
+  ruleId: string,
+  expectedVersion: number,
+  input: GlobalSourceParserRuleInput,
+): Promise<GlobalSourceParserRule> {
+  return parseGlobalSourceParserRule(
+    unwrapData(
+      await request(
+        session,
+        `/v1/transactions/global-settings/source-rules/${encodeURIComponent(ruleId)}`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ...input, expected_version: expectedVersion }),
+        },
+      ),
+    ),
+  );
+}
+
+export async function listPromptPreviewSources(
+  session: Session,
+  signal?: AbortSignal,
+): Promise<PromptPreviewSource[]> {
+  return parsePromptPreviewSources(
+    await request(session, "/v1/transactions/prompt-preview/sources", { signal }),
+  );
+}
+
+export async function buildPromptPreview(
+  session: Session,
+  input: PromptPreviewInput,
+  signal?: AbortSignal,
+): Promise<PromptPreviewResult> {
+  return parsePromptPreviewResult(
+    await request(session, "/v1/transactions/prompt-preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input),
+      signal,
+    }),
   );
 }
 

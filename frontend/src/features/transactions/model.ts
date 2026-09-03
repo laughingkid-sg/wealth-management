@@ -225,6 +225,96 @@ export interface TransactionSettings {
   matching_keys: AccountMatchingKey[];
 }
 
+export interface GlobalSourceParserRule {
+  id: string;
+  name: string;
+  provider: "gmail";
+  sender_matcher: string | null;
+  content_matcher: string | null;
+  prompt_fragment: string;
+  extraction_config: { [key: string]: JsonValue };
+  version: number;
+  priority: number;
+  active: boolean;
+  updated_by_user_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface GlobalTransactionSettings {
+  rules: GlobalSourceParserRule[];
+}
+
+export interface GlobalSourceParserRuleInput {
+  name: string;
+  provider: "gmail";
+  sender_matcher: string | null;
+  content_matcher: string | null;
+  prompt_fragment: string;
+  priority: number;
+  active: boolean;
+}
+
+export interface PromptPreviewSource {
+  id: string;
+  subject: string | null;
+  sender: string | null;
+  received_at: string;
+  parse_status: SourceStatus;
+}
+
+export type PromptPreviewMode = "manual" | "automatic";
+
+export interface ManualPromptPreviewInput {
+  mode: "manual";
+  global_rule_id?: string;
+  include_user_default: boolean;
+  user_rule_id?: string;
+}
+
+export interface AutomaticPromptPreviewInput {
+  mode: "automatic";
+  data_source_id: string;
+}
+
+export type PromptPreviewInput = ManualPromptPreviewInput | AutomaticPromptPreviewInput;
+
+export interface QwenPromptPreviewTextPart {
+  type: "text";
+  text: "<EMAIL CONTENT OMITTED FROM PREVIEW>";
+}
+
+export interface QwenPromptPreviewImagePart {
+  type: "image_url";
+  image_url: {
+    url: "<ELIGIBLE RECEIPT OR INVOICE IMAGE OMITTED FROM PREVIEW>";
+  };
+}
+
+export interface QwenPromptPreviewRequest {
+  model: "qwen3.8-flash";
+  messages: [
+    { role: "system"; content: string },
+    {
+      role: "user";
+      content: [QwenPromptPreviewTextPart] | [QwenPromptPreviewTextPart, QwenPromptPreviewImagePart];
+    },
+  ];
+  response_format: {
+    type: "json_object";
+  };
+  enable_thinking: false;
+}
+
+export interface PromptPreviewResult {
+  mode: PromptPreviewMode;
+  assembled_system_prompt: string;
+  prompt_components: { [key: string]: JsonValue };
+  provider_request: QwenPromptPreviewRequest;
+  selected_source: PromptPreviewSource | null;
+  selection: { [key: string]: JsonValue } | null;
+}
+
 export interface DefaultParserInstructions {
   default_instructions: string;
   default_instructions_version: number;

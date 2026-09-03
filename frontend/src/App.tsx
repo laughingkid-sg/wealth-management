@@ -10,6 +10,8 @@ import {
   CircleHelp,
   Eye,
   EyeOff,
+  FileSearch,
+  Globe2,
   Landmark,
   LayoutDashboard,
   LogOut,
@@ -54,8 +56,23 @@ const TransactionSettingsPage = lazy(() =>
     ({ TransactionSettingsPage: Page }) => ({ default: Page }),
   ),
 );
+const GlobalTransactionSettingsPage = lazy(() =>
+  import("./features/transactions/GlobalTransactionSettingsPage").then(
+    ({ GlobalTransactionSettingsPage: Page }) => ({ default: Page }),
+  ),
+);
+const PromptPreviewPage = lazy(() =>
+  import("./features/transactions/PromptPreviewPage").then(
+    ({ PromptPreviewPage: Page }) => ({ default: Page }),
+  ),
+);
 
-type WorkspacePage = "accounts" | "transactions" | "transaction-settings";
+type WorkspacePage =
+  | "accounts"
+  | "transactions"
+  | "transaction-settings"
+  | "transaction-global-settings"
+  | "transaction-prompt-preview";
 
 const newDraft = (): AccountDraft => ({
   side: "asset",
@@ -449,6 +466,8 @@ const navigation = [
 const transactionNavigation = [
   { label: "Transactions", icon: ArrowLeftRight, page: "transactions" as const },
   { label: "Settings", icon: SlidersHorizontal, page: "transaction-settings" as const },
+  { label: "Global Settings", icon: Globe2, page: "transaction-global-settings" as const },
+  { label: "Prompt Preview", icon: FileSearch, page: "transaction-prompt-preview" as const },
 ];
 
 function SideNav({
@@ -871,7 +890,10 @@ function AccountsPage({
           </div>
         </header>
         <main className="app-shell">
-          {activePage === "transactions" || activePage === "transaction-settings" ? (
+          {activePage === "transactions" ||
+          activePage === "transaction-settings" ||
+          activePage === "transaction-global-settings" ||
+          activePage === "transaction-prompt-preview" ? (
             <Suspense
               fallback={(
                 <section aria-busy="true" aria-label="Loading transaction workspace" className="transaction-panel" role="status">
@@ -882,10 +904,13 @@ function AccountsPage({
                 </section>
               )}
             >
-              {activePage === "transactions" ? (
-                <TransactionsPage session={session} />
-              ) : (
-                <TransactionSettingsPage session={session} />
+              {activePage === "transactions" && <TransactionsPage session={session} />}
+              {activePage === "transaction-settings" && <TransactionSettingsPage session={session} />}
+              {activePage === "transaction-global-settings" && (
+                <GlobalTransactionSettingsPage session={session} />
+              )}
+              {activePage === "transaction-prompt-preview" && (
+                <PromptPreviewPage session={session} />
               )}
             </Suspense>
           ) : (
@@ -1080,7 +1105,12 @@ function workspacePageFromLocation(): WorkspacePage {
   const parameters = new URL(window.location.href).searchParams;
   if (parameters.get("gmail")) return "transactions";
   const page = parameters.get("page");
-  if (page === "transactions" || page === "transaction-settings") return page;
+  if (
+    page === "transactions" ||
+    page === "transaction-settings" ||
+    page === "transaction-global-settings" ||
+    page === "transaction-prompt-preview"
+  ) return page;
   return "accounts";
 }
 
