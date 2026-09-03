@@ -78,12 +78,16 @@ select results_eq(
   'an authenticated user reads only their own sync runs'
 );
 
-select throws_ok(
-  $$insert into public.transactions (user_id, account_id, transaction_kind, title, original_amount_minor, original_currency, occurred_at)
-    values ('11111111-1111-1111-1111-111111111111', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'debit', 'Direct browser write', 1, 'SGD', now())$$,
-  '42501',
-  null,
-  'authenticated users cannot write canonical transactions directly'
+select lives_ok(
+  $$insert into public.transactions (
+      user_id, account_id, transaction_kind, title,
+      original_amount_minor, original_currency, occurred_at, review_status
+    ) values (
+      '11111111-1111-1111-1111-111111111111',
+      'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+      'debit', 'Direct browser manual transaction', 1, 'SGD', now(), 'confirmed'
+    )$$,
+  'authenticated users can insert confirmed manual transactions they own'
 );
 
 select throws_ok(
