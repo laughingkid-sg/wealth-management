@@ -31,6 +31,8 @@ import {
   formatAmount,
   formatDateTime,
   isISO4217Currency,
+  majorAmountToMinor,
+  minorAmountToMajor,
   toDateTimeLocal,
   toRFC3339,
   type OwnedAccountOption,
@@ -57,12 +59,20 @@ export function TransactionDetailDialog({
   saved: (message: string) => void;
 }) {
   const [title, setTitle] = useState(transaction.title);
+  const [merchantName, setMerchantName] = useState(transaction.merchant_name ?? "");
   const [accountId, setAccountId] = useState(transaction.account_id);
   const [occurredAt, setOccurredAt] = useState(toDateTimeLocal(transaction.occurred_at));
-  const [originalAmount, setOriginalAmount] = useState(transaction.original_amount_minor);
+  const [originalAmount, setOriginalAmount] = useState(
+    minorAmountToMajor(transaction.original_amount_minor, transaction.original_currency),
+  );
   const [originalCurrency, setOriginalCurrency] = useState(transaction.original_currency);
-  const [sgdAmount, setSgdAmount] = useState(transaction.sgd_amount_minor ?? "");
+  const [sgdAmount, setSgdAmount] = useState(
+    transaction.sgd_amount_minor
+      ? minorAmountToMajor(transaction.sgd_amount_minor, "SGD")
+      : "",
+  );
   const [categoryId, setCategoryId] = useState(transaction.category_id ?? "");
+  const [userNotes, setUserNotes] = useState(transaction.user_notes ?? "");
   const [lineItems, setLineItems] = useState<LineItemDraft[]>(
     lineItemsToDrafts(transaction.line_items),
   );
@@ -151,6 +161,7 @@ export function TransactionDetailDialog({
     event.preventDefault();
     setFormError(null);
     const normalizedTitle = title.trim();
+    const normalizedMerchantName = merchantName.trim();
     const normalizedCurrency = originalCurrency.trim().toUpperCase();
     const timestamp = toRFC3339(occurredAt);
     const parsedLines = parseLineItemDrafts(lineItems);
@@ -166,10 +177,6 @@ export function TransactionDetailDialog({
       setFormError("Enter a valid transaction date and time.");
       return;
     }
-    if (!/^\d+$/.test(originalAmount) || BigInt(originalAmount) === 0n) {
-      setFormError("Original amount must be a positive minor-unit integer.");
-      return;
-    }
     if (!isISO4217Currency(normalizedCurrency)) {
       setFormError("Original currency must be an ISO 4217 code.");
       return;
@@ -178,9 +185,32 @@ export function TransactionDetailDialog({
       setFormError("Choose an active category or leave the transaction uncategorized.");
       return;
     }
-    if (sgdAmount && (!/^\d+$/.test(sgdAmount) || BigInt(sgdAmount) === 0n)) {
-      setFormError("SGD amount must be empty or a positive minor-unit integer.");
+    if (normalizedMerchantName.length > 250) {
+      setFormError("Merchant or payee must contain at most 250 characters.");
       return;
+    }
+    const normalizedUserNotes = userNotes.trim();
+    if ([...normalizedUserNotes].length > 4000) {
+      setFormError("User notes must contain at most 4,000 characters.");
+      return;
+    }
+    let originalAmountMinor: string;
+    try {
+      originalAmountMinor = majorAmountToMinor(originalAmount, normalizedCurrency);
+    } catch (error) {
+      setFormError(`Original amount: ${error instanceof Error ? error.message : "Enter a valid amount."}`);
+      return;
+    }
+    let sgdAmountMinor: string | null = null;
+    if (normalizedCurrency === "SGD") {
+      sgdAmountMinor = originalAmountMinor;
+    } else if (sgdAmount.trim()) {
+      try {
+        sgdAmountMinor = majorAmountToMinor(sgdAmount, "SGD");
+      } catch (error) {
+        setFormError(`SGD amount: ${error instanceof Error ? error.message : "Enter a valid amount."}`);
+        return;
+      }
     }
     if (parsedLines.error) {
       setFormError(parsedLines.error);
@@ -190,13 +220,15 @@ export function TransactionDetailDialog({
     try {
       await patchTransaction(session, transaction.id, {
         title: normalizedTitle,
+        merchant_name: normalizedMerchantName || null,
         account_id: accountId,
         occurred_at: timestamp,
-        original_amount_minor: originalAmount,
+        original_amount_minor: originalAmountMinor,
         original_currency: normalizedCurrency,
-        sgd_amount_minor: sgdAmount || null,
+        sgd_amount_minor: sgdAmountMinor,
         category_id: categoryId || null,
         line_items: parsedLines.items,
+        user_notes: normalizedUserNotes || null,
       });
       saved("Transaction changes were saved.");
       close();
@@ -289,14 +321,15 @@ export function TransactionDetailDialog({
           <legend>Canonical fields</legend>
           <div className="form-grid">
             <label>Title<input maxLength={250} onChange={(event) => setTitle(event.target.value)} required value={title} /></label>
-            <label>Merchant <span className="optional">(source-derived)</span><input disabled value={transaction.merchant_name ?? "Not supplied"} /></label>
+            <label>Merchant or payee <span className="optional">(optional)</span><input maxLength={250} onChange={(event) => setMerchantName(event.target.value)} value={merchantName} /></label>
             <label>Account<AccountSelect accounts={accounts} disabled={referenceLoading} onChange={setAccountId} value={accountId} /></label>
             <label>Date and time<input onChange={(event) => setOccurredAt(event.target.value)} required type="datetime-local" value={occurredAt} /></label>
-            <label>Original amount <span className="optional">(minor units)</span><input inputMode="numeric" min="1" onChange={(event) => setOriginalAmount(event.target.value)} required type="number" value={originalAmount} /></label>
-            <label>Original currency<input autoCapitalize="characters" maxLength={3} onChange={(event) => setOriginalCurrency(event.target.value.toUpperCase())} pattern="[A-Z]{3}" required value={originalCurrency} /></label>
-            <label>SGD amount <span className="optional">(minor units, optional)</span><input inputMode="numeric" min="1" onChange={(event) => setSgdAmount(event.target.value)} type="number" value={sgdAmount} /></label>
+            <label>Original amount<input inputMode="decimal" onChange={(event) => { const value = event.target.value; setOriginalAmount(value); if (originalCurrency === "SGD") setSgdAmount(value); }} placeholder="0.00" required type="text" value={originalAmount} /></label>
+            <label>Original currency<input autoCapitalize="characters" maxLength={3} onChange={(event) => { const value = event.target.value.toUpperCase(); if (value === "SGD") setSgdAmount(originalAmount); else if (originalCurrency === "SGD") setSgdAmount(""); setOriginalCurrency(value); }} pattern="[A-Z]{3}" required value={originalCurrency} /></label>
+            <label>SGD amount <span className="optional">({originalCurrency === "SGD" ? "matches original" : "optional"})</span><input disabled={originalCurrency === "SGD"} inputMode="decimal" onChange={(event) => setSgdAmount(event.target.value)} placeholder="0.00" type="text" value={originalCurrency === "SGD" ? originalAmount : sgdAmount} /></label>
             <label>Category<CategorySelect categories={categories} disabled={referenceLoading} onChange={setCategoryId} value={categoryId} /></label>
           </div>
+          <label>User notes <span className="optional">(optional)</span><textarea maxLength={4000} onChange={(event) => setUserNotes(event.target.value)} rows={3} value={userNotes} /></label>
         </fieldset>
         <LineItemsEditor defaultCurrency={originalCurrency} disabled={saving} drafts={lineItems} onChange={setLineItems} />
         {formError && <p className="form-error" role="alert">{formError}</p>}

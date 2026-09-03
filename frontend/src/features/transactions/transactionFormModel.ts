@@ -1,5 +1,7 @@
 import {
   isISO4217Currency,
+  majorAmountToMinor,
+  minorAmountToMajor,
   type JsonValue,
   type TransactionLineItem,
 } from "./model";
@@ -8,13 +10,16 @@ export interface LineItemDraft {
   key: string;
   description: string;
   quantity: string;
-  unit_price_minor: string;
-  line_total_minor: string;
-  tax_minor: string;
-  discount_minor: string;
+  unitPrice: string;
+  lineTotal: string;
+  tax: string;
+  discount: string;
   currency: string;
   details: string;
 }
+
+export const MAX_LINE_ITEMS = 100;
+export const MAX_LINE_ITEMS_BYTES = 262_144;
 
 let nextLineItemKey = 0;
 
@@ -28,10 +33,16 @@ export function lineItemsToDrafts(items: TransactionLineItem[]): LineItemDraft[]
     key: lineItemKey(),
     description: item.description,
     quantity: String(item.quantity),
-    unit_price_minor: item.unit_price_minor ?? "",
-    line_total_minor: item.line_total_minor ?? "",
-    tax_minor: item.tax_minor ?? "",
-    discount_minor: item.discount_minor ?? "",
+    unitPrice: item.unit_price_minor
+      ? minorAmountToMajor(item.unit_price_minor, item.currency)
+      : "",
+    lineTotal: item.line_total_minor
+      ? minorAmountToMajor(item.line_total_minor, item.currency)
+      : "",
+    tax: item.tax_minor ? minorAmountToMajor(item.tax_minor, item.currency) : "",
+    discount: item.discount_minor
+      ? minorAmountToMajor(item.discount_minor, item.currency)
+      : "",
     currency: item.currency,
     details: JSON.stringify(item.details, null, 2),
   }));
@@ -83,11 +94,20 @@ export function isFiniteJsonValue(value: unknown): value is JsonValue {
 export function parseLineItemDrafts(
   drafts: LineItemDraft[],
 ): { items: TransactionLineItem[]; error: string | null } {
+  if (drafts.length > MAX_LINE_ITEMS) {
+    return {
+      items: [],
+      error: `A transaction can contain at most ${MAX_LINE_ITEMS} line items.`,
+    };
+  }
   const items: TransactionLineItem[] = [];
   for (const [index, draft] of drafts.entries()) {
     const label = `Line item ${index + 1}`;
     const description = draft.description.trim();
     if (!description) return { items: [], error: `${label} needs a description.` };
+    if ([...description].length > 250) {
+      return { items: [], error: `${label} description must contain at most 250 characters.` };
+    }
     if (!/^[1-9]\d*$/.test(draft.quantity) || !Number.isSafeInteger(Number(draft.quantity))) {
       return { items: [], error: `${label} quantity must be a positive whole number.` };
     }
@@ -96,14 +116,22 @@ export function parseLineItemDrafts(
       return { items: [], error: `${label} currency must be an ISO 4217 code.` };
     }
     const amounts = [
-      ["unit price", "unit_price_minor"],
-      ["line total", "line_total_minor"],
-      ["tax", "tax_minor"],
-      ["discount", "discount_minor"],
+      ["unit price", "unitPrice", "unit_price_minor"],
+      ["line total", "lineTotal", "line_total_minor"],
+      ["tax", "tax", "tax_minor"],
+      ["discount", "discount", "discount_minor"],
     ] as const;
-    for (const [name, field] of amounts) {
-      if (draft[field] && !/^\d+$/.test(draft[field])) {
-        return { items: [], error: `${label} ${name} must be a non-negative minor-unit integer.` };
+    const parsedAmounts = new Map<string, string>();
+    for (const [name, draftField, outputField] of amounts) {
+      if (!draft[draftField]) continue;
+      try {
+        parsedAmounts.set(
+          outputField,
+          majorAmountToMinor(draft[draftField], currency, true),
+        );
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : "Enter a valid amount.";
+        return { items: [], error: `${label} ${name}: ${reason}` };
       }
     }
     let details: unknown;
@@ -125,10 +153,52 @@ export function parseLineItemDrafts(
       currency,
       details: details as { [key: string]: JsonValue },
     };
-    for (const [, field] of amounts) {
-      if (draft[field]) item[field] = draft[field];
+    for (const [, , outputField] of amounts) {
+      const amount = parsedAmounts.get(outputField);
+      if (amount !== undefined) item[outputField] = amount;
     }
     items.push(item);
   }
+  if (new TextEncoder().encode(JSON.stringify(items)).byteLength > MAX_LINE_ITEMS_BYTES) {
+    return {
+      items: [],
+      error: "Line items are too large. Shorten their additional details and try again.",
+    };
+  }
   return { items, error: null };
+}
+
+export function calculateLineTotal(
+  quantity: string,
+  unitPrice: string,
+  currency: string,
+): string | null {
+  if (!/^[1-9]\d*$/.test(quantity) || !Number.isSafeInteger(Number(quantity))) {
+    return null;
+  }
+  try {
+    const unitPriceMinor = majorAmountToMinor(unitPrice, currency, true);
+    const totalMinor = BigInt(unitPriceMinor) * BigInt(quantity);
+    if (totalMinor > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+    return minorAmountToMajor(totalMinor.toString(), currency);
+  } catch {
+    return null;
+  }
+}
+
+export function updateLineItemDraft(
+  draft: LineItemDraft,
+  field: keyof LineItemDraft,
+  value: string,
+): LineItemDraft {
+  const updated = { ...draft, [field]: value };
+  if (field === "quantity" || field === "unitPrice" || field === "currency") {
+    const calculated = calculateLineTotal(
+      updated.quantity,
+      updated.unitPrice,
+      updated.currency,
+    );
+    if (calculated !== null) updated.lineTotal = calculated;
+  }
+  return updated;
 }

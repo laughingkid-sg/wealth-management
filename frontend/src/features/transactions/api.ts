@@ -8,6 +8,7 @@ import type {
   GmailConnection,
   InternalTransferInput,
   JsonValue,
+  ManualTransactionInput,
   MinorUnitAmount,
   OwnedAccountOption,
   SourceAttachment,
@@ -32,6 +33,10 @@ import type {
   TransactionSyncRun,
 } from "./model";
 import { isISO4217Currency } from "./model";
+import {
+  buildManualDuplicatePreflightParams,
+  buildManualTransactionInsertPayload,
+} from "./manualTransactionModel";
 
 export interface SanitizedEmail {
   subject: string;
@@ -293,6 +298,15 @@ function parseTransaction(
   const categoryRelation = relation(item.transaction_categories);
   const lineItems = item.line_items ?? [];
   if (!Array.isArray(lineItems)) contractError("transaction.line_items must be an array");
+  const details = jsonObject(item.details, "transaction.details");
+  const userNotesValue = details.user_notes;
+  if (
+    userNotesValue !== undefined &&
+    userNotesValue !== null &&
+    typeof userNotesValue !== "string"
+  ) {
+    contractError("transaction.details.user_notes must be a string or null");
+  }
 
   let transferLink = null;
   const nestedTransfer = relation(item.transfer_link);
@@ -360,6 +374,8 @@ function parseTransaction(
       "transaction.category_parent_name",
     ),
     line_items: lineItems.map((lineItem, index) => parseLineItem(lineItem, index, moneyParser)),
+    details,
+    user_notes: typeof userNotesValue === "string" ? userNotesValue : null,
     review_status: enumValue<TransactionReviewStatus>(
       item.review_status,
       ["confirmed", "review_required", "pending"],
@@ -653,6 +669,38 @@ async function requestDataRest(
   return body;
 }
 
+async function mutateDataRest(
+  session: Session,
+  path: string,
+  body: object,
+): Promise<unknown> {
+  if (!supabaseUrl || !supabasePublishableKey) {
+    throw new TransactionApiError("Supabase is not configured in this frontend.", 500);
+  }
+  const response = await fetch(`${supabaseUrl}/rest/v1/${path}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.access_token}`,
+      apikey: supabasePublishableKey,
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      Prefer: "return=representation",
+    },
+    body: JSON.stringify(body),
+  });
+  const value: unknown = await response.json().catch(() => null);
+  if (!response.ok) {
+    throw new TransactionApiError(
+      "The manual transaction could not be created.",
+      response.status,
+    );
+  }
+  return value;
+}
+
+const dataRestTransactionSelect =
+  "id,title,merchant_name,account_id,transaction_kind,original_amount_minor,original_currency,sgd_amount_minor,occurred_at,category_id,line_items,details,review_status,match_confidence,accounts(name),transaction_categories(name,parent_name)";
+
 export async function listTransactions(
   session: Session,
   filters: TransactionFilters,
@@ -739,8 +787,7 @@ export async function listTransactionsForAccount(
   const offset = cursor && /^\d+$/.test(cursor) ? Number(cursor) : 0;
   if (!Number.isSafeInteger(offset)) throw new TransactionApiError("Invalid transaction cursor.", 400);
   const params = new URLSearchParams({
-    select:
-      "id,title,merchant_name,account_id,transaction_kind,original_amount_minor,original_currency,sgd_amount_minor,occurred_at,category_id,line_items,review_status,match_confidence,accounts(name),transaction_categories(name,parent_name)",
+    select: dataRestTransactionSelect,
     account_id: `eq.${accountId}`,
     order: "occurred_at.desc",
     limit: String(pageSize + 1),
@@ -769,8 +816,7 @@ export async function getOwnedTransactionCandidate(
   signal?: AbortSignal,
 ): Promise<TransactionListItem | null> {
   const params = new URLSearchParams({
-    select:
-      "id,title,merchant_name,account_id,transaction_kind,original_amount_minor,original_currency,sgd_amount_minor,occurred_at,category_id,line_items,review_status,match_confidence,accounts(name),transaction_categories(name,parent_name)",
+    select: dataRestTransactionSelect,
     id: `eq.${transactionId}`,
     limit: "2",
   });
@@ -779,6 +825,39 @@ export async function getOwnedTransactionCandidate(
   if (!Array.isArray(response)) contractError("recommended transaction must be an array");
   if (response.length > 1) contractError("recommended transaction lookup returned multiple rows");
   return response.length === 0 ? null : parseDataRestTransaction(response[0]);
+}
+
+export async function findLikelyManualTransactionDuplicates(
+  session: Session,
+  input: ManualTransactionInput,
+  signal?: AbortSignal,
+): Promise<TransactionListItem[]> {
+  const occurredAt = new Date(input.occurred_at);
+  if (Number.isNaN(occurredAt.getTime())) {
+    throw new TransactionApiError("The transaction time is invalid.", 400);
+  }
+  const params = buildManualDuplicatePreflightParams(input);
+  params.set("select", dataRestTransactionSelect);
+  const response = await requestDataRest(session, `transactions?${params.toString()}`, signal);
+  if (!Array.isArray(response)) contractError("likely duplicate transactions must be an array");
+  return response.map(parseDataRestTransaction);
+}
+
+export async function createManualTransaction(
+  session: Session,
+  input: ManualTransactionInput,
+): Promise<TransactionListItem> {
+  const payload = buildManualTransactionInsertPayload(session.user.id, input);
+  const params = new URLSearchParams({ select: dataRestTransactionSelect });
+  const response = await mutateDataRest(
+    session,
+    `transactions?${params.toString()}`,
+    payload,
+  );
+  if (!Array.isArray(response) || response.length !== 1) {
+    contractError("manual transaction insert must return exactly one row");
+  }
+  return parseDataRestTransaction(response[0]);
 }
 
 export async function listSources(

@@ -20,6 +20,7 @@ import {
   RefreshCw,
   Search,
   SlidersHorizontal,
+  X,
 } from "lucide-react";
 import { supabase } from "../../lib/supabase";
 import {
@@ -33,8 +34,14 @@ import {
   TransactionApiError,
 } from "./api";
 import { InternalTransferDialog } from "./InternalTransferDialog";
+import { ManualTransactionDialog } from "./ManualTransactionDialog";
 import { SourceInspector } from "./SourceInspector";
 import { TransactionDetailDialog } from "./TransactionDetailDialog";
+import {
+  isSyncBannerDismissed,
+  persistSyncBannerDismissal,
+  syncBannerDismissalKey,
+} from "./syncBannerDismissal";
 import {
   formatAmount,
   formatDateTime,
@@ -56,6 +63,7 @@ interface SourcePageState {
 }
 
 const views: TransactionsView[] = ["transactions", "review", "dangling", "failed"];
+const justCreatedPinDurationMS = 15_000;
 const emptySourcePages: Record<SourceQueue, SourcePageState> = {
   review: { items: [], nextCursor: null },
   dangling: { items: [], nextCursor: null },
@@ -198,8 +206,11 @@ export function TransactionsPage({ session }: { session: Session }) {
   const [monitorStopped, setMonitorStopped] = useState(false);
   const [monitorResumeKey, setMonitorResumeKey] = useState(0);
   const [startingSync, setStartingSync] = useState(false);
+  const [dismissedSyncBannerKey, setDismissedSyncBannerKey] = useState<string | null>(null);
   const [inspecting, setInspecting] = useState<SourceSummary | null>(null);
   const [detailTransaction, setDetailTransaction] = useState<TransactionListItem | null>(null);
+  const [creatingManual, setCreatingManual] = useState(false);
+  const [justCreatedTransaction, setJustCreatedTransaction] = useState<TransactionListItem | null>(null);
   const [creatingTransfer, setCreatingTransfer] = useState(false);
   const [transferSourceSeed, setTransferSourceSeed] = useState<InternalTransferSourceSeed | null>(null);
   const [success, setSuccess] = useState<string | null>(() =>
@@ -411,12 +422,41 @@ export function TransactionsPage({ session }: { session: Session }) {
     };
   }, [activeSyncID, loadConnection, loadData, monitorResumeKey, session]);
 
+  const justCreatedTransactionID = justCreatedTransaction?.id ?? null;
+  useEffect(() => {
+    if (!justCreatedTransactionID) return;
+    const timer = window.setTimeout(() => {
+      setJustCreatedTransaction((current) => current?.id === justCreatedTransactionID ? null : current);
+    }, justCreatedPinDurationMS);
+    return () => window.clearTimeout(timer);
+  }, [justCreatedTransactionID]);
+
   const activeSources = view === "transactions" ? [] : sourcePages[view].items;
-  const activeCount = view === "transactions" ? transactions.length : activeSources.length;
-  const nextCursor = view === "transactions" ? transactionCursor : sourcePages[view].nextCursor;
   const hasFilters = Boolean(filters.search || filters.kind || filters.review);
+  const showJustCreatedTransaction = view === "transactions" && !hasFilters && justCreatedTransaction !== null;
+  const visibleTransactions = useMemo(() => {
+    if (!showJustCreatedTransaction || !justCreatedTransaction) return transactions;
+    return [
+      justCreatedTransaction,
+      ...transactions.filter(({ id }) => id !== justCreatedTransaction.id),
+    ];
+  }, [justCreatedTransaction, showJustCreatedTransaction, transactions]);
+  const activeCount = view === "transactions" ? visibleTransactions.length : activeSources.length;
+  const nextCursor = view === "transactions" ? transactionCursor : sourcePages[view].nextCursor;
   const syncBusy = syncRestoring || startingSync || syncRun?.status === "queued" || syncRun?.status === "running";
   const syncRestoreFailed = !syncRestoring && !syncRun && Boolean(monitorError);
+  const terminalSyncRun = syncRun?.status === "completed" || syncRun?.status === "failed" ? syncRun : null;
+  const terminalSyncRunID = terminalSyncRun?.id ?? null;
+  const terminalSyncBannerKey = terminalSyncRunID
+    ? syncBannerDismissalKey(session.user.id, terminalSyncRunID)
+    : null;
+  const terminalSyncDismissedFromStorage = useMemo(
+    () => terminalSyncRunID ? isSyncBannerDismissed(session.user.id, terminalSyncRunID) : false,
+    [session.user.id, terminalSyncRunID],
+  );
+  const terminalSyncDismissed = terminalSyncBannerKey !== null &&
+    (dismissedSyncBannerKey === terminalSyncBannerKey || terminalSyncDismissedFromStorage);
+  const showSyncBanner = Boolean(syncRestoring || syncRun || monitorError) && !terminalSyncDismissed;
   const heading = view === "transactions" ? "Transactions" : view === "review" ? "Review sources" : view === "dangling" ? "Dangling sources" : "Failed sources";
   const description = view === "transactions"
     ? "Account-linked activity created from your transaction evidence."
@@ -524,6 +564,12 @@ export function TransactionsPage({ session }: { session: Session }) {
     setSyncRestoreReload((value) => value + 1);
   }
 
+  function dismissTerminalSyncBanner() {
+    if (!terminalSyncRun || !terminalSyncBannerKey) return;
+    persistSyncBannerDismissal(session.user.id, terminalSyncRun.id);
+    setDismissedSyncBannerKey(terminalSyncBannerKey);
+  }
+
   function clearFilters() {
     setFilters({});
   }
@@ -531,6 +577,19 @@ export function TransactionsPage({ session }: { session: Session }) {
   function showSuccess(message: string) {
     setSuccess(message);
     void loadData(false);
+  }
+
+  function showCreatedManualTransaction(transaction: TransactionListItem) {
+    loadGeneration.current += 1;
+    transactionCursorRef.current = null;
+    setView("transactions");
+    setFilters({});
+    setLoading(true);
+    setDataError(null);
+    setLoadMoreError(null);
+    setTransactionCursor(null);
+    setJustCreatedTransaction(transaction);
+    setSuccess("Transaction was created.");
   }
 
   function startSourceTransfer(source: SourceSummary, role: TransferSourceRole) {
@@ -552,7 +611,8 @@ export function TransactionsPage({ session }: { session: Session }) {
           <p className="muted">{description}</p>
         </div>
         <div className="transaction-header-actions">
-          <button className="button button-secondary" onClick={() => { setTransferSourceSeed(null); setCreatingTransfer(true); }} type="button"><Plus aria-hidden="true" size={17} /> Internal transfer</button>
+          <button className="button button-secondary" onClick={() => setCreatingManual(true)} type="button"><Plus aria-hidden="true" size={17} /> Add transaction</button>
+          <button className="button button-secondary" onClick={() => { setTransferSourceSeed(null); setCreatingTransfer(true); }} type="button"><ArrowLeftRight aria-hidden="true" size={17} /> Internal transfer</button>
           {connection?.connected ? (
             <button className="button button-primary" disabled={syncBusy} onClick={() => void triggerSync()} type="button">
               <RefreshCw aria-hidden="true" className={syncBusy ? "spin" : undefined} size={18} />
@@ -576,7 +636,7 @@ export function TransactionsPage({ session }: { session: Session }) {
       </section>
       {(connectionError || oauthError) && <p className="form-error page-inline-error" role="alert">{connectionError || oauthError}</p>}
 
-      {(syncRestoring || syncRun || monitorError) && (
+      {showSyncBanner && (
         <section aria-live="polite" className={`sync-status ${syncRestoreFailed ? "failed" : syncRun?.status ?? "queued"}`} role="status">
           {syncRestoreFailed || syncRun?.status === "failed" ? <CircleAlert aria-hidden="true" size={21} /> : syncRestoring ? <Clock3 aria-hidden="true" size={21} /> : syncRun?.status === "completed" ? <CheckCircle2 aria-hidden="true" size={21} /> : <Clock3 aria-hidden="true" size={21} />}
           <div>
@@ -584,7 +644,11 @@ export function TransactionsPage({ session }: { session: Session }) {
             <p>{syncRun ? syncDescription(syncRun) : syncRestoreFailed ? "Retry the owner-scoped progress check before starting another refresh." : "Checking safe progress…"}</p>
             {monitorError && <p className="sync-monitor-error">{monitorError}</p>}
           </div>
-          {syncRestoreFailed ? <button className="button button-secondary button-compact" onClick={retrySyncRestore} type="button">Retry progress</button> : monitorStopped ? <button className="button button-secondary button-compact" onClick={() => { setMonitorStopped(false); setMonitorResumeKey((value) => value + 1); }} type="button">Resume progress</button> : null}
+          {terminalSyncRun ? (
+            <button aria-label="Dismiss Gmail refresh result" className="button button-secondary button-compact" onClick={dismissTerminalSyncBanner} type="button">
+              <X aria-hidden="true" size={16} /> Dismiss
+            </button>
+          ) : syncRestoreFailed ? <button className="button button-secondary button-compact" onClick={retrySyncRestore} type="button">Retry progress</button> : monitorStopped ? <button className="button button-secondary button-compact" onClick={() => { setMonitorStopped(false); setMonitorResumeKey((value) => value + 1); }} type="button">Resume progress</button> : null}
         </section>
       )}
       {syncActionError && (
@@ -650,18 +714,18 @@ export function TransactionsPage({ session }: { session: Session }) {
           </section>
         )}
 
-        {loading ? (
+        {loading && !showJustCreatedTransaction ? (
           <section aria-busy="true" aria-label={`Loading ${view}`} className="transaction-panel" role="status">
             <span className="sr-only">Loading {view}…</span><div className="skeleton-row" /><div className="skeleton-row" /><div className="skeleton-row" />
           </section>
-        ) : dataError ? null : activeCount === 0 ? (
+        ) : dataError && !showJustCreatedTransaction ? null : activeCount === 0 ? (
           <section className="empty-state transaction-empty">
             <Inbox aria-hidden="true" size={28} /><h2>{emptyCopy[0]}</h2><p>{emptyCopy[1]}</p>
             {view === "transactions" && !hasFilters && (connection?.connected ? <button className="button button-primary" disabled={syncBusy} onClick={() => void triggerSync()} type="button"><RefreshCw aria-hidden="true" size={18} /> Refresh Gmail</button> : <button className="button button-primary" disabled={connecting || connectionLoading} onClick={() => void connectGmail()} type="button"><Mail aria-hidden="true" size={18} /> Connect Gmail</button>)}
             {hasFilters && <button className="button button-secondary" onClick={clearFilters} type="button">Clear filters</button>}
           </section>
         ) : view === "transactions" ? (
-          <TransactionRows inspect={setDetailTransaction} items={transactions} />
+          <TransactionRows inspect={setDetailTransaction} items={visibleTransactions} />
         ) : (
           <SourceCards inspect={setInspecting} sources={activeSources} view={view} />
         )}
@@ -683,6 +747,13 @@ export function TransactionsPage({ session }: { session: Session }) {
           saved={showSuccess}
           session={session}
           transaction={detailTransaction}
+        />
+      )}
+      {creatingManual && (
+        <ManualTransactionDialog
+          onClose={() => setCreatingManual(false)}
+          onCreated={showCreatedManualTransaction}
+          session={session}
         />
       )}
       {creatingTransfer && <InternalTransferDialog close={closeTransfer} initialSource={transferSourceSeed ?? undefined} saved={showSuccess} session={session} />}

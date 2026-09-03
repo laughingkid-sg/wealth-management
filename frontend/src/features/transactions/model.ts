@@ -53,6 +53,8 @@ export interface TransactionListItem {
   category_name: string | null;
   category_parent_name: string | null;
   line_items: TransactionLineItem[];
+  details: { [key: string]: JsonValue };
+  user_notes: string | null;
   review_status: TransactionReviewStatus;
   match_confidence: number | null;
   source_count: number;
@@ -140,6 +142,7 @@ export interface CursorPage<T> {
 
 export interface TransactionPatch {
   title?: string;
+  merchant_name?: string | null;
   account_id?: string;
   occurred_at?: string;
   original_amount_minor?: MinorUnitAmount;
@@ -147,6 +150,21 @@ export interface TransactionPatch {
   sgd_amount_minor?: MinorUnitAmount | null;
   category_id?: string | null;
   line_items?: TransactionLineItem[];
+  user_notes?: string | null;
+}
+
+export interface ManualTransactionInput {
+  account_id: string;
+  transaction_kind: TransactionKind;
+  title: string;
+  merchant_name: string | null;
+  original_amount_minor: MinorUnitAmount;
+  original_currency: string;
+  sgd_amount_minor: MinorUnitAmount | null;
+  occurred_at: string;
+  category_id: string | null;
+  line_items: TransactionLineItem[];
+  user_notes: string | null;
 }
 
 export interface TransferLegInput {
@@ -315,6 +333,66 @@ export function fractionDigitsForCurrency(currency: string): number {
   }
   currencyFractionDigits.set(normalized, digits);
   return digits;
+}
+
+// PostgREST serializes PostgreSQL bigint columns as JSON numbers in returned
+// representations. Keep browser-created amounts in the lossless JSON integer
+// range until that read contract returns minor units as strings.
+const maxSafeMinorUnitAmount = BigInt(Number.MAX_SAFE_INTEGER);
+
+function normalizedCurrencyFractionDigits(currency: string): number {
+  const normalized = currency.trim().toUpperCase();
+  if (!isISO4217Currency(normalized)) {
+    throw new Error("Currency must be a valid three-letter ISO 4217 code.");
+  }
+  return fractionDigitsForCurrency(normalized);
+}
+
+export function majorAmountToMinor(
+  major: string,
+  currency: string,
+  allowZero = false,
+): MinorUnitAmount {
+  const digits = normalizedCurrencyFractionDigits(currency);
+  const normalized = major.trim();
+  if (normalized.length > 64) {
+    throw new Error("Amount is too large to transfer safely through the browser.");
+  }
+  if (!/^\d+(?:\.\d+)?$/.test(normalized)) {
+    throw new Error("Use digits and an optional decimal point without grouping separators or exponents.");
+  }
+  const [whole, suppliedFraction = ""] = normalized.split(".");
+  if (suppliedFraction.length > digits) {
+    throw new Error(
+      `${currency.trim().toUpperCase()} supports at most ${digits} decimal place${digits === 1 ? "" : "s"}.`,
+    );
+  }
+  const fraction = suppliedFraction.padEnd(digits, "0");
+  const minor = BigInt(whole) * 10n ** BigInt(digits) + BigInt(fraction || "0");
+  if ((!allowZero && minor === 0n) || minor < 0n) {
+    throw new Error(allowZero ? "Amount cannot be negative." : "Amount must be greater than zero.");
+  }
+  if (minor > maxSafeMinorUnitAmount) {
+    throw new Error("Amount is too large to transfer safely through the browser.");
+  }
+  return minor.toString();
+}
+
+export function minorAmountToMajor(
+  minor: MinorUnitAmount,
+  currency: string,
+): string {
+  const digits = normalizedCurrencyFractionDigits(currency);
+  if (!/^\d+$/.test(minor)) {
+    throw new Error("Minor-unit amount must be a non-negative integer string.");
+  }
+  if (minor.length > 19) {
+    throw new Error("Minor-unit amount is outside the supported database range.");
+  }
+  const value = BigInt(minor);
+  if (digits === 0) return value.toString();
+  const divisor = 10n ** BigInt(digits);
+  return `${value / divisor}.${(value % divisor).toString().padStart(digits, "0")}`;
 }
 
 export function formatAmount(minor: MinorUnitAmount, currency: string): string {

@@ -1287,7 +1287,8 @@ footer {
   min-width: 0;
 }
 .transaction-detail-dialog,
-.internal-transfer-dialog {
+.internal-transfer-dialog,
+.manual-transaction-dialog {
   width: min(100%, 980px);
 }
 .reference-warning {
@@ -1337,12 +1338,14 @@ footer {
   font-size: 0.82rem;
 }
 .transaction-edit-form,
-.transfer-form {
+.transfer-form,
+.manual-transaction-form {
   display: grid;
   gap: 18px;
   margin-top: 22px;
 }
 .transaction-edit-form > fieldset,
+.manual-transaction-form > fieldset,
 .transfer-leg,
 .line-items-editor {
   display: grid;
@@ -1353,6 +1356,7 @@ footer {
   border-radius: 11px;
 }
 .transaction-edit-form > fieldset > legend,
+.manual-transaction-form > fieldset > legend,
 .transfer-leg > legend,
 .line-items-editor > legend {
   padding: 0 5px;
@@ -1449,6 +1453,43 @@ footer {
 .transfer-form > .form-error,
 .transfer-form > .modal-actions {
   grid-column: 1 / -1;
+}
+.manual-duplicate-warning {
+  align-items: flex-start;
+  border: 1px solid #ead6b4;
+  background: #fff8ed;
+  color: #70411e;
+}
+.manual-duplicate-warning > div {
+  min-width: 0;
+  flex: 1;
+}
+.manual-duplicate-warning ul {
+  display: grid;
+  gap: 7px;
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.manual-duplicate-warning li {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px;
+  border-radius: 7px;
+  background: rgb(255 255 255 / 0.72);
+  font-size: 0.8rem;
+}
+.manual-duplicate-warning li span {
+  color: var(--muted);
+  text-align: right;
+}
+.manual-duplicate-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 13px;
 }
 .load-more-row {
   display: flex;
@@ -2165,6 +2206,7 @@ footer {
   }
   .transaction-detail-dialog,
   .internal-transfer-dialog,
+  .manual-transaction-dialog,
   .source-inspector {
     max-height: calc(100dvh - 20px);
     padding: 18px;

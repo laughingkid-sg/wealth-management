@@ -3,7 +3,12 @@ import type {
   OwnedAccountOption,
   TransactionCategory,
 } from "./model";
-import { lineItemKey, type LineItemDraft } from "./transactionFormModel";
+import {
+  lineItemKey,
+  MAX_LINE_ITEMS,
+  updateLineItemDraft,
+  type LineItemDraft,
+} from "./transactionFormModel";
 
 export function LineItemsEditor({
   drafts,
@@ -17,13 +22,17 @@ export function LineItemsEditor({
   disabled?: boolean;
 }) {
   function update(key: string, field: keyof LineItemDraft, value: string) {
-    onChange(drafts.map((draft) => (draft.key === key ? { ...draft, [field]: value } : draft)));
+    onChange(
+      drafts.map((draft) =>
+        draft.key === key ? updateLineItemDraft(draft, field, value) : draft,
+      ),
+    );
   }
 
   return (
     <fieldset className="line-items-editor" disabled={disabled}>
       <legend>Line items <span className="optional">(optional)</span></legend>
-      <p>Amounts use integer minor units. Additional details must be a JSON object.</p>
+      <p>Enter normal currency amounts, such as 12.50. Additional details must be a JSON object.</p>
       {drafts.length === 0 ? (
         <p className="line-items-empty">No line items recorded.</p>
       ) : (
@@ -74,18 +83,18 @@ export function LineItemsEditor({
                   />
                 </label>
                 {([
-                  ["Unit price", "unit_price_minor"],
-                  ["Line total", "line_total_minor"],
-                  ["Tax", "tax_minor"],
-                  ["Discount", "discount_minor"],
+                  ["Unit price", "unitPrice"],
+                  ["Line total", "lineTotal"],
+                  ["Tax", "tax"],
+                  ["Discount", "discount"],
                 ] as const).map(([label, field]) => (
                   <label key={field}>
-                    {label} <span className="optional">(minor)</span>
+                    {label} <span className="optional">(optional)</span>
                     <input
-                      inputMode="numeric"
-                      min="0"
+                      inputMode="decimal"
                       onChange={(event) => update(draft.key, field, event.target.value)}
-                      type="number"
+                      placeholder="0.00"
+                      type="text"
                       value={draft[field]}
                     />
                   </label>
@@ -107,6 +116,7 @@ export function LineItemsEditor({
       )}
       <button
         className="button button-secondary add-line-item"
+        disabled={disabled || drafts.length >= MAX_LINE_ITEMS}
         onClick={() =>
           onChange([
             ...drafts,
@@ -114,10 +124,10 @@ export function LineItemsEditor({
               key: lineItemKey(),
               description: "",
               quantity: "1",
-              unit_price_minor: "",
-              line_total_minor: "",
-              tax_minor: "",
-              discount_minor: "",
+              unitPrice: "",
+              lineTotal: "",
+              tax: "",
+              discount: "",
               currency: /^[A-Z]{3}$/.test(defaultCurrency) ? defaultCurrency : "SGD",
               details: "{}",
             },
@@ -125,7 +135,10 @@ export function LineItemsEditor({
         }
         type="button"
       >
-        <Plus aria-hidden="true" size={16} /> Add line item
+        <Plus aria-hidden="true" size={16} />
+        {drafts.length >= MAX_LINE_ITEMS
+          ? `${MAX_LINE_ITEMS} line item limit reached`
+          : "Add line item"}
       </button>
     </fieldset>
   );

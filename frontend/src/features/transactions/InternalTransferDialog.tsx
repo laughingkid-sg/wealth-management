@@ -11,6 +11,7 @@ import {
 import { parseLineItemDrafts, type LineItemDraft } from "./transactionFormModel";
 import {
   isISO4217Currency,
+  majorAmountToMinor,
   toDateTimeLocal,
   toRFC3339,
   type InternalTransferSourceSeed,
@@ -52,9 +53,23 @@ function validateLeg(draft: LegDraft, label: string): { value: TransferLegInput 
   const occurredAt = toRFC3339(draft.occurredAt);
   if (!title || title.length > 250) return { value: null, error: `${label} title must contain 1 to 250 characters.` };
   if (!draft.accountId) return { value: null, error: `Choose the ${label.toLowerCase()} account.` };
-  if (!/^\d+$/.test(draft.amount) || BigInt(draft.amount) === 0n) return { value: null, error: `${label} amount must be a positive minor-unit integer.` };
   if (!isISO4217Currency(currency)) return { value: null, error: `${label} currency must be an ISO 4217 code.` };
-  if (draft.sgdAmount && (!/^\d+$/.test(draft.sgdAmount) || BigInt(draft.sgdAmount) === 0n)) return { value: null, error: `${label} SGD amount must be empty or a positive minor-unit integer.` };
+  let amountMinor: string;
+  try {
+    amountMinor = majorAmountToMinor(draft.amount, currency);
+  } catch (error) {
+    return { value: null, error: `${label} amount: ${error instanceof Error ? error.message : "Enter a valid amount."}` };
+  }
+  let sgdAmountMinor: string | null = null;
+  if (currency === "SGD") {
+    sgdAmountMinor = amountMinor;
+  } else if (draft.sgdAmount.trim()) {
+    try {
+      sgdAmountMinor = majorAmountToMinor(draft.sgdAmount, "SGD");
+    } catch (error) {
+      return { value: null, error: `${label} SGD amount: ${error instanceof Error ? error.message : "Enter a valid amount."}` };
+    }
+  }
   if (!occurredAt) return { value: null, error: `${label} date and time is invalid.` };
   const lines = parseLineItemDrafts(draft.lineItems);
   if (lines.error) return { value: null, error: `${label}: ${lines.error}` };
@@ -62,9 +77,9 @@ function validateLeg(draft: LegDraft, label: string): { value: TransferLegInput 
     value: {
       title,
       account_id: draft.accountId,
-      original_amount_minor: draft.amount,
+      original_amount_minor: amountMinor,
       original_currency: currency,
-      sgd_amount_minor: draft.sgdAmount || null,
+      sgd_amount_minor: sgdAmountMinor,
       occurred_at: occurredAt,
       category_id: draft.categoryId || null,
       line_items: lines.items,
@@ -142,7 +157,18 @@ export function InternalTransferDialog({
     setDraft: (updater: (current: LegDraft) => LegDraft) => void,
   ) {
     const update = <K extends keyof LegDraft>(field: K, value: LegDraft[K]) =>
-      setDraft((current) => ({ ...current, [field]: value }));
+      setDraft((current) => {
+        const next = { ...current, [field]: value };
+        if (field === "amount" && current.currency === "SGD") {
+          next.sgdAmount = String(value);
+        }
+        if (field === "currency" && value === "SGD") {
+          next.sgdAmount = current.amount;
+        } else if (field === "currency" && current.currency === "SGD") {
+          next.sgdAmount = "";
+        }
+        return next;
+      });
     return (
       <fieldset className={`transfer-leg ${kind}`} disabled={saving || loading || Boolean(loadError)}>
         <legend>{legend}</legend>
@@ -155,9 +181,9 @@ export function InternalTransferDialog({
         <div className="form-grid">
           <label>Title<input maxLength={250} onChange={(event) => update("title", event.target.value)} required value={draft.title} /></label>
           <label>Account<AccountSelect accounts={accounts} disabled={loading} excludedId={kind === "debit" ? credit.accountId : debit.accountId} onChange={(value) => update("accountId", value)} value={draft.accountId} /></label>
-          <label>Amount <span className="optional">(minor units)</span><input inputMode="numeric" min="1" onChange={(event) => update("amount", event.target.value)} required type="number" value={draft.amount} /></label>
+          <label>Amount<input inputMode="decimal" onChange={(event) => update("amount", event.target.value)} placeholder="0.00" required type="text" value={draft.amount} /></label>
           <label>Currency<input autoCapitalize="characters" maxLength={3} onChange={(event) => update("currency", event.target.value.toUpperCase())} pattern="[A-Z]{3}" required value={draft.currency} /></label>
-          <label>SGD amount <span className="optional">(minor units, optional)</span><input inputMode="numeric" min="1" onChange={(event) => update("sgdAmount", event.target.value)} type="number" value={draft.sgdAmount} /></label>
+          <label>SGD amount <span className="optional">({draft.currency === "SGD" ? "matches amount" : "optional"})</span><input disabled={draft.currency === "SGD"} inputMode="decimal" onChange={(event) => update("sgdAmount", event.target.value)} placeholder="0.00" type="text" value={draft.currency === "SGD" ? draft.amount : draft.sgdAmount} /></label>
           <label>Date and time<input onChange={(event) => update("occurredAt", event.target.value)} required type="datetime-local" value={draft.occurredAt} /></label>
           <label>Category<CategorySelect categories={categories} disabled={loading} onChange={(value) => update("categoryId", value)} value={draft.categoryId} /></label>
         </div>
