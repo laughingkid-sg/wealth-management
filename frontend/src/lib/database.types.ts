@@ -6,11 +6,11 @@ export interface Database {
       accounts: {
         Row: {
           id: string; user_id: string; side: 'asset' | 'liability'
-          account_type: 'bank_account' | 'brokerage' | 'digital_wallet' | 'crypto_wallet' | 'crypto_exchange' | 'rsu' | 'credit_card' | 'personal_loan'
+          account_type: 'bank_account' | 'brokerage' | 'robo_advisor' | 'retirement_account' | 'digital_wallet' | 'crypto_wallet' | 'crypto_exchange' | 'rsu' | 'credit_card' | 'personal_loan' | 'other'
           name: string; institution_name: string; account_identifier: string | null; notes: string | null; metadata: Json; sort_order: number; deleted_at: string | null; created_at: string; updated_at: string
         }
-        Insert: { id?: string; user_id: string; side: 'asset' | 'liability'; account_type: 'bank_account' | 'brokerage' | 'digital_wallet' | 'crypto_wallet' | 'crypto_exchange' | 'rsu' | 'credit_card' | 'personal_loan'; name: string; institution_name: string; account_identifier?: string | null; notes?: string | null; metadata?: Json; sort_order?: number; deleted_at?: string | null }
-        Update: { side?: 'asset' | 'liability'; account_type?: 'bank_account' | 'brokerage' | 'digital_wallet' | 'crypto_wallet' | 'crypto_exchange' | 'rsu' | 'credit_card' | 'personal_loan'; name?: string; institution_name?: string; account_identifier?: string | null; notes?: string | null; metadata?: Json; sort_order?: number; deleted_at?: string | null }
+        Insert: { id?: string; user_id: string; side: 'asset' | 'liability'; account_type: 'bank_account' | 'brokerage' | 'robo_advisor' | 'retirement_account' | 'digital_wallet' | 'crypto_wallet' | 'crypto_exchange' | 'rsu' | 'credit_card' | 'personal_loan' | 'other'; name: string; institution_name: string; account_identifier?: string | null; notes?: string | null; metadata?: Json; sort_order?: number; deleted_at?: string | null }
+        Update: { side?: 'asset' | 'liability'; account_type?: 'bank_account' | 'brokerage' | 'robo_advisor' | 'retirement_account' | 'digital_wallet' | 'crypto_wallet' | 'crypto_exchange' | 'rsu' | 'credit_card' | 'personal_loan' | 'other'; name?: string; institution_name?: string; account_identifier?: string | null; notes?: string | null; metadata?: Json; sort_order?: number; deleted_at?: string | null }
         Relationships: []
       }
     }

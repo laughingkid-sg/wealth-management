@@ -1,0 +1,938 @@
+// Package providers contains provider boundaries. Implementations keep tokens server-side.
+package providers
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"mime"
+	"net/http"
+	"net/url"
+	"path"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+	"unicode/utf8"
+)
+
+const (
+	GmailReadonlyScope      = "https://www.googleapis.com/auth/gmail.readonly"
+	defaultGoogleTokenURL   = "https://oauth2.googleapis.com/token"
+	defaultGmailAPIBaseURL  = "https://gmail.googleapis.com/gmail/v1"
+	maxGmailAttachmentBytes = 5 * 1024 * 1024
+	// The remaining 32 KiB below the parser's 256 KiB text ceiling covers
+	// bounded subject/sender fields, labels, prefixes, and received_at.
+	maxGmailBodyBytes          = 224 * 1024
+	maxGmailHeaderValueBytes   = 8 * 1024
+	defaultProviderHTTPTimeout = 20 * time.Second
+)
+
+// ErrGmailMessageUnavailable identifies a Gmail message that was listed but
+// disappeared before its complete contents (or one of its attachments) could
+// be read. Callers may safely skip that source; other provider failures remain
+// retryable errors.
+var ErrGmailMessageUnavailable = errors.New("Gmail message is unavailable")
+
+type GmailMessageRef struct {
+	ID, ThreadID string
+	ReceivedAt   time.Time
+}
+
+type GmailMessage struct {
+	ID, ThreadID, HTML, Text string
+	ReceivedAt               time.Time
+	Attachments              []GmailAttachment
+	BodyTruncated            bool
+	// Headers contains available message headers, keyed case-insensitively in
+	// their canonical lower-case form (for example, "subject" and "from").
+	// It is source evidence, not trusted transaction data.
+	Headers map[string]string
+}
+
+type GmailAttachment struct {
+	ID, Filename, MIMEType string
+	Size                   int64
+	Content                []byte
+}
+
+// GmailClient never exposes refresh tokens to callers outside server-side connection storage.
+type GmailClient interface {
+	ListLabelMessages(context.Context, string, string, string, int) ([]GmailMessageRef, string, error)
+	GetMessage(context.Context, string, string) (GmailMessage, error)
+}
+
+// GmailConnectionTokenSource obtains a short-lived access token from an encrypted connection.
+type GmailConnectionTokenSource interface {
+	AccessToken(context.Context, string) (string, error)
+}
+
+// OAuthAccessToken is deliberately limited to the short-lived access token.
+// Refresh tokens stay in encrypted connection storage and must not be returned
+// from this provider boundary.
+type OAuthAccessToken struct {
+	Value     string
+	TokenType string
+	ExpiresAt time.Time
+}
+
+// OAuthCodeExchange is the server-only result of a Google authorization-code exchange.
+// RefreshToken must be encrypted before persistence and never returned to a browser.
+type OAuthCodeExchange struct {
+	RefreshToken string
+	Metadata     json.RawMessage
+}
+
+// GoogleOAuthClient exchanges a server-side refresh token for a short-lived
+// Gmail access token. It does not persist or log either token.
+type GoogleOAuthClient struct {
+	httpClient   *http.Client
+	tokenURL     string
+	clientID     string
+	clientSecret string
+}
+
+func NewGoogleOAuthClient(httpClient *http.Client, clientID, clientSecret string) (*GoogleOAuthClient, error) {
+	return newGoogleOAuthClient(httpClient, defaultGoogleTokenURL, clientID, clientSecret)
+}
+
+func newGoogleOAuthClient(httpClient *http.Client, tokenURL, clientID, clientSecret string) (*GoogleOAuthClient, error) {
+	if strings.TrimSpace(clientID) == "" || strings.TrimSpace(clientSecret) == "" {
+		return nil, errors.New("Google OAuth client credentials are required")
+	}
+	parsed, err := url.Parse(tokenURL)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		return nil, errors.New("Google OAuth token URL must be an absolute HTTPS URL")
+	}
+	return &GoogleOAuthClient{
+		httpClient:   providerHTTPClient(httpClient),
+		tokenURL:     parsed.String(),
+		clientID:     clientID,
+		clientSecret: clientSecret,
+	}, nil
+}
+
+func (c *GoogleOAuthClient) ExchangeRefreshToken(ctx context.Context, refreshToken string) (OAuthAccessToken, error) {
+	if c == nil {
+		return OAuthAccessToken{}, errors.New("Google OAuth client is nil")
+	}
+	if strings.TrimSpace(refreshToken) == "" {
+		return OAuthAccessToken{}, errors.New("Google OAuth refresh token is empty")
+	}
+	form := url.Values{
+		"client_id":     {c.clientID},
+		"client_secret": {c.clientSecret},
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {refreshToken},
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.tokenURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return OAuthAccessToken{}, fmt.Errorf("create Google OAuth refresh request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	response, err := c.httpClient.Do(req)
+	if err != nil {
+		return OAuthAccessToken{}, fmt.Errorf("send Google OAuth refresh request: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return OAuthAccessToken{}, fmt.Errorf("Google OAuth refresh request returned status %d", response.StatusCode)
+	}
+	var payload struct {
+		AccessToken string `json:"access_token"`
+		TokenType   string `json:"token_type"`
+		ExpiresIn   int64  `json:"expires_in"`
+	}
+	if err := decodeJSON(response.Body, &payload); err != nil {
+		return OAuthAccessToken{}, fmt.Errorf("decode Google OAuth refresh response: %w", err)
+	}
+	if strings.TrimSpace(payload.AccessToken) == "" {
+		return OAuthAccessToken{}, errors.New("Google OAuth refresh response omitted an access token")
+	}
+	if payload.ExpiresIn < 1 {
+		return OAuthAccessToken{}, errors.New("Google OAuth refresh response has an invalid expiry")
+	}
+	return OAuthAccessToken{
+		Value:     payload.AccessToken,
+		TokenType: payload.TokenType,
+		ExpiresAt: time.Now().Add(time.Duration(payload.ExpiresIn) * time.Second),
+	}, nil
+}
+
+func (c *GoogleOAuthClient) ExchangeAuthorizationCode(ctx context.Context, code, redirectURL, verifier string) (OAuthCodeExchange, error) {
+	if c == nil {
+		return OAuthCodeExchange{}, errors.New("Google OAuth client is nil")
+	}
+	if strings.TrimSpace(code) == "" || strings.TrimSpace(redirectURL) == "" || strings.TrimSpace(verifier) == "" {
+		return OAuthCodeExchange{}, errors.New("Google OAuth code, redirect URL, and verifier are required")
+	}
+	form := url.Values{
+		"client_id": {c.clientID}, "client_secret": {c.clientSecret}, "grant_type": {"authorization_code"},
+		"code": {code}, "redirect_uri": {redirectURL}, "code_verifier": {verifier},
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.tokenURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return OAuthCodeExchange{}, fmt.Errorf("create Google OAuth code request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	response, err := c.httpClient.Do(req)
+	if err != nil {
+		return OAuthCodeExchange{}, fmt.Errorf("send Google OAuth code request: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return OAuthCodeExchange{}, fmt.Errorf("Google OAuth code request returned status %d", response.StatusCode)
+	}
+	var payload struct {
+		RefreshToken string `json:"refresh_token"`
+		Scope        string `json:"scope"`
+		TokenType    string `json:"token_type"`
+		ExpiresIn    int64  `json:"expires_in"`
+	}
+	if err := decodeJSON(response.Body, &payload); err != nil {
+		return OAuthCodeExchange{}, fmt.Errorf("decode Google OAuth code response: %w", err)
+	}
+	if strings.TrimSpace(payload.RefreshToken) == "" {
+		return OAuthCodeExchange{}, errors.New("Google OAuth code response omitted a refresh token")
+	}
+	metadata, err := json.Marshal(map[string]any{"scope": payload.Scope, "token_type": payload.TokenType, "expires_in": payload.ExpiresIn})
+	if err != nil {
+		return OAuthCodeExchange{}, err
+	}
+	return OAuthCodeExchange{RefreshToken: payload.RefreshToken, Metadata: metadata}, nil
+}
+
+// RefreshTokenLookup retrieves an already-decrypted refresh token for one
+// connection. Its implementation belongs to the encrypted connection store.
+type RefreshTokenLookup func(context.Context, string) (string, error)
+
+// GoogleOAuthTokenSource adapts encrypted connection storage to the Gmail
+// client. It intentionally performs no token caching: the caller owns any
+// cache so token invalidation is immediate and testable.
+type GoogleOAuthTokenSource struct {
+	oauthClient *GoogleOAuthClient
+	lookup      RefreshTokenLookup
+}
+
+func NewGoogleOAuthTokenSource(oauthClient *GoogleOAuthClient, lookup RefreshTokenLookup) (*GoogleOAuthTokenSource, error) {
+	if oauthClient == nil {
+		return nil, errors.New("Google OAuth client is required")
+	}
+	if lookup == nil {
+		return nil, errors.New("refresh token lookup is required")
+	}
+	return &GoogleOAuthTokenSource{oauthClient: oauthClient, lookup: lookup}, nil
+}
+
+func (s *GoogleOAuthTokenSource) AccessToken(ctx context.Context, connectionID string) (string, error) {
+	if s == nil || s.oauthClient == nil || s.lookup == nil {
+		return "", errors.New("Google OAuth token source is not configured")
+	}
+	if strings.TrimSpace(connectionID) == "" {
+		return "", errors.New("Gmail connection ID is empty")
+	}
+	refreshToken, err := s.lookup(ctx, connectionID)
+	if err != nil {
+		return "", fmt.Errorf("load Gmail connection refresh token: %w", err)
+	}
+	token, err := s.oauthClient.ExchangeRefreshToken(ctx, refreshToken)
+	if err != nil {
+		return "", err
+	}
+	return token.Value, nil
+}
+
+// GmailHTTPClient makes Gmail API requests for one server-side connection at a
+// time. The worker supplies its short-lived access token per request, keeping
+// this client safe to reuse across separate connections.
+type GmailHTTPClient struct {
+	httpClient *http.Client
+	baseURL    *url.URL
+}
+
+func NewGmailHTTPClient(httpClient *http.Client) (*GmailHTTPClient, error) {
+	return newGmailHTTPClient(httpClient, defaultGmailAPIBaseURL)
+}
+
+func newGmailHTTPClient(httpClient *http.Client, baseURL string) (*GmailHTTPClient, error) {
+	parsed, err := url.Parse(baseURL)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		return nil, errors.New("Gmail API URL must be an absolute HTTPS URL")
+	}
+	if !strings.HasSuffix(parsed.Path, "/") {
+		parsed.Path += "/"
+	}
+	return &GmailHTTPClient{
+		httpClient: providerHTTPClient(httpClient),
+		baseURL:    parsed,
+	}, nil
+}
+
+const (
+	historyCursorPrefix = "history:"
+	maxHistoryPages     = 3
+	historyPageSize     = 100
+)
+
+// ListLabelMessages returns the initial bounded newest messages only when no
+// cursor exists. New messages use a Gmail history cursor. Expired or legacy
+// cursor values use bounded full-label recovery; neither path advances a
+// cursor after an incomplete read.
+func (c *GmailHTTPClient) ListLabelMessages(ctx context.Context, accessToken, label, cursor string, maxResults int) ([]GmailMessageRef, string, error) {
+	if c == nil {
+		return nil, "", errors.New("Gmail client is nil")
+	}
+	if strings.TrimSpace(accessToken) == "" {
+		return nil, "", errors.New("Gmail access token is empty")
+	}
+	if strings.TrimSpace(label) == "" {
+		return nil, "", errors.New("Gmail label is empty")
+	}
+	if maxResults < 1 || maxResults > 500 {
+		return nil, "", errors.New("Gmail maximum results must be between 1 and 500")
+	}
+	labelID, err := c.resolveLabelID(ctx, accessToken, label)
+	if err != nil {
+		return nil, "", err
+	}
+	if cursor == "" {
+		return c.initialLabelMessages(ctx, accessToken, labelID, maxResults)
+	}
+	if strings.HasPrefix(cursor, historyCursorPrefix) {
+		refs, next, err := c.historyAddedMessages(ctx, accessToken, labelID, strings.TrimPrefix(cursor, historyCursorPrefix))
+		if err == nil {
+			return refs, next, nil
+		}
+		if !errors.Is(err, errHistoryExpired) {
+			return nil, "", err
+		}
+		return c.recoverLabelMessages(ctx, accessToken, labelID)
+	}
+	// Older builds persisted a page-token-like cursor rather than a Gmail
+	// History ID. Treat it as incomplete state and recover the full label: using
+	// the initial five-message backfill here would silently drop older messages.
+	return c.recoverLabelMessages(ctx, accessToken, labelID)
+}
+
+var errHistoryExpired = errors.New("Gmail history cursor expired")
+
+const maxRecoveryPages = 50
+
+func (c *GmailHTTPClient) recoverLabelMessages(ctx context.Context, accessToken, labelID string) ([]GmailMessageRef, string, error) {
+	next, err := c.currentHistoryCursor(ctx, accessToken)
+	if err != nil {
+		return nil, "", err
+	}
+	refs := make([]GmailMessageRef, 0)
+	pageToken := ""
+	for page := 0; page < maxRecoveryPages; page++ {
+		query := url.Values{"labelIds": {labelID}, "maxResults": {"100"}}
+		if pageToken != "" {
+			query.Set("pageToken", pageToken)
+		}
+		var listed struct {
+			Messages []struct {
+				ID       string `json:"id"`
+				ThreadID string `json:"threadId"`
+			} `json:"messages"`
+			NextPageToken string `json:"nextPageToken"`
+		}
+		if err := c.getJSON(ctx, accessToken, "users/me/messages", query, &listed); err != nil {
+			return nil, "", err
+		}
+		for _, message := range listed.Messages {
+			metadata, err := c.messageMetadata(ctx, accessToken, message.ID)
+			if err != nil {
+				if isHistoryExpiredError(err) {
+					// A message can disappear after list/recovery but before its
+					// metadata request. It is not actionable evidence and must not
+					// make an otherwise complete recovery permanently fail.
+					continue
+				}
+				return nil, "", err
+			}
+			threadID := message.ThreadID
+			if threadID == "" {
+				threadID = metadata.ThreadID
+			}
+			refs = append(refs, GmailMessageRef{ID: message.ID, ThreadID: threadID, ReceivedAt: metadata.ReceivedAt})
+		}
+		if listed.NextPageToken == "" {
+			sort.Slice(refs, func(i, j int) bool { return refs[i].ReceivedAt.After(refs[j].ReceivedAt) })
+			return refs, next, nil
+		}
+		if page == maxRecoveryPages-1 {
+			return nil, "", errors.New("Gmail recovery pagination safety bound reached")
+		}
+		pageToken = listed.NextPageToken
+	}
+	return nil, "", errors.New("Gmail recovery pagination ended unexpectedly")
+}
+
+func (c *GmailHTTPClient) initialLabelMessages(ctx context.Context, accessToken, labelID string, maxResults int) ([]GmailMessageRef, string, error) {
+	// Capture a lower bound before listing. A message arriving during the list
+	// will be replayed on the next History sync instead of being skipped.
+	next, err := c.currentHistoryCursor(ctx, accessToken)
+	if err != nil {
+		return nil, "", err
+	}
+	query := url.Values{"labelIds": {labelID}, "maxResults": {strconv.Itoa(maxResults)}}
+	var listed struct {
+		Messages []struct {
+			ID       string `json:"id"`
+			ThreadID string `json:"threadId"`
+		} `json:"messages"`
+	}
+	if err := c.getJSON(ctx, accessToken, "users/me/messages", query, &listed); err != nil {
+		return nil, "", err
+	}
+	refs := make([]GmailMessageRef, 0, len(listed.Messages))
+	for _, message := range listed.Messages {
+		if message.ID == "" {
+			return nil, "", errors.New("Gmail list response contains a message without an ID")
+		}
+		metadata, err := c.messageMetadata(ctx, accessToken, message.ID)
+		if err != nil {
+			if isHistoryExpiredError(err) {
+				// A message may be deleted after the initial list. The profile
+				// history ID was captured before listing, so skipping this vanished
+				// item cannot skip a still-existing message on the next sync.
+				continue
+			}
+			return nil, "", err
+		}
+		threadID := message.ThreadID
+		if threadID == "" {
+			threadID = metadata.ThreadID
+		}
+		refs = append(refs, GmailMessageRef{ID: message.ID, ThreadID: threadID, ReceivedAt: metadata.ReceivedAt})
+	}
+	return refs, next, nil
+}
+
+func (c *GmailHTTPClient) historyAddedMessages(ctx context.Context, accessToken, labelID, startHistoryID string) ([]GmailMessageRef, string, error) {
+	if strings.TrimSpace(startHistoryID) == "" {
+		return nil, "", errHistoryExpired
+	}
+	seen := make(map[string]GmailMessageRef)
+	pageToken := ""
+	for page := 0; page < maxHistoryPages; page++ {
+		// Gmail historyTypes accepts one enum value; omit it to receive both
+		// messagesAdded and labelsAdded, then filter safely in this client.
+		query := url.Values{"startHistoryId": {startHistoryID}, "labelId": {labelID}, "maxResults": {strconv.Itoa(historyPageSize)}}
+		if pageToken != "" {
+			query.Set("pageToken", pageToken)
+		}
+		var response struct {
+			HistoryID string `json:"historyId"`
+			History   []struct {
+				MessagesAdded []struct {
+					Message struct {
+						ID       string `json:"id"`
+						ThreadID string `json:"threadId"`
+					} `json:"message"`
+				} `json:"messagesAdded"`
+				LabelsAdded []struct {
+					Message struct {
+						ID       string `json:"id"`
+						ThreadID string `json:"threadId"`
+					} `json:"message"`
+					LabelIDs []string `json:"labelIds"`
+				} `json:"labelsAdded"`
+			} `json:"history"`
+			NextPageToken string `json:"nextPageToken"`
+		}
+		err := c.getJSON(ctx, accessToken, "users/me/history", query, &response)
+		if err != nil {
+			if isHistoryExpiredError(err) {
+				return nil, "", errHistoryExpired
+			}
+			return nil, "", err
+		}
+		for _, history := range response.History {
+			for _, added := range history.MessagesAdded {
+				if added.Message.ID == "" {
+					continue
+				}
+				if _, exists := seen[added.Message.ID]; exists {
+					continue
+				}
+				metadata, metadataErr := c.messageMetadata(ctx, accessToken, added.Message.ID)
+				if metadataErr != nil {
+					if isHistoryExpiredError(metadataErr) {
+						continue
+					}
+					return nil, "", metadataErr
+				}
+				threadID := added.Message.ThreadID
+				if threadID == "" {
+					threadID = metadata.ThreadID
+				}
+				seen[added.Message.ID] = GmailMessageRef{ID: added.Message.ID, ThreadID: threadID, ReceivedAt: metadata.ReceivedAt}
+			}
+			for _, added := range history.LabelsAdded {
+				if added.Message.ID == "" || !containsLabel(added.LabelIDs, labelID) {
+					continue
+				}
+				if _, exists := seen[added.Message.ID]; exists {
+					continue
+				}
+				metadata, metadataErr := c.messageMetadata(ctx, accessToken, added.Message.ID)
+				if metadataErr != nil {
+					if isHistoryExpiredError(metadataErr) {
+						continue
+					}
+					return nil, "", metadataErr
+				}
+				threadID := added.Message.ThreadID
+				if threadID == "" {
+					threadID = metadata.ThreadID
+				}
+				seen[added.Message.ID] = GmailMessageRef{ID: added.Message.ID, ThreadID: threadID, ReceivedAt: metadata.ReceivedAt}
+			}
+		}
+		if response.NextPageToken == "" {
+			if strings.TrimSpace(response.HistoryID) == "" {
+				return nil, "", errors.New("Gmail history response omitted history ID")
+			}
+			return sortedGmailMessageRefs(seen), historyCursorPrefix + response.HistoryID, nil
+		}
+		if page == maxHistoryPages-1 {
+			// Never advance the cursor after seeing only part of a history
+			// window: doing so would silently lose the remaining messages.
+			return nil, "", errors.New("Gmail history pagination safety bound reached")
+		}
+		pageToken = response.NextPageToken
+	}
+	return nil, "", errors.New("Gmail history pagination ended unexpectedly")
+}
+
+func containsLabel(labels []string, wanted string) bool {
+	for _, label := range labels {
+		if label == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+func sortedGmailMessageRefs(seen map[string]GmailMessageRef) []GmailMessageRef {
+	refs := make([]GmailMessageRef, 0, len(seen))
+	for _, ref := range seen {
+		refs = append(refs, ref)
+	}
+	sort.Slice(refs, func(i, j int) bool {
+		if refs[i].ReceivedAt.Equal(refs[j].ReceivedAt) {
+			return refs[i].ID > refs[j].ID
+		}
+		return refs[i].ReceivedAt.After(refs[j].ReceivedAt)
+	})
+	return refs
+}
+
+func (c *GmailHTTPClient) currentHistoryCursor(ctx context.Context, accessToken string) (string, error) {
+	var profile struct {
+		HistoryID string `json:"historyId"`
+	}
+	if err := c.getJSON(ctx, accessToken, "users/me/profile", nil, &profile); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(profile.HistoryID) == "" {
+		return "", errors.New("Gmail profile omitted history ID")
+	}
+	return historyCursorPrefix + profile.HistoryID, nil
+}
+
+func isHistoryExpiredError(err error) bool {
+	var status *gmailHTTPError
+	return errors.As(err, &status) && status.StatusCode == http.StatusNotFound
+}
+
+func (c *GmailHTTPClient) GetMessage(ctx context.Context, accessToken, messageID string) (GmailMessage, error) {
+	if c == nil {
+		return GmailMessage{}, errors.New("Gmail client is nil")
+	}
+	if strings.TrimSpace(messageID) == "" {
+		return GmailMessage{}, errors.New("Gmail message ID is empty")
+	}
+	if strings.TrimSpace(accessToken) == "" {
+		return GmailMessage{}, errors.New("Gmail access token is empty")
+	}
+	var full gmailMessagePayload
+	if err := c.getJSON(ctx, accessToken, "users/me/messages/"+url.PathEscape(messageID), url.Values{"format": {"full"}}, &full); err != nil {
+		if isHistoryExpiredError(err) {
+			return GmailMessage{}, fmt.Errorf("%w: %v", ErrGmailMessageUnavailable, err)
+		}
+		return GmailMessage{}, err
+	}
+	receivedAt, err := parseInternalDate(full.InternalDate)
+	if err != nil {
+		return GmailMessage{}, err
+	}
+	message := GmailMessage{
+		ID:         firstNonEmpty(full.ID, messageID),
+		ThreadID:   full.ThreadID,
+		ReceivedAt: receivedAt,
+		Headers:    normalizedHeaders(full.Payload.Headers),
+	}
+	if err := c.collectPayload(ctx, accessToken, message.ID, full.Payload, &message); err != nil {
+		if isHistoryExpiredError(err) {
+			return GmailMessage{}, fmt.Errorf("%w: %v", ErrGmailMessageUnavailable, err)
+		}
+		return GmailMessage{}, err
+	}
+	message.HTML = normalizeEmailContent(message.HTML)
+	message.Text = normalizeEmailContent(message.Text)
+	return message, nil
+}
+
+type gmailMessageMetadata struct {
+	ThreadID     string    `json:"threadId"`
+	InternalDate string    `json:"internalDate"`
+	ReceivedAt   time.Time `json:"-"`
+}
+
+func (c *GmailHTTPClient) messageMetadata(ctx context.Context, accessToken, messageID string) (gmailMessageMetadata, error) {
+	var metadata gmailMessageMetadata
+	err := c.getJSON(ctx, accessToken, "users/me/messages/"+url.PathEscape(messageID), url.Values{"format": {"metadata"}}, &metadata)
+	if err != nil {
+		return gmailMessageMetadata{}, err
+	}
+	receivedAt, err := parseInternalDate(metadata.InternalDate)
+	if err != nil {
+		return gmailMessageMetadata{}, err
+	}
+	metadata.ReceivedAt = receivedAt
+	return metadata, nil
+}
+
+func (c *GmailHTTPClient) resolveLabelID(ctx context.Context, accessToken, label string) (string, error) {
+	var response struct {
+		Labels []struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"labels"`
+	}
+	if err := c.getJSON(ctx, accessToken, "users/me/labels", nil, &response); err != nil {
+		return "", err
+	}
+	for _, candidate := range response.Labels {
+		if candidate.ID == label || candidate.Name == label {
+			if candidate.ID == "" {
+				break
+			}
+			return candidate.ID, nil
+		}
+	}
+	return "", errors.New("Gmail label was not found")
+}
+
+type gmailMessagePayload struct {
+	ID           string       `json:"id"`
+	ThreadID     string       `json:"threadId"`
+	InternalDate string       `json:"internalDate"`
+	Payload      gmailPayload `json:"payload"`
+}
+
+type gmailPayload struct {
+	MIMEType string           `json:"mimeType"`
+	Filename string           `json:"filename"`
+	Headers  []gmailHeader    `json:"headers"`
+	Body     gmailMessageBody `json:"body"`
+	Parts    []gmailPayload   `json:"parts"`
+}
+
+type gmailHeader struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+type gmailMessageBody struct {
+	AttachmentID string `json:"attachmentId"`
+	Size         int64  `json:"size"`
+	Data         string `json:"data"`
+}
+
+func (c *GmailHTTPClient) collectPayload(ctx context.Context, accessToken, messageID string, payload gmailPayload, message *GmailMessage) error {
+	if message == nil {
+		return errors.New("Gmail message output is nil")
+	}
+	mediaType := normalizedMediaType(payload.MIMEType)
+	if payload.Filename != "" {
+		attachment, include, err := c.attachment(ctx, accessToken, messageID, payload, mediaType)
+		if err != nil {
+			return err
+		}
+		if include {
+			message.Attachments = append(message.Attachments, attachment)
+		}
+		// A named part is an attachment, even when Gmail also gives it a text
+		// MIME type. Do not accidentally mix a document into the email body.
+		return nil
+	}
+
+	if len(payload.Parts) > 0 {
+		for _, part := range payload.Parts {
+			if err := c.collectPayload(ctx, accessToken, messageID, part, message); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if payload.Body.Data == "" || (mediaType != "text/plain" && mediaType != "text/html") {
+		return nil
+	}
+	content, err := decodeGmailBase64(payload.Body.Data)
+	if err != nil {
+		return fmt.Errorf("decode Gmail message body: %w", err)
+	}
+	remaining := maxGmailBodyBytes - len(message.Text) - len(message.HTML)
+	if remaining < 0 {
+		remaining = 0
+	}
+	decoded := strings.ToValidUTF8(string(content), "\uFFFD")
+	switch mediaType {
+	case "text/plain":
+		var truncated bool
+		message.Text, truncated = appendBoundedEmailContent(message.Text, decoded, remaining)
+		message.BodyTruncated = message.BodyTruncated || truncated
+	case "text/html":
+		var truncated bool
+		message.HTML, truncated = appendBoundedEmailContent(message.HTML, decoded, remaining)
+		message.BodyTruncated = message.BodyTruncated || truncated
+	}
+	return nil
+}
+
+func (c *GmailHTTPClient) attachment(ctx context.Context, accessToken, messageID string, payload gmailPayload, mediaType string) (GmailAttachment, bool, error) {
+	if !supportedGmailAttachmentType(mediaType) || payload.Body.Size > maxGmailAttachmentBytes {
+		return GmailAttachment{}, false, nil
+	}
+	content, err := c.attachmentContent(ctx, accessToken, messageID, payload.Body)
+	if err != nil {
+		return GmailAttachment{}, false, err
+	}
+	if int64(len(content)) > maxGmailAttachmentBytes {
+		return GmailAttachment{}, false, nil
+	}
+	return GmailAttachment{
+		ID:       payload.Body.AttachmentID,
+		Filename: path.Base(payload.Filename),
+		MIMEType: mediaType,
+		Size:     int64(len(content)),
+		Content:  content,
+	}, true, nil
+}
+
+func (c *GmailHTTPClient) attachmentContent(ctx context.Context, accessToken, messageID string, body gmailMessageBody) ([]byte, error) {
+	if body.Data != "" {
+		content, err := decodeGmailBase64(body.Data)
+		if err != nil {
+			return nil, fmt.Errorf("decode Gmail attachment: %w", err)
+		}
+		return content, nil
+	}
+	if body.AttachmentID == "" {
+		return nil, errors.New("Gmail attachment has no content")
+	}
+	var response struct {
+		Data string `json:"data"`
+	}
+	resource := "users/me/messages/" + url.PathEscape(messageID) + "/attachments/" + url.PathEscape(body.AttachmentID)
+	if err := c.getJSON(ctx, accessToken, resource, nil, &response); err != nil {
+		return nil, err
+	}
+	content, err := decodeGmailBase64(response.Data)
+	if err != nil {
+		return nil, fmt.Errorf("decode Gmail attachment: %w", err)
+	}
+	return content, nil
+}
+
+func (c *GmailHTTPClient) getJSON(ctx context.Context, accessToken, resource string, query url.Values, target any) error {
+	if strings.TrimSpace(accessToken) == "" {
+		return errors.New("Gmail access token is empty")
+	}
+	relative, err := url.Parse(resource)
+	if err != nil {
+		return fmt.Errorf("create Gmail resource URL: %w", err)
+	}
+	endpoint := c.baseURL.ResolveReference(relative)
+	endpoint.RawQuery = query.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return fmt.Errorf("create Gmail request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Accept", "application/json")
+	response, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("send Gmail request: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+		return &gmailHTTPError{StatusCode: response.StatusCode}
+	}
+	if err := decodeJSON(response.Body, target); err != nil {
+		return fmt.Errorf("decode Gmail API response: %w", err)
+	}
+	return nil
+}
+
+type gmailHTTPError struct{ StatusCode int }
+
+func (e *gmailHTTPError) Error() string {
+	return fmt.Sprintf("Gmail API request returned status %d", e.StatusCode)
+}
+
+func providerHTTPClient(client *http.Client) *http.Client {
+	if client != nil {
+		return client
+	}
+	return &http.Client{Timeout: defaultProviderHTTPTimeout}
+}
+
+func decodeJSON(reader io.Reader, target any) error {
+	decoder := json.NewDecoder(io.LimitReader(reader, 32*1024*1024))
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	return nil
+}
+
+func decodeGmailBase64(value string) ([]byte, error) {
+	if value == "" {
+		return nil, errors.New("Gmail base64 content is empty")
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(value)
+	if err == nil {
+		return decoded, nil
+	}
+	decoded, paddedErr := base64.URLEncoding.DecodeString(value)
+	if paddedErr != nil {
+		return nil, errors.New("Gmail base64 content is invalid")
+	}
+	return decoded, nil
+}
+
+func parseInternalDate(value string) (time.Time, error) {
+	milliseconds, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || milliseconds < 0 {
+		return time.Time{}, errors.New("Gmail message has an invalid internal date")
+	}
+	return time.UnixMilli(milliseconds).UTC(), nil
+}
+
+func normalizedHeaders(headers []gmailHeader) map[string]string {
+	if len(headers) == 0 {
+		return nil
+	}
+	result := make(map[string]string, len(headers))
+	for _, header := range headers {
+		name := strings.ToLower(strings.TrimSpace(header.Name))
+		if name == "" || strings.TrimSpace(header.Value) == "" {
+			continue
+		}
+		if _, exists := result[name]; !exists {
+			value := strings.TrimSpace(strings.ToValidUTF8(header.Value, "\uFFFD"))
+			value, _ = truncateUTF8(value, maxGmailHeaderValueBytes)
+			result[name] = value
+		}
+	}
+	return result
+}
+
+func normalizedMediaType(value string) string {
+	mediaType, _, err := mime.ParseMediaType(value)
+	if err != nil {
+		return strings.ToLower(strings.TrimSpace(value))
+	}
+	return strings.ToLower(mediaType)
+}
+
+func supportedGmailAttachmentType(mediaType string) bool {
+	switch mediaType {
+	case "application/pdf", "image/bmp", "image/jpeg", "image/png", "image/tiff", "image/webp", "image/heic":
+		return true
+	default:
+		return false
+	}
+}
+
+func appendBoundedEmailContent(current, next string, remaining int) (string, bool) {
+	separator := ""
+	if current != "" {
+		separator = "\n\n"
+	}
+	if remaining <= len(separator) {
+		return current, next != ""
+	}
+	next, truncated := truncateUTF8(next, remaining-len(separator))
+	if next == "" {
+		return current, truncated
+	}
+	return current + separator + next, truncated
+}
+
+func truncateUTF8(value string, maxBytes int) (string, bool) {
+	if len(value) <= maxBytes {
+		return value, false
+	}
+	if maxBytes <= 0 {
+		return "", true
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.ValidString(value[:cut]) {
+		cut--
+	}
+	return value[:cut], true
+}
+
+func normalizeEmailContent(value string) string {
+	value = strings.ReplaceAll(value, "\r\n", "\n")
+	value = strings.ReplaceAll(value, "\r", "\n")
+	return strings.TrimSpace(value)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+// DevelopmentRefreshToken is intentionally unavailable outside local development.
+type DevelopmentRefreshToken interface {
+	DevelopmentRefreshToken() (string, bool)
+}
+
+// LocalDevelopmentTokenSource supports the explicitly configured local test account.
+// It must never be constructed for a deployed environment or persisted to application data.
+type LocalDevelopmentTokenSource struct {
+	refreshToken string
+}
+
+func NewLocalDevelopmentTokenSource(environment, refreshToken string) (*LocalDevelopmentTokenSource, error) {
+	if environment != "development" {
+		return nil, errors.New("development refresh tokens are unavailable outside development")
+	}
+	if refreshToken == "" {
+		return nil, errors.New("development refresh token is empty")
+	}
+	return &LocalDevelopmentTokenSource{refreshToken: refreshToken}, nil
+}
+
+func (s *LocalDevelopmentTokenSource) DevelopmentRefreshToken() (string, bool) {
+	if s == nil || s.refreshToken == "" {
+		return "", false
+	}
+	return s.refreshToken, true
+}

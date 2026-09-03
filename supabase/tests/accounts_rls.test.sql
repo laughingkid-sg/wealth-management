@@ -1,7 +1,7 @@
 begin;
 
 create extension if not exists pgtap with schema extensions;
-select plan(11);
+select plan(13);
 
 insert into auth.users (id, email) values
   ('11111111-1111-1111-1111-111111111111', 'account-owner@example.com'),
@@ -30,6 +30,21 @@ select lives_ok(
   $$insert into public.accounts (user_id, side, account_type, name, institution_name)
     values ('11111111-1111-1111-1111-111111111111', 'asset', 'digital_wallet', 'Everyday wallet', 'Apple')$$,
   'an authenticated user can create a digital wallet asset account'
+);
+
+select lives_ok(
+  $$insert into public.accounts (user_id, side, account_type, name, institution_name)
+    values
+      ('11111111-1111-1111-1111-111111111111', 'asset', 'robo_advisor', 'Managed portfolio', 'Advisor'),
+      ('11111111-1111-1111-1111-111111111111', 'asset', 'retirement_account', 'Retirement', 'Pension provider'),
+      ('11111111-1111-1111-1111-111111111111', 'asset', 'other', 'Other asset', 'Other institution')$$,
+  'an authenticated user can create every newly supported asset account type'
+);
+
+select lives_ok(
+  $$insert into public.accounts (user_id, side, account_type, name, institution_name)
+    values ('11111111-1111-1111-1111-111111111111', 'liability', 'other', 'Other liability', 'Other institution')$$,
+  'an authenticated user can create an other liability account'
 );
 
 select throws_ok(

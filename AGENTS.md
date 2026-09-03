@@ -35,6 +35,7 @@ Keep the frontend, API, and database concerns separate. Browser code may use Sup
 ## Supabase rules
 
 - Use the available Supabase skill and MCP/documentation before implementing Supabase features; verify current API/CLI behaviour rather than relying on memory.
+- Use the configured hosted/remote Supabase project for development and testing by default. Do not start or use a local Docker Supabase instance unless the user explicitly requests it.
 - Never expose the Supabase `service_role`/secret key in frontend code or any public environment variable. The frontend may use only the publishable (or legacy anon) key.
 - Enable RLS on every browser-accessible table and write policies that restrict rows to the authenticated user. Policies must enforce ownership, not merely `TO authenticated`.
 - Treat `user_metadata` as user-controlled; do not use it for authorization.
@@ -46,6 +47,7 @@ Keep the frontend, API, and database concerns separate. Browser code may use Sup
 - Never commit secrets, Supabase tokens, private keys, or populated `.env` files.
 - Avoid unrelated refactors and preserve existing user changes.
 - Run the narrowest relevant checks after changes (typecheck, lint, tests, or targeted API tests).
+- The hosted project is currently a development environment. Breaking schema changes and deletion or rebuilding of development feature data are allowed when they are part of the agreed scope; backward compatibility is not required unless the user asks for it. Preserve authentication users unless the user explicitly names them for deletion. Before any destructive change, resolve the exact database and Storage targets, and remove all dependent rows and objects so no orphaned data remains.
 
 ## Documentation structure
 
@@ -69,5 +71,7 @@ The completed Accounts feature may be captured as one initial commit because its
 
 ## Collaboration
 
-- Before a page is built, clarify its user goal, primary actions, data it needs, and success/empty/error states if they are not already evident.
+- Before any coding begins, clarify every relevant detail of the requested work and communicate the agreed scope clearly. This includes the user goal, primary actions, data model and ownership, validation and business rules, UI behaviour, loading/empty/error/success states, security and integration boundaries, documentation impact, and acceptance criteria. Do not make implementation assumptions where a detail could materially change the result; resolve it with the user first.
+- Do not request environment variables, credentials, OAuth setup, or other implementation configuration while drafting or agreeing a PRD and TD. Once the plan is confirmed, request all required setup inputs together, validate the integrations, and only then begin implementation.
+- Always use subagents for implementation work. Divide implementation into focused, non-overlapping subtasks, and retain coordination, integration, and verification responsibility in the primary task.
 - When parallel work is explicitly requested, divide it into independent, non-overlapping tasks and avoid concurrent edits to the same files.
