@@ -994,13 +994,7 @@ function AccountsPage({
                 }
               >
                 <option value="all">All types</option>
-                {(side === "all"
-                  ? [
-                      ...accountTypesForSide("asset"),
-                      ...accountTypesForSide("liability"),
-                    ]
-                  : accountTypesForSide(side)
-                ).map((item) => (
+                {accountTypesForSide(side).map((item) => (
                   <option key={item.value} value={item.value}>
                     {item.label}
                   </option>
