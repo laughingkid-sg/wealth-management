@@ -16,7 +16,7 @@ Accounts owns a user-owned account directory. It does not calculate balances, cu
 - The visible sort options are name A–Z and Z–A. `sort_order` remains an internal stable database value and is not editable in the UI.
 - Other sidebar features are outside the Accounts boundary; Transactions is implemented and documented separately.
 
-The frontend uses only `VITE_SUPABASE_URL` and `VITE_SUPABASE_PUBLISHABLE_KEY`. Do not expose a secret or service-role key.
+Accounts uses `VITE_SUPABASE_URL` and `VITE_SUPABASE_PUBLISHABLE_KEY`. The SPA additionally accepts optional `VITE_API_BASE_URL` for Transactions; see the [Transactions technical implementation](../transactions/technical.md). Do not expose a secret or service-role key in any frontend variable.
 
 ## Supabase data and RLS
 

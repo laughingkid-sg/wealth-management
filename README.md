@@ -1,6 +1,6 @@
 # Wealth Builder
 
-Wealth Builder is a private, multi-user personal-finance SPA for organizing financial accounts and turning transaction evidence into account-linked records. The current product includes working **Accounts** and **Transactions** features backed by a hosted Supabase project.
+Wealth Builder is a private personal-finance SPA for organizing financial accounts and turning transaction evidence into account-linked records. Its data model applies per-user ownership boundaries, while the initial delivery uses one provisioned email/password user. The current product includes working **Accounts** and **Transactions** features backed by a hosted Supabase project.
 
 Users sign in with a provisioned Supabase email/password account. Public registration is not available. Google OAuth is used only to connect Gmail for transaction ingestion; it is not a Wealth Builder sign-in method.
 
@@ -11,7 +11,7 @@ Users sign in with a provisioned Supabase email/password account. Public registr
 Signed-in users can maintain their own account directory:
 
 - Asset and liability types covering bank, brokerage, digital-wallet, crypto, RSU, robo-advisor, retirement, credit-card, personal-loan, and other accounts.
-- Required account and institution names, with optional safe identifiers, notes, and custom metadata.
+- Required account and institution names, with optional identifiers, notes, and custom metadata.
 - Search, filtering, alphabetical sorting, expandable metadata, create/edit, soft-delete, and restore.
 - Responsive loading, empty, validation, and error states.
 

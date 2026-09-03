@@ -2,7 +2,7 @@
 
 ## User goal
 
-> I can sign in and keep a clean, private list of my bank, brokerage, crypto, RSU, and liability accounts before the product starts tracking financial values.
+> I can sign in and keep a clean, private list of my bank, brokerage, crypto, RSU, and liability accounts, separate from the values and transactions tracked elsewhere in the product.
 
 ## Scope
 
@@ -10,7 +10,7 @@ Accounts is a user-owned directory only. It stores descriptive identity and meta
 
 ### Included
 
-- Email/password sign-in with Supabase Auth; no public sign-up or OAuth.
+- Email/password sign-in with Supabase Auth; no public sign-up or OAuth-based sign-in.
 - Create, edit, search, filter, alphabetically sort, soft-delete, and restore accounts.
 - Click anywhere on an account header row—its icon, text, or whitespace—to expand or collapse its safe custom metadata. Header action buttons remain independent, and clicks inside expanded details do not toggle the row.
 - Add and Edit use a popup that closes with Escape except while a save is in progress.
@@ -36,11 +36,11 @@ Accounts is a user-owned directory only. It stores descriptive identity and meta
 | Account type | Required and limited by side. |
 | Account name | Required, 1–100 characters. |
 | Institution/platform | Required, 1–100 characters. |
-| Account identification | Optional safe free-text reference, maximum 100 characters. |
+| Account identification | Optional free-text reference, maximum 100 characters. |
 | Notes | Optional plain text, maximum 500 characters. |
-| Metadata | Optional safe user-defined key/value data. |
+| Metadata | Optional string key/value data. Nonblank keys must be unique; a value requires a key, and blank-key entries are omitted on save. |
 
-Never store credentials, full account or card numbers, private keys, or seed phrases.
+The form warns users not to enter credentials, full account or card numbers, private keys, or seed phrases. It does not detect, redact, or reject sensitive content, so users must not enter it.
 
 ## Acceptance criteria
 

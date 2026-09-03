@@ -17,7 +17,7 @@ Documentation is organised by scope so a feature change does not require reading
 | Feature | Status |
 | --- | --- |
 | Accounts | Delivered as the account directory used by other finance features; current automated and signed-out-browser verification is recorded in its technical document. |
-| Transactions | Implemented and release-verified on `codex/feat-transaction`; hosted migration, live provider/Storage, replay-idempotency, database, Go, and frontend checks pass. Two environment-limited manual checks are explicitly recorded in the Transactions technical document. |
+| Transactions | Implemented and release-verified, then merged to `main` in PR #3; hosted migration, live provider/Storage, replay-idempotency, database, Go, and frontend checks pass. Two environment-limited manual checks are explicitly recorded in the Transactions technical document. |
 
 ## Maintenance rule
 
