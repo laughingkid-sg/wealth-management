@@ -15,7 +15,7 @@ backend/
 ├── internal/              all application code (not importable outside the module)
 ├── .air.api.toml          Air hot-reload config for the API
 ├── .air.worker.toml       Air hot-reload config for the worker
-├── Dockerfile.dev         dev image (Go + Air), used by both api and worker
+├── Dockerfile.dev         Alpine dev image (Go + Air, multi-stage); api and worker
 ├── .env.example           full server-only env contract
 └── go.mod / go.sum
 ```
@@ -28,6 +28,22 @@ backend/
 
 That's the entire direct dependency set. Prefer the standard library before adding
 anything new.
+
+### System dependencies (dev image)
+
+`backend/Dockerfile.dev` is **Alpine-based** and multi-stage: Air (the hot-reload
+watcher) is compiled in a separate `air-builder` stage so its build caches never ship
+in the runtime image, which keeps the Go toolchain plus these `apk` runtime tools:
+
+- `poppler-utils` — rasterise PDF attachments to images.
+- `imagemagick` (+ `imagemagick-heic`) — convert image attachments (incl. HEIC) to PNG.
+- `curl` (API healthcheck), `procps` (`pgrep` worker healthcheck), `ca-certificates`.
+
+Before the worker sends evidence to the LLM it renders attachments to model-safe
+images — only PNG/JPEG/WebP/GIF ≤ 5 MiB are sent: PDFs via poppler, and images to PNG
+via `sips` on macOS or ImageMagick `magick` on Linux. `transactionworker.imageConversionCommand`
+picks the tool by `runtime.GOOS`, so the same code path works on a macOS host and in
+the Alpine container. The `frontend` dev image is `node:22-alpine`.
 
 ## The two entrypoints
 

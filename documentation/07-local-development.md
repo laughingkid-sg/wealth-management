@@ -66,6 +66,16 @@ bind-mounted; named volumes cache `node_modules` and the Go module/build caches.
 The browser calls stay same-origin on `:8085/api/*`; Vite strips `/api` and proxies
 to `http://api:8080` over the private Compose network.
 
+The `api`/`worker` and `frontend` dev images are **Alpine-based** to stay small (the
+backend compiles Air in a separate build stage; the backend image ships the
+attachment-rendering tools `imagemagick`+`imagemagick-heic` and `poppler-utils`). See
+[03 — Backend](03-backend.md#system-dependencies-dev-image).
+
+> **Switching an existing checkout from the older Debian images:** run
+> `docker compose down --volumes` **once** before rebuilding, so glibc-built frontend
+> packages and Go cache entries aren't reused under Alpine's musl. Ordinary `down`/`up`
+> afterward preserves the Alpine-compatible caches.
+
 ## Everyday commands
 
 ```bash
