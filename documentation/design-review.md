@@ -42,7 +42,7 @@ and exactly `5`, hard-failing startup otherwise.
   Safety-critical validations are unchanged. See `internal/config/config.go` and
   `internal/config/config_test.go`.
 
-### 2. A few god-files  · impact: high (readability) · effort: med · risk: low
+### 2. A few god-files  · impact: high (readability) · effort: med · risk: low  · ◑ in progress
 | File | Lines | Note |
 | --- | --- | --- |
 | `backend/internal/transactions/http.go` | ~1,755 | All transaction handlers in one file. |
@@ -54,7 +54,15 @@ None are architecturally wrong; they're big enough to slow every future change a
 review. Best targets: split `transactions/http.go` by sub-domain (gmail / sources /
 settings / transactions), and extract `AccountsPage` out of `App.tsx`.
 
-### 3. Inconsistent frontend structure  · impact: low-med · effort: low · risk: low
+- **Done (2026-09-04):** `App.tsx` `1313 → 149` lines — the Accounts/workspace UI moved
+  to `features/accounts/AccountsPage.tsx` (see #3). `transactions/http.go` `1755 → 1153`
+  — the Gmail/sync handlers moved to `gmail.go` and the response/encoding helpers to
+  `responses.go` (same package, no behaviour change; `go build`/`vet`/tests green).
+- **Remaining:** `features/transactions/api.ts` (~1,482) and
+  `account-balances/AccountFinanceDetailPage.tsx` (~1,400) are still monolithic —
+  follow-up, lower priority.
+
+### 3. Inconsistent frontend structure  · impact: low-med · effort: low · risk: low  · ✅ done
 Every feature is a folder under `features/` **except Accounts, which lives inside
 `App.tsx`**. Move Accounts into `features/accounts/` to match the rest.
 
@@ -62,6 +70,12 @@ Related (optional): navigation is hand-rolled query-param + `popstate`. Avoiding
 router library is defensible, but the cost shows up as `App.tsx` sprawl. A ~30-line
 routes module (no new dependency) would contain it. Note the deliberate tradeoff
 before adding a router lib.
+
+- **Resolved (2026-09-04):** the Accounts/workspace UI now lives in
+  `features/accounts/AccountsPage.tsx`, matching the other features. `App.tsx` is a
+  slim auth-gate shell, and the `WorkspacePage` type + `workspacePageFromLocation()`
+  moved to a shared `src/workspace.ts` (the "tiny routes module"); no router library
+  was added. `tsc` and `oxlint` are clean.
 
 ### 4. Bulk Import largely re-implements the Transactions pipeline  · impact: high · effort: high · risk: high — **not now**
 Bulk has its own `bulkstore`, `bulkstorage` (thin wrapper over `attachmentstorage`),
@@ -108,8 +122,8 @@ canonical definition (later migrations can reference, not redefine, the limits).
 | # | Finding | Impact | Effort | Risk | Status |
 | --- | --- | --- | --- | --- | --- |
 | 1 | Relax over-pinned config validation | Med | Low | Low | ✅ done |
-| 2 | Split god-files (`transactions/http.go`, `App.tsx`, `api.ts`, `AccountFinanceDetailPage`) | High | Med | Low | proposed |
-| 3 | Move Accounts into `features/`; consider a tiny routes module | Low-Med | Low | Low | proposed |
+| 2 | Split god-files (`transactions/http.go`, `App.tsx`, `api.ts`, `AccountFinanceDetailPage`) | High | Med | Low | ◑ partial (`App.tsx`, `http.go` done) |
+| 3 | Move Accounts into `features/`; consider a tiny routes module | Low-Med | Low | Low | ✅ done |
 | 4 | Converge Bulk Import with the Transactions evidence pipeline | High | High | High | deferred / not now |
 | 5 | Decide parser-rule layering (drop shared layer or add admin auth) | Med | Med | Med | needs product decision |
 | 6 | Single canonical storage-bucket definition | Low | Low | Low | proposed |
