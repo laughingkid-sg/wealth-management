@@ -45,12 +45,53 @@ func TestLoadFromEnvRejectsTestTokenOutsideDevelopment(t *testing.T) {
 	}
 }
 
-func TestLoadFromEnvRejectsIncorrectInitialBackfill(t *testing.T) {
+func TestLoadFromEnvAcceptsConfigurableModelLabelAndBackfill(t *testing.T) {
 	setValidEnvironment(t)
-	t.Setenv("GMAIL_INITIAL_BACKFILL_MAX_MESSAGES", "6")
+	t.Setenv("ALIBABA_TOKEN_PLAN_MODEL", "qwen-max")
+	t.Setenv("GMAIL_SYNC_LABEL", "finance")
+	t.Setenv("GMAIL_INITIAL_BACKFILL_MAX_MESSAGES", "10")
+	cfg, err := LoadFromEnv()
+	if err != nil {
+		t.Fatalf("LoadFromEnv() error = %v", err)
+	}
+	if cfg.AlibabaModel != "qwen-max" {
+		t.Fatalf("AlibabaModel = %q, want qwen-max", cfg.AlibabaModel)
+	}
+	if cfg.GmailSyncLabel != "finance" {
+		t.Fatalf("GmailSyncLabel = %q, want finance", cfg.GmailSyncLabel)
+	}
+	if cfg.InitialBackfillMax != 10 {
+		t.Fatalf("InitialBackfillMax = %d, want 10", cfg.InitialBackfillMax)
+	}
+}
+
+func TestLoadFromEnvDefaultsModelLabelAndBackfillWhenUnset(t *testing.T) {
+	setValidEnvironment(t)
+	t.Setenv("GMAIL_INITIAL_BACKFILL_MAX_MESSAGES", "")
+	cfg, err := LoadFromEnv()
+	if err != nil {
+		t.Fatalf("LoadFromEnv() error = %v", err)
+	}
+	if cfg.AlibabaModel != defaultAlibabaModel || cfg.GmailSyncLabel != defaultGmailLabel || cfg.InitialBackfillMax != defaultInitialBackfillMax {
+		t.Fatalf("unexpected defaults: %#v", cfg)
+	}
+}
+
+func TestLoadFromEnvRejectsBackfillAboveMaximum(t *testing.T) {
+	setValidEnvironment(t)
+	t.Setenv("GMAIL_INITIAL_BACKFILL_MAX_MESSAGES", "1000")
 	_, err := LoadFromEnv()
-	if err == nil || !strings.Contains(err.Error(), "must be 5") {
-		t.Fatalf("LoadFromEnv() error = %v, want five-message validation", err)
+	if err == nil || !strings.Contains(err.Error(), "between 1 and") {
+		t.Fatalf("LoadFromEnv() error = %v, want backfill range validation", err)
+	}
+}
+
+func TestLoadFromEnvRejectsNonPositiveBackfill(t *testing.T) {
+	setValidEnvironment(t)
+	t.Setenv("GMAIL_INITIAL_BACKFILL_MAX_MESSAGES", "0")
+	_, err := LoadFromEnv()
+	if err == nil || !strings.Contains(err.Error(), "positive integer") {
+		t.Fatalf("LoadFromEnv() error = %v, want positive-integer validation", err)
 	}
 }
 
