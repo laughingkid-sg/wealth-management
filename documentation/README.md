@@ -32,6 +32,7 @@ of the real architecture, data model, and workflows.
 | Deploy to production (VM + Caddy + Docker Compose) and set up CI/CD | [11 — Deployment & CI/CD](11-deployment.md) |
 | See how data moves through the system (diagrams) | [Data flow diagrams](data-flow.md) |
 | Review where the system may be over-complex (advisory) | [Design review — complexity & simplification](design-review.md) |
+| Understand the shared JSON-in/JSON-out scripting engine | [Design — scripting engine](design-scripting-engine.md) |
 
 For agent-assisted development, the repository root also has a **`CLAUDE.md`** with
 a compressed operating guide (commands, boundaries, gotchas).
