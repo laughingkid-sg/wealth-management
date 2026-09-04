@@ -338,7 +338,7 @@ Backend values are process environment variables. Real values belong in an ignor
 | `OUTBOUND_HTTP_TIMEOUT_SECONDS` | Optional positive shared outbound timeout; defaults to `20`, maximum `120`. Qwen additionally caps its request at 30 seconds. |
 | `GOOGLE_TEST_REFRESH_TOKEN` | Optional development-only local test fallback when no stored connection exists. Rejected outside development. |
 
-Frontend variables are `VITE_SUPABASE_URL`, `VITE_SUPABASE_PUBLISHABLE_KEY`, and optional `VITE_API_BASE_URL`. `VITE_API_BASE_URL` defaults to `/api`; Vite rewrites that prefix to the local Go API at `http://localhost:8080`. No Supabase secret/service-role key, Gmail token, encryption key, or Alibaba key may use a `VITE_*` name.
+Frontend variables are `VITE_SUPABASE_URL`, `VITE_SUPABASE_PUBLISHABLE_KEY`, and optional `VITE_API_BASE_URL`. `VITE_API_BASE_URL` defaults to same-origin `/api`. Vite removes that prefix and proxies to `API_PROXY_TARGET`, which defaults to the host-development API at `http://localhost:8080`; Docker Compose overrides it to the internal API service at `http://api:8080`. No Supabase secret/service-role key, Gmail token, encryption key, or Alibaba key may use a `VITE_*` name.
 
 The API and worker are separate processes and both need the backend environment. Database access uses a reusable `pgxpool` with simple protocol, zero minimum and five maximum connections, short transactions, and no prepared-statement/session-state dependency so it is safe with the transaction proxy.
 
