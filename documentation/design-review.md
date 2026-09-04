@@ -102,12 +102,18 @@ footgun the moment a second user exists.
   of leaving the open-edit shortcut in place. See also
   [08 — Security](08-security.md).
 
-### 6. Two sources of truth for the storage bucket  · impact: low · effort: low · risk: low
+### 6. Two sources of truth for the storage bucket  · impact: low · effort: low · risk: low  · ✅ done
 Both `20260902191000_create_transactions_foundation.sql` and
 `20260904043716_create_bulk_import_foundation.sql` `insert ... on conflict do update`
 the same `transaction-attachments` bucket, each with its own copy of the MIME list
 and 5 MiB limit. Idempotent today, but two definitions can silently diverge. Keep one
 canonical definition (later migrations can reference, not redefine, the limits).
+
+- **Resolved (2026-09-04):** added
+  `20260904210000_canonical_transaction_attachments_bucket.sql`, an idempotent upsert
+  that runs **last** and is therefore the authoritative definition on any replay. The
+  two historical migrations are left untouched (editing applied migrations is unsafe)
+  but are now inert for this bucket. Future changes go in the canonical file only.
 
 ## If you only do three things
 
@@ -126,7 +132,7 @@ canonical definition (later migrations can reference, not redefine, the limits).
 | 3 | Move Accounts into `features/`; consider a tiny routes module | Low-Med | Low | Low | ✅ done |
 | 4 | Converge Bulk Import with the Transactions evidence pipeline | High | High | High | deferred / not now |
 | 5 | Decide parser-rule layering (drop shared layer or add admin auth) | Med | Med | Med | needs product decision |
-| 6 | Single canonical storage-bucket definition | Low | Low | Low | proposed |
+| 6 | Single canonical storage-bucket definition | Low | Low | Low | ✅ done |
 
 These are recommendations, not committed work. Promote any of them into the team's
 active backlog (`docs/TODO.md`) when you decide to act.
