@@ -84,10 +84,10 @@ Only stored attachments whose filename contains `receipt` or `invoice`, case-ins
 
 - JPEG, PNG, and WEBP evidence goes directly to Qwen.
 - PDF evidence requires Poppler’s `pdftoppm` executable on `PATH`. At most the first three pages are rendered to PNG.
-- BMP, TIFF, and HEIC evidence currently uses macOS `sips` to convert to PNG. On a non-macOS worker, either provide an equivalent supported conversion path before deployment or accept the documented fallback.
+- BMP, TIFF, and HEIC evidence is converted to PNG with macOS `sips` during host development and ImageMagick's `magick` executable on Linux workers. The Alpine worker image installs the ImageMagick HEIC delegate explicitly.
 - Conversion runs in a mode-appropriate temporary directory with a ten-second timeout. At most five visual inputs and 5 MiB total visual bytes are sent to Qwen.
 
-If `pdftoppm`/`sips` is unavailable, conversion fails, times out, or produces an unusable/oversized image, that optional visual is skipped. The private original stays stored and viewable, and parsing continues with email text and any other usable visual inputs. A Storage download failure is different: it is retried as a worker failure because the eligible evidence could not be read safely.
+If `pdftoppm` or the platform image converter is unavailable, conversion fails, times out, or produces an unusable/oversized image, that optional visual is skipped. The private original stays stored and viewable, and parsing continues with email text and any other usable visual inputs. A Storage download failure is different: it is retried as a worker failure because the eligible evidence could not be read safely.
 
 ## Parser and rule contract
 
