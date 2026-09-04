@@ -29,6 +29,8 @@ of the real architecture, data model, and workflows.
 | Understand the security model and secrets | [08 — Security model](08-security.md) |
 | Follow the team's conventions, testing, and git flow | [09 — Conventions & workflows](09-conventions-and-workflows.md) |
 | Look up a domain term | [10 — Glossary](10-glossary.md) |
+| Deploy to production (VM + Caddy + Docker Compose) and set up CI/CD | [11 — Deployment & CI/CD](11-deployment.md) |
+| See how data moves through the system (diagrams) | [Data flow diagrams](data-flow.md) |
 | Review where the system may be over-complex (advisory) | [Design review — complexity & simplification](design-review.md) |
 
 For agent-assisted development, the repository root also has a **`CLAUDE.md`** with
