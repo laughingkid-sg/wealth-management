@@ -232,9 +232,14 @@ select results_eq(
 
 select results_eq(
   $$select count(*) from pg_policies where schemaname = 'storage' and tablename = 'objects'
-      and policyname = 'Transaction attachments require the Go API' and permissive = 'RESTRICTIVE'$$,
-  array[1::bigint],
-  'attachment objects have a restrictive direct-access policy'
+      and policyname in (
+        'Transaction attachments block browser reads',
+        'Transaction attachments block browser updates',
+        'Transaction attachments block browser deletes',
+        'Transaction attachments gate browser inserts'
+      ) and permissive = 'RESTRICTIVE'$$,
+  array[4::bigint],
+  'attachment objects retain restrictive operation-specific browser policies'
 );
 
 select * from finish();
