@@ -75,6 +75,19 @@ Line items are optional and are capped at 100 per transaction. When present, eac
 
 The Gmail provider message ID provides exact ingestion deduplication per user. Reconciliation then matches evidence across different senders/providers.
 
+### Source-derived title, counterparty, and identifiers
+
+The active OCBC, Amex, and Citi global prompts name `title` and optional `merchant_name` only from explicit, cited source facts. They never infer, expand, or guess a merchant, person, identifier, payment method, or Account.
+
+- An OCBC NETS or NETS QR payment is titled `NETS · <merchant>` using the explicit merchant/payee.
+- An outgoing OCBC PayNow payment is titled `PayNow to · <recipient>`; an incoming payment is titled `PayNow from · <sender>`.
+- Where the same PayNow source explicitly shows one, the title also appends ` · Mobile <masked mobile>`, ` · NRIC <masked NRIC>`, or ` · UEN <UEN>` so that the counterparty identifier is immediately visible.
+- Amex and Citi card transactions use the exact source merchant descriptor for the title and `merchant_name`; their card suffix remains typed Account evidence rather than title text.
+
+Payment references, approval codes, NETS IDs, and other provider transaction IDs belong in `references`. An explicit masked mobile number, masked NRIC, or UEN is retained in `account_evidence.additional_identifiers` as descriptive evidence. Those identifiers, like all generic `additional_identifiers`, are excluded from automatic Account matching.
+
+This configuration applies to future parses and manual retries. It does not rewrite the canonical title of an existing transaction, including when newly parsed evidence is paired with it.
+
 Automatic reconciliation first requires source evidence to resolve exactly one active Account owned by the user. Account resolution compares the model’s typed `card_last_four` or `masked_bank_reference` evidence with active `card_last_four` or `bank_account_suffix` matching keys. Account names, arbitrary metadata, `account_identifier`, and generic `additional_identifiers` never participate in automatic matching, and the Account catalogue and configured keys are never sent to Qwen. Missing or unmatched Account evidence produces a dangling source; evidence that maps to several Accounts requires review.
 
 Matching keys are immutable identities. A card key normalizes only masking characters and must contain exactly four ASCII digits; matching keys never store six digits, and a full card number is rejected rather than truncated. Before a model-provided card suffix may participate in matching, the source must present exactly one suffix in masked-card or explicit card context, such as `Mastercard (**** 2562)` or `card ending in 2562`. A bounded provider format may include two displayed digits before the trailing four: for example, Amex `Card ending: 721001` corroborates the extracted four-digit suffix `1001`. This exception does not make arbitrary longer numbers matchable; unrelated, mismatched, or conflicting identifiers remain audit-only. A bank suffix is lowercased and removes Unicode whitespace plus `*`, `•`, and `-`, while retaining other characters. The original value remains available for display. A normalized key is permanently unique per user and type, including after retirement; the same row may be reactivated for its original Account but cannot be reassigned. Recognized legacy Account metadata, including **Last 4 Digit**, is backfilled without removing or changing the descriptive metadata.
