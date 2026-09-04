@@ -1,0 +1,26 @@
+FROM golang:1.23.12-bookworm
+
+ARG AIR_VERSION=v1.61.7
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        imagemagick \
+        poppler-utils \
+        procps \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/convert /usr/local/bin/magick
+
+RUN go install github.com/air-verse/air@${AIR_VERSION}
+
+WORKDIR /app
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+# Compose overrides this command for the worker. Runtime configuration and all
+# credentials are injected by Compose; no environment files enter the image.
+CMD ["air", "-c", ".air.api.toml"]

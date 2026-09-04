@@ -1,0 +1,27 @@
+root = "."
+tmp_dir = "tmp-worker"
+
+[build]
+cmd = "go build -o ./tmp-worker/worker ./cmd/worker"
+bin = "tmp-worker/worker"
+include_ext = ["go", "txt"]
+exclude_dir = ["tmp", "tmp-api", "tmp-worker", "vendor"]
+exclude_regex = ["_test\\.go"]
+exclude_unchanged = true
+delay = 300
+stop_on_error = true
+send_interrupt = true
+kill_delay = 500000000
+log = "worker-air.log"
+
+[log]
+time = true
+main_only = false
+silent = false
+
+[misc]
+clean_on_exit = true
+
+[screen]
+clear_on_rebuild = false
+keep_scroll = true
