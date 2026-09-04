@@ -1,0 +1,289 @@
+.ccb-page {
+  display: grid;
+  min-width: 0;
+}
+
+.ccb-page-header {
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.ccb-preview-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-self: start;
+  gap: 6px;
+  margin-bottom: 22px;
+  padding: 5px 9px;
+  border: 1px solid #eadfda;
+  border-radius: 99px;
+  background: #fff8f4;
+  color: #9b3a1e;
+  font-size: 0.72rem;
+  font-weight: 750;
+}
+
+.ccb-groups {
+  display: grid;
+  gap: 18px;
+}
+
+.ccb-card-group,
+.ccb-loading {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.ccb-card-group > summary {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  padding: 18px 20px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.ccb-card-group > summary::-webkit-details-marker {
+  display: none;
+}
+
+.ccb-card-group > summary:hover {
+  background: #fbfaf9;
+}
+
+.ccb-card-group > summary:focus-visible,
+.ccb-bill-row:focus-visible {
+  outline: 3px solid rgb(255 101 46 / 0.24);
+  outline-offset: -3px;
+}
+
+.ccb-card-mark {
+  display: grid;
+  place-items: center;
+  flex: 0 0 42px;
+  height: 42px;
+  border-radius: 11px;
+  background: #fff0e9;
+  color: #9b3a1e;
+}
+
+.ccb-card-identity {
+  display: grid;
+  min-width: 0;
+  flex: 1;
+  gap: 3px;
+}
+
+.ccb-card-identity strong {
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 1rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ccb-card-identity small,
+.ccb-bill-count,
+.ccb-bill-period small,
+.ccb-amount small {
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.ccb-bill-count {
+  padding: 5px 9px;
+  border-radius: 99px;
+  background: #f1eeeb;
+  font-weight: 750;
+}
+
+.ccb-expand-icon {
+  color: var(--muted);
+  transition: transform 0.18s ease;
+}
+
+.ccb-card-group[open] .ccb-expand-icon {
+  transform: rotate(180deg);
+}
+
+.ccb-bill-list {
+  display: grid;
+  border-top: 1px solid var(--border);
+}
+
+.ccb-no-bills {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 19px 20px;
+  color: var(--muted);
+}
+
+.ccb-no-bills > span {
+  display: grid;
+  gap: 3px;
+}
+
+.ccb-no-bills strong {
+  color: var(--ink);
+  font-size: 0.86rem;
+}
+
+.ccb-no-bills small {
+  font-size: 0.78rem;
+}
+
+.ccb-bill-row {
+  display: grid;
+  grid-template-columns: auto minmax(220px, 1fr) auto minmax(135px, auto) auto;
+  align-items: center;
+  gap: 15px;
+  width: 100%;
+  padding: 16px 20px;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  background: #fff;
+  color: var(--ink);
+  cursor: pointer;
+  text-align: left;
+}
+
+.ccb-bill-row:last-child {
+  border-bottom: 0;
+}
+
+.ccb-bill-row:hover {
+  background: #fcfbfa;
+}
+
+.ccb-bill-icon {
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  border-radius: 10px;
+}
+
+.ccb-bill-icon-review,
+.ccb-status-review {
+  background: #fff3df;
+  color: #8b5518;
+}
+
+.ccb-bill-icon-unpaid,
+.ccb-status-unpaid {
+  background: #fff0e9;
+  color: #9b3a1e;
+}
+
+.ccb-bill-icon-paid,
+.ccb-status-paid {
+  background: #e8f7ef;
+  color: #11704b;
+}
+
+.ccb-bill-icon-void,
+.ccb-status-void {
+  background: #efefef;
+  color: #646765;
+}
+
+.ccb-bill-period,
+.ccb-amount {
+  display: grid;
+  gap: 5px;
+}
+
+.ccb-bill-period small {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.ccb-status {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 5px 8px;
+  border-radius: 99px;
+  font-size: 0.72rem;
+  font-weight: 750;
+  white-space: nowrap;
+}
+
+.ccb-amount {
+  text-align: right;
+}
+
+.ccb-row-arrow {
+  color: var(--muted);
+}
+
+.ccb-empty {
+  color: var(--muted);
+}
+
+.ccb-empty h2 {
+  color: var(--ink);
+}
+
+.ccb-loading {
+  padding-block: 4px;
+}
+
+@media (max-width: 760px) {
+  .ccb-bill-row {
+    grid-template-areas:
+      "icon period arrow"
+      ". status amount";
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    gap: 10px 12px;
+  }
+
+  .ccb-bill-icon {
+    grid-area: icon;
+  }
+
+  .ccb-bill-period {
+    grid-area: period;
+  }
+
+  .ccb-status {
+    grid-area: status;
+    justify-self: start;
+  }
+
+  .ccb-amount {
+    grid-area: amount;
+  }
+
+  .ccb-row-arrow {
+    grid-area: arrow;
+  }
+}
+
+@media (max-width: 520px) {
+  .ccb-card-group > summary,
+  .ccb-bill-row {
+    padding-inline: 15px;
+  }
+
+  .ccb-bill-count {
+    display: none;
+  }
+
+  .ccb-card-identity small,
+  .ccb-bill-period small {
+    white-space: normal;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ccb-expand-icon {
+    transition: none;
+  }
+}
