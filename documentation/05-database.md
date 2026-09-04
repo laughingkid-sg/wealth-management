@@ -157,7 +157,11 @@ One private bucket: **`transaction-attachments`**.
   API after an ownership check.
 
 Both the transactions and bulk-import migrations `insert ... on conflict do update`
-the same bucket, so the bucket config is idempotent.
+the same bucket, so the bucket config is idempotent. The **canonical** definition
+now lives in `20260904210000_canonical_transaction_attachments_bucket.sql`, which
+runs last and therefore always wins on a fresh replay. Change the bucket's limits or
+MIME types **there only**; do not add a new `storage.buckets` upsert for this bucket
+in another migration.
 
 ## Migrations
 
