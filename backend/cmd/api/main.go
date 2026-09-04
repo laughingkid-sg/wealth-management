@@ -9,9 +9,16 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/zhengteck/wealth-builder/backend/internal/accountbalances"
+	"github.com/zhengteck/wealth-builder/backend/internal/accountbalancestore"
 	"github.com/zhengteck/wealth-builder/backend/internal/attachmentstorage"
 	"github.com/zhengteck/wealth-builder/backend/internal/auth"
+	"github.com/zhengteck/wealth-builder/backend/internal/bulkimport"
+	"github.com/zhengteck/wealth-builder/backend/internal/bulkstorage"
+	"github.com/zhengteck/wealth-builder/backend/internal/bulkstore"
 	"github.com/zhengteck/wealth-builder/backend/internal/config"
+	"github.com/zhengteck/wealth-builder/backend/internal/creditcard"
+	"github.com/zhengteck/wealth-builder/backend/internal/creditcardstore"
 	"github.com/zhengteck/wealth-builder/backend/internal/database"
 	"github.com/zhengteck/wealth-builder/backend/internal/gmailconnection"
 	"github.com/zhengteck/wealth-builder/backend/internal/providers"
@@ -57,6 +64,13 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("GET /healthz", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }))
 	transactions.NewHandler(store, cfg.Environment == "development" && cfg.GoogleTestRefreshToken != "", oauthFlow, cfg.FrontendOrigin, attachmentClient).Register(mux, verifier)
+	balanceHandler := accountbalances.NewHandler(accountbalances.NewService(accountbalancestore.New(pool), nil))
+	creditCardHandler := creditcard.NewHandler(creditcard.NewService(creditcardstore.New(pool), nil))
+	bulkRepository := bulkstore.New(pool, store, store)
+	bulkHandler := bulkimport.Handler{Application: bulkimport.Service{
+		Store: bulkRepository, Storage: bulkstorage.Client{Storage: attachmentClient},
+	}}
+	registerFeatureRoutes(mux, verifier, balanceHandler, creditCardHandler, bulkHandler, cfg.BulkImportEnabled)
 	server := &http.Server{Addr: cfg.APIAddress, Handler: securityHeaders(mux), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second}
 
 	stop := make(chan os.Signal, 1)
@@ -70,6 +84,18 @@ func main() {
 	log.Printf("transactions API listening on %s", cfg.APIAddress)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
+	}
+}
+
+type featureRegistrar interface {
+	Register(*http.ServeMux, auth.Verifier)
+}
+
+func registerFeatureRoutes(mux *http.ServeMux, verifier auth.Verifier, balances, creditCards, bulk featureRegistrar, bulkEnabled bool) {
+	balances.Register(mux, verifier)
+	creditCards.Register(mux, verifier)
+	if bulkEnabled {
+		bulk.Register(mux, verifier)
 	}
 }
 

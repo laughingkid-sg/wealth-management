@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -21,17 +22,28 @@ const (
 	KindSourceParse             Kind = "source_parsing"
 	KindReconcile               Kind = "reconciliation"
 	KindSourceAttachmentCleanup Kind = "source_attachment_cleanup"
+	KindBulkDocumentPrepare     Kind = "bulk_document_prepare"
+	KindBulkDocumentChunkParse  Kind = "bulk_document_chunk_parse"
+	KindBulkDocumentAggregate   Kind = "bulk_document_aggregate"
+	KindBulkCandidateReconcile  Kind = "bulk_candidate_reconciliation"
+	KindBulkDocumentPostProcess Kind = "bulk_document_post_process"
 )
 
 type Job struct {
-	ID         uuid.UUID
-	UserID     uuid.UUID
-	SyncRunID  *uuid.UUID
-	Kind       Kind
-	Payload    []byte
-	Attempts   int
-	Available  time.Time
-	LeaseUntil *time.Time
+	ID          uuid.UUID
+	UserID      uuid.UUID
+	SyncRunID   *uuid.UUID
+	SourceID    *uuid.UUID
+	BatchID     *uuid.UUID
+	DocumentID  *uuid.UUID
+	ChunkID     *uuid.UUID
+	CandidateID *uuid.UUID
+	Generation  *int
+	Kind        Kind
+	Payload     []byte
+	Attempts    int
+	Available   time.Time
+	LeaseUntil  *time.Time
 }
 
 // SourceAttachmentCleanupPayload is persisted in the durable job row before
@@ -51,6 +63,10 @@ type Store interface {
 	Retry(context.Context, uuid.UUID, string, int, time.Time, string) error
 }
 
+type KindStore interface {
+	ClaimKinds(context.Context, string, time.Time, []Kind) (*Job, error)
+}
+
 type Handler interface {
 	Handle(context.Context, Job) error
 }
@@ -59,6 +75,15 @@ type Handler interface {
 // It keeps each handler focused while making unsupported queue values fail
 // safely and retry through Worker.
 type Router map[Kind]Handler
+
+func (r Router) Kinds() []Kind {
+	result := make([]Kind, 0, len(r))
+	for kind := range r {
+		result = append(result, kind)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
+	return result
+}
 
 func (r Router) Handle(ctx context.Context, job Job) error {
 	handler, ok := r[job.Kind]
@@ -77,6 +102,7 @@ type Worker struct {
 	// workers default to renewing once per minute, well within the five-minute
 	// database lease.
 	LeaseHeartbeatInterval time.Duration
+	AllowedKinds           []Kind
 }
 
 func (w Worker) ProcessOne(ctx context.Context) (bool, error) {
@@ -87,7 +113,13 @@ func (w Worker) ProcessOne(ctx context.Context) (bool, error) {
 	if w.Now != nil {
 		now = w.Now
 	}
-	job, err := w.Store.Claim(ctx, w.WorkerID, now())
+	var job *Job
+	var err error
+	if scoped, ok := w.Store.(KindStore); ok && len(w.AllowedKinds) > 0 {
+		job, err = scoped.ClaimKinds(ctx, w.WorkerID, now(), w.AllowedKinds)
+	} else {
+		job, err = w.Store.Claim(ctx, w.WorkerID, now())
+	}
 	if err != nil {
 		return false, err
 	}

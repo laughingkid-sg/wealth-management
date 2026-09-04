@@ -34,7 +34,7 @@ func TestPatchTransactionUpdatesMerchantAndOnlyUserNotesDetail(t *testing.T) {
 	defer func() {
 		cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cleanupCancel()
-		_, _ = pool.Exec(cleanupContext, `delete from auth.users where id = any($1::uuid[])`, []uuid.UUID{userID, otherUserID})
+		_, _ = pool.Exec(cleanupContext, `delete from auth.users where id = any($1::uuid[])`, database.UUIDArrayLiteral([]uuid.UUID{userID, otherUserID}))
 	}()
 	if _, err = pool.Exec(ctx, `
 		insert into public.accounts (

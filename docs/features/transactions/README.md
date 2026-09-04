@@ -8,13 +8,13 @@ Focused design reference: [Wealth Builder Transactions — Prompt and Matching D
 
 ## Delivery status
 
-The Transactions product flow is implemented on `codex/feat-transaction`: Gmail OAuth and refresh, durable asynchronous processing, configurable Qwen guidance, typed Account matching keys, account-aware reconciliation, exact parse-call audit, transaction and source review views, attachment inspection, editing, unmatching, raw-source deletion, retry, internal-transfer creation, direct manual creation, merchant/user-note editing, dismissible terminal Gmail results, shared global-rule administration, and read-only prompt preview. Migrations through `20260903055808_add_global_source_rule_editor_metadata.sql` are applied to the hosted development project with matching local/remote history. The migration rehearsal, hosted database, Go, focused frontend, and authenticated-browser checks recorded in [technical implementation](technical.md) pass. Verification did not call Qwen.
+The Transactions product flow is implemented: Gmail OAuth and refresh, user-uploaded Bulk Import evidence, durable asynchronous processing, configurable LLM guidance, typed Account matching keys, account-aware reconciliation, exact parse-call audit, transaction and source review views, attachment inspection, editing, unmatching, raw-source deletion, retry, internal-transfer creation, direct manual creation, merchant/user-note editing, dismissible terminal Gmail results, shared global-rule administration, and read-only prompt preview. The original Gmail/manual delivery is merged into `main`; the Bulk Import extension and its dependent Credit Card workflow are implemented on the current feature branch and applied to the hosted development project with matching local/remote migration history.
 
 ## Product model
 
 Transactions is multi-user. A canonical transaction is a debit or credit on one Account and may be supported by several source records—for example a bank alert, payment-provider notice, and merchant receipt for the same purchase.
 
-Email is the first implemented input. The source model is intended to support three transaction-data channels in total: Gmail email, a later phone-notification channel, and a third future channel whose provider contract is not yet specified. The current database constraint accepts `gmail_email` and reserves `phone_notification`; adding the third channel requires an explicit product decision and migration.
+Email was the first implemented input. The database now accepts `gmail_email`, reserves `phone_notification`, and implements `bulk_upload_document` for user-uploaded PDF and image evidence through [Bulk Import](../bulk-insert/README.md).
 
 Raw sources are durable evidence, not canonical transactions. Every canonical transaction must link to an active Account owned by the same user. Missing Account evidence is valid source input: it leaves the source in the Dangling queue instead of failing parsing. Ambiguous Account evidence or other unsafe matches stay in Review. A parsing failure stays in Failed and can be retried from the stored source without fetching Gmail again.
 

@@ -378,7 +378,7 @@ func TestLoadParseAttachmentsBoundsVisualCountAndAggregateBytes(t *testing.T) {
 			attachments := make([]transactionstore.SourceAttachment, 0, len(testCase.sizes))
 			downloads := make(attachmentDownloadStub, len(testCase.sizes))
 			for index, size := range testCase.sizes {
-				path := "attachment-" + strconv.Itoa(index)
+				path := userID.String() + "/" + sourceID.String() + "/attachment-" + strconv.Itoa(index)
 				attachments = append(attachments, transactionstore.SourceAttachment{
 					Filename: "invoice-" + strconv.Itoa(index) + ".png", MIMEType: "image/png",
 					ObjectPath: path, StorageStatus: "stored", ParseEligible: true,

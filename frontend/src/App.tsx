@@ -12,12 +12,14 @@ import {
   EyeOff,
   FileSearch,
   Globe2,
+  History,
   Landmark,
   LayoutDashboard,
   LogOut,
   PanelLeft,
   Pencil,
   Plus,
+  ReceiptText,
   Search,
   Settings,
   SlidersHorizontal,
@@ -52,6 +54,21 @@ const TransactionsPage = lazy(() =>
     default: Page,
   })),
 );
+const BulkImportPage = lazy(() =>
+  import("./features/bulk-import/BulkImportPage").then(({ BulkImportPage: Page }) => ({
+    default: Page,
+  })),
+);
+const AccountFinanceDetailPage = lazy(() =>
+  import("./features/account-balances/AccountFinanceDetailPage").then(
+    ({ AccountFinanceDetailPage: Page }) => ({ default: Page }),
+  ),
+);
+const CreditCardPage = lazy(() =>
+  import("./features/account-balances/CreditCardPage").then(
+    ({ CreditCardPage: Page }) => ({ default: Page }),
+  ),
+);
 const TransactionSettingsPage = lazy(() =>
   import("./features/transactions/TransactionSettingsPage").then(
     ({ TransactionSettingsPage: Page }) => ({ default: Page }),
@@ -71,9 +88,16 @@ const PromptPreviewPage = lazy(() =>
 type WorkspacePage =
   | "accounts"
   | "transactions"
+  | "bulk-import"
+  | "credit-card"
   | "transaction-settings"
   | "transaction-global-settings"
   | "transaction-prompt-preview";
+
+type FinanceAccountSelection = Pick<
+  Account,
+  "id" | "name" | "institution_name" | "account_type" | "side"
+>;
 
 const newDraft = (): AccountDraft => ({
   side: "asset",
@@ -487,6 +511,8 @@ const navigation = [
 
 const transactionNavigation = [
   { label: "Transactions", icon: ArrowLeftRight, page: "transactions" as const },
+  { label: "Credit Card", icon: ReceiptText, page: "credit-card" as const },
+  { label: "Bulk Import", icon: FileSearch, page: "bulk-import" as const },
   { label: "Prompt Preview", icon: FileSearch, page: "transaction-prompt-preview" as const },
   { label: "Global Settings", icon: Globe2, page: "transaction-global-settings" as const },
   { label: "Settings", icon: SlidersHorizontal, page: "transaction-settings" as const },
@@ -638,6 +664,9 @@ function AccountsPage({
   const [deletedFilter, setDeletedFilter] = useState<DeletedFilter>("active");
   const [sort, setSort] = useState<SortOption>("name_asc");
   const [editing, setEditing] = useState<Account | null | undefined>(undefined);
+  const [financeAccount, setFinanceAccount] = useState<FinanceAccountSelection | null>(null);
+  const [financeInitialTab, setFinanceInitialTab] = useState<"balance" | "bills">("balance");
+  const [financeInitialBillId, setFinanceInitialBillId] = useState<string | null>(null);
   const [expandedAccountIds, setExpandedAccountIds] = useState<string[]>([]);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const mobileNavToggleRef = useRef<HTMLButtonElement>(null);
@@ -682,17 +711,15 @@ function AccountsPage({
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
-    let query = supabase.from("accounts").select("*");
-    if (deletedFilter === "active") query = query.is("deleted_at", null);
-    if (deletedFilter === "deleted")
-      query = query.not("deleted_at", "is", null);
-    const { data, error: loadError } = await query
+    const { data, error: loadError } = await supabase
+      .from("accounts")
+      .select("*")
       .order("sort_order")
       .order("created_at");
     if (loadError) setError(loadError.message);
     else setAccounts(data);
     setLoading(false);
-  }, [deletedFilter]);
+  }, []);
   useEffect(() => {
     const timer = window.setTimeout(() => void load(), 0);
     return () => window.clearTimeout(timer);
@@ -715,7 +742,9 @@ function AccountsPage({
               account.institution_name.toLowerCase().includes(query)) &&
             (side === "all" || account.side === side) &&
             (type === "all" || account.account_type === type) &&
-            (!institution || account.institution_name === institution)
+            (!institution || account.institution_name === institution) &&
+            (deletedFilter === "all" ||
+              (deletedFilter === "active" ? !account.deleted_at : Boolean(account.deleted_at)))
           );
         })
         .sort((a, b) =>
@@ -726,7 +755,20 @@ function AccountsPage({
               : a.sort_order - b.sort_order ||
                 a.created_at.localeCompare(b.created_at),
         ),
-    [accounts, institution, search, side, sort, type],
+    [accounts, deletedFilter, institution, search, side, sort, type],
+  );
+  const activeCreditCards = useMemo(
+    () =>
+      accounts
+        .filter(
+          (account): account is Account & { account_type: "credit_card" } =>
+            account.account_type === "credit_card" && !account.deleted_at,
+        )
+        .sort(
+          (left, right) =>
+            left.sort_order - right.sort_order || left.name.localeCompare(right.name),
+        ),
+    [accounts],
   );
   const assets = visible.filter((account) => account.side === "asset");
   const liabilities = visible.filter((account) => account.side === "liability");
@@ -804,6 +846,19 @@ function AccountsPage({
                   </div>
                   <div className="row-actions">
                     <button
+                      aria-label="View balance and history"
+                      className="icon-button"
+                      onClick={() => {
+                        setFinanceInitialTab("balance");
+                        setFinanceInitialBillId(null);
+                        setFinanceAccount(account);
+                      }}
+                      title="View balance and history"
+                      type="button"
+                    >
+                      <History aria-hidden="true" size={18} />
+                    </button>
+                    <button
                       className="icon-button"
                       onClick={() => setEditing(account)}
                       aria-label={`Edit ${account.name}`}
@@ -874,7 +929,10 @@ function AccountsPage({
         activePage={activePage}
         email={session.user.email}
         mobileOpen={mobileNavOpen}
-        onNavigate={onNavigate}
+        onNavigate={(page) => {
+          if (page === "accounts" || page === "credit-card") setFinanceAccount(null);
+          onNavigate(page);
+        }}
         onMobileClose={() => setMobileNavOpen(false)}
         signOut={signOut}
       />
@@ -920,6 +978,8 @@ function AccountsPage({
         </header>
         <main className="app-shell">
           {activePage === "transactions" ||
+          activePage === "bulk-import" ||
+          (activePage === "credit-card" && !financeAccount) ||
           activePage === "transaction-settings" ||
           activePage === "transaction-global-settings" ||
           activePage === "transaction-prompt-preview" ? (
@@ -934,6 +994,37 @@ function AccountsPage({
               )}
             >
               {activePage === "transactions" && <TransactionsPage session={session} />}
+              {activePage === "bulk-import" && (
+                <BulkImportPage
+                  accounts={accounts.filter((account) => !account.deleted_at)}
+                  session={session}
+                  onOpenCreditCardBill={(billId, accountId) => {
+                    const matchingAccount = activeCreditCards.find(
+                      (account) => account.id === accountId,
+                    );
+                    if (!matchingAccount) return;
+                    setFinanceInitialTab("bills");
+                    setFinanceInitialBillId(billId);
+                    setFinanceAccount(matchingAccount);
+                    onNavigate("accounts");
+                  }}
+                />
+              )}
+              {activePage === "credit-card" && !financeAccount && (
+                <CreditCardPage
+                  accounts={activeCreditCards}
+                  error={error}
+                  loading={loading}
+                  onOpenBill={(account, billId) => {
+                    setFinanceInitialTab("bills");
+                    setFinanceInitialBillId(billId);
+                    setFinanceAccount(account);
+                  }}
+                  onOpenBulkImport={() => onNavigate("bulk-import")}
+                  onRetry={() => void load()}
+                  session={session}
+                />
+              )}
               {activePage === "transaction-settings" && <TransactionSettingsPage session={session} />}
               {activePage === "transaction-global-settings" && (
                 <GlobalTransactionSettingsPage session={session} />
@@ -942,6 +1033,31 @@ function AccountsPage({
                 <PromptPreviewPage session={session} />
               )}
             </Suspense>
+          ) : financeAccount ? (
+            <Suspense
+              fallback={(
+                <section aria-busy="true" aria-label="Loading account finances" className="account-section" role="status">
+                  <div className="skeleton-row" />
+                  <div className="skeleton-row" />
+                </section>
+              )}
+            >
+              <AccountFinanceDetailPage
+                accountId={financeAccount.id}
+                accountName={financeAccount.name}
+                accountType={financeAccount.account_type}
+                backLabel={activePage === "credit-card" ? "Back to Credit Card" : "Back to accounts"}
+                initialBillId={financeInitialBillId ?? undefined}
+                initialTab={financeInitialTab}
+                institution={financeAccount.institution_name}
+                key={`${financeAccount.institution_name}:${financeAccount.name}:${financeInitialTab}:${financeInitialBillId ?? "all"}`}
+                onBack={() => setFinanceAccount(null)}
+                onOpenBulkImport={() => onNavigate("bulk-import")}
+                side={financeAccount.side}
+                session={session}
+                accounts={accounts.filter((account) => !account.deleted_at)}
+              />
+            </Suspense>
           ) : (
             <>
           <header className="page-header">
@@ -949,8 +1065,7 @@ function AccountsPage({
               <p className="eyebrow">ACCOUNT DIRECTORY</p>
               <h1>Accounts</h1>
               <p className="muted">
-                Your private account directory. No balances or financial data
-                are stored here.
+                Manage your account directory, opening balances, and credit-card statements.
               </p>
             </div>
             <button
@@ -1130,6 +1245,8 @@ function workspacePageFromLocation(): WorkspacePage {
   const page = parameters.get("page");
   if (
     page === "transactions" ||
+    page === "bulk-import" ||
+    page === "credit-card" ||
     page === "transaction-settings" ||
     page === "transaction-global-settings" ||
     page === "transaction-prompt-preview"

@@ -317,12 +317,45 @@ func ValidateObjectRequest(request ObjectRequest) error {
 	if request.UserID == uuid.Nil || request.SourceID == uuid.Nil {
 		return errors.New("attachment storage requires user and source IDs")
 	}
-	prefix := request.UserID.String() + "/" + request.SourceID.String() + "/"
-	if !strings.HasPrefix(request.ObjectPath, prefix) || len(request.ObjectPath) <= len(prefix) ||
-		strings.Contains(request.ObjectPath, "..") || strings.ContainsAny(request.ObjectPath, "\r\n\x00") {
+	scopeID, err := ScopeIDFromObjectPath(request.UserID, request.ObjectPath)
+	if err != nil || scopeID != request.SourceID {
 		return errors.New("attachment object path is outside the owned source")
 	}
 	return nil
+}
+
+// ScopeIDFromObjectPath returns the immutable Storage scope encoded in the
+// second path segment. The first segment must be the canonical authenticated
+// owner UUID; callers must not substitute a document or data-source ID for the
+// scope carried by the stored path.
+func ScopeIDFromObjectPath(userID uuid.UUID, objectPath string) (uuid.UUID, error) {
+	if userID == uuid.Nil || objectPath == "" || objectPath != strings.TrimSpace(objectPath) ||
+		strings.ContainsAny(objectPath, "\r\n\x00\\") {
+		return uuid.Nil, errors.New("attachment object path is invalid")
+	}
+	segments := strings.Split(objectPath, "/")
+	if len(segments) < 3 || segments[0] != userID.String() {
+		return uuid.Nil, errors.New("attachment object path has a different owner")
+	}
+	for _, segment := range segments[2:] {
+		if segment == "" || segment == "." || segment == ".." {
+			return uuid.Nil, errors.New("attachment object path is invalid")
+		}
+	}
+	scopeID, err := uuid.Parse(segments[1])
+	if err != nil || scopeID == uuid.Nil || segments[1] != scopeID.String() {
+		return uuid.Nil, errors.New("attachment object path scope is invalid")
+	}
+	return scopeID, nil
+}
+
+// ObjectRequestFromPath builds a request using the path's immutable scope.
+func ObjectRequestFromPath(userID uuid.UUID, objectPath string) (ObjectRequest, error) {
+	scopeID, err := ScopeIDFromObjectPath(userID, objectPath)
+	if err != nil {
+		return ObjectRequest{}, err
+	}
+	return ObjectRequest{UserID: userID, SourceID: scopeID, ObjectPath: objectPath}, nil
 }
 
 func normalizedMIMEType(value string) string {

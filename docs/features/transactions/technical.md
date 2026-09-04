@@ -4,7 +4,7 @@ Focused design reference: [Wealth Builder Transactions — Prompt and Matching D
 
 ## Implementation status
 
-The React workspace, Go API, Go worker, database migrations, and automated-test fixtures described here are implemented on `codex/feat-transaction`. Migrations through `20260903055808_add_global_source_rule_editor_metadata.sql` passed hosted dry runs and exact transaction-wrapped rollback rehearsals, are applied to the hosted development project, and appear in matching local/remote history. All 244 pgTAP assertions across ten suites pass, and hosted database lint reports no schema warnings or errors for the private or public schema. The full Go test, vet, race, and API/worker build gates pass; the hosted global-rule ownership/optimistic-update integration test also passes through the transaction pooler. Frontend lint and production build pass together with eight focused prompt/global-rule tests. Authenticated-browser verification covers Global Settings, safe rule defaults and catch-all warning, the automatic preview empty state after evidence reset, manual preview output and placeholders, and zero console warnings or errors. Qwen was not called.
+The React workspace, Go API, Go worker, database migrations, and automated-test fixtures described here are implemented. The original Gmail/manual delivery is merged into `main`; the current feature branch extends its source, audit, job, reconciliation, and evidence contracts for Bulk Import. Hosted migrations through `20260904061318_disambiguate_credit_card_validation_records.sql` are applied with matching local/remote history. The latest cross-feature hosted regression passes 23 focused transaction pgTAP assertions, while the original 244-assertion transaction acceptance record remains documented below. Hosted database lint reports no errors for the private or public schema, and the full Go test/vet plus frontend lint/build gates pass. The original transaction acceptance did not call Qwen; the separate live Bulk provider and isolated API-to-worker verification, including complete temporary-data cleanup, are recorded in the [Bulk Import technical implementation](../bulk-insert/technical.md).
 
 ## Component boundary
 
@@ -169,12 +169,12 @@ All monetary columns use `bigint` integer minor units. Timestamps use `timestamp
 | --- | --- |
 | `private.gmail_connections` | Encrypted refresh token, token metadata, exact label, History cursor, status, last sync/error. One Gmail connection per user. |
 | `private.gmail_oauth_states` | Single-use state digest and encrypted PKCE verifier with expiry/consumption protections. |
-| `private.data_sources` | Durable generic evidence, provider identity, JSON payload, parser provenance/state, Account/transaction suggestions, and reconciliation reason. Current allowed types: `gmail_email`, `phone_notification`. |
+| `private.data_sources` | Durable generic evidence, provider identity, JSON payload, parser provenance/state, Account/transaction suggestions, and reconciliation reason. Current allowed types: `gmail_email`, reserved `phone_notification`, and implemented `bulk_upload_document`. Uploaded-document details are in the [Bulk Insert technical implementation](../bulk-insert/technical.md). |
 | `private.source_parser_rules` | Shared versioned Gmail rules: name, optional sender/content matchers, prompt fragment, deterministic extraction configuration, priority, active state, last authenticated editor, and timestamps. |
 | `private.user_parser_settings` | One versioned, bounded default parser-instruction value per user. |
 | `private.user_source_parser_rules` | Versioned owner-specific Gmail sender/subject/content matching plus prompt guidance and priority. |
 | `private.account_matching_keys` | Typed, immutable Account identities with permanent per-user uniqueness and retire/reactivate lifecycle. |
-| `private.source_parse_attempts` | Exact bounded prompt/input/provider/model audit, rule provenance, validated candidate, validation state, and errors. |
+| `private.source_parse_attempts` | Exact bounded prompt/input/provider/model audit, rule provenance, validated candidate, validation state, and errors. Bulk provider and strict-decoder failures retain every available audit boundary plus a bounded diagnostic for owner-only Debug. |
 | `private.transaction_user_locks` | Minimal per-user row-lock target that serializes Gmail sync creation/ingestion with raw-source deletion. |
 | `private.deleted_provider_messages` | SHA-256 provider-identity tombstones that prevent deliberate raw deletions from being recreated without retaining the source UUID, provider message ID, content, or paths. |
 | `private.transaction_data_sources` | Evidence junction with source role, confidence, matched-by provenance, and detachable audit fields. A source ordinarily has one active link; exactly two are allowed only when they are the debit and credit legs of the same internal-transfer pair. Unmatching soft-detaches evidence before reuse. |
@@ -247,6 +247,8 @@ Every route except the OAuth callback requires the authenticated Supabase bearer
 | `POST /v1/transactions/gmail/sync-runs` | Returns `202` with the queued safe run projection; rejects missing Gmail connection or an existing active run with `409`. |
 | `GET /v1/transactions/sync-runs/latest` | Restores the owner’s newest run, or `404` when none exists. |
 | `GET /v1/transactions/sync-runs/{id}` | Returns owner-scoped progress for one run. |
+
+The Account Balances feature exposes Transaction spending treatments at `GET/PUT /v1/transaction-calculation-treatments/{transaction_id}`. It intentionally uses a separate top-level collection so its Transaction-ID wildcard cannot conflict with the established sync-run route above.
 
 ### Transactions and evidence
 

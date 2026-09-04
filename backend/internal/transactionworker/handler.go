@@ -205,7 +205,7 @@ func jsonObjectAudit(raw []byte, fallbackField string) json.RawMessage {
 	return encoded
 }
 
-func (h Handler) loadParseAttachments(ctx context.Context, userID, sourceID uuid.UUID, metadata []transactionstore.SourceAttachment) ([]providers.AttachmentInput, []transactionstore.AttachmentUsage, error) {
+func (h Handler) loadParseAttachments(ctx context.Context, userID, _ uuid.UUID, metadata []transactionstore.SourceAttachment) ([]providers.AttachmentInput, []transactionstore.AttachmentUsage, error) {
 	if h.Attachments == nil {
 		return nil, nil, nil
 	}
@@ -219,7 +219,11 @@ func (h Handler) loadParseAttachments(ctx context.Context, userID, sourceID uuid
 		if !transactionprompt.VisualAttachmentMetadataEligible(item) {
 			continue
 		}
-		content, err := h.Attachments.Download(ctx, attachmentstorage.ObjectRequest{UserID: userID, SourceID: sourceID, ObjectPath: item.ObjectPath})
+		request, err := attachmentstorage.ObjectRequestFromPath(userID, item.ObjectPath)
+		if err != nil {
+			return nil, usage, err
+		}
+		content, err := h.Attachments.Download(ctx, request)
 		if err != nil {
 			return nil, usage, err
 		}

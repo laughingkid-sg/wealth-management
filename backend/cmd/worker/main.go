@@ -11,7 +11,12 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/zhengteck/wealth-builder/backend/internal/attachmentstorage"
+	"github.com/zhengteck/wealth-builder/backend/internal/bulkstorage"
+	"github.com/zhengteck/wealth-builder/backend/internal/bulkstore"
+	"github.com/zhengteck/wealth-builder/backend/internal/bulkworker"
 	"github.com/zhengteck/wealth-builder/backend/internal/config"
+	"github.com/zhengteck/wealth-builder/backend/internal/creditcard"
+	"github.com/zhengteck/wealth-builder/backend/internal/creditcardstore"
 	"github.com/zhengteck/wealth-builder/backend/internal/database"
 	"github.com/zhengteck/wealth-builder/backend/internal/ingestion"
 	"github.com/zhengteck/wealth-builder/backend/internal/jobs"
@@ -53,7 +58,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("configure Alibaba parser: %v", err)
 	}
-
 	store := transactionstore.New(pool)
 	gmailHandler := ingestion.GmailIngestionHandler{
 		Repository: store, Gmail: gmailClient, Tokens: oauthClient, Cipher: cipher, Attachments: attachmentClient,
@@ -69,7 +73,31 @@ func main() {
 		jobs.KindReconcile:               processingHandler,
 		jobs.KindSourceAttachmentCleanup: processingHandler,
 	}
-	worker := jobs.Worker{Store: store, WorkerID: workerID(), Handler: handler}
+	if cfg.BulkImportEnabled {
+		bulkProviderHTTPClient := &http.Client{Timeout: cfg.BulkImportProviderTimeout}
+		bulkQwenClient, bulkErr := providers.NewAlibabaQwenClient(bulkProviderHTTPClient, cfg.AlibabaBaseURL, cfg.AlibabaTokenPlanAPIKey, cfg.AlibabaModel)
+		if bulkErr != nil {
+			log.Fatalf("configure Bulk Import parser: %v", bulkErr)
+		}
+		bulkBlobStorage := bulkstorage.Client{Storage: attachmentClient}
+		bulkRepository := bulkstore.New(pool, store, store)
+		creditCardService := creditcard.NewService(creditcardstore.New(pool), nil)
+		bulkHandler := bulkworker.JobHandler{Handler: bulkworker.Handler{
+			Repository: bulkRepository,
+			Renderer: bulkworker.BoundedRenderer{
+				Timeout: cfg.BulkImportRenderTimeout, MaxPageBytes: cfg.BulkImportMaxRenderedPage,
+				MaxDocumentBytes: cfg.BulkImportMaxRenderedDocument,
+			},
+			Parser: bulkQwenClient, BlobStorage: bulkBlobStorage,
+			CreditCard: creditcardstore.NewPostProcessor(creditCardService),
+		}}
+		handler[jobs.KindBulkDocumentPrepare] = bulkHandler
+		handler[jobs.KindBulkDocumentChunkParse] = bulkHandler
+		handler[jobs.KindBulkDocumentAggregate] = bulkHandler
+		handler[jobs.KindBulkCandidateReconcile] = bulkHandler
+		handler[jobs.KindBulkDocumentPostProcess] = bulkHandler
+	}
+	worker := jobs.Worker{Store: store, WorkerID: workerID(), Handler: handler, AllowedKinds: handler.Kinds()}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	for {

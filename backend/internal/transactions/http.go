@@ -413,9 +413,12 @@ func (h *Handler) listSourceAttachments(w http.ResponseWriter, r *http.Request) 
 	}
 	items := make([]attachmentJSON, 0, len(attachments))
 	for _, attachment := range attachments {
-		signedURL, signErr := h.attachmentStorage.SignURL(r.Context(), attachmentstorage.ObjectRequest{
-			UserID: user.ID, SourceID: sourceID, ObjectPath: attachment.ObjectPath,
-		}, attachmentURLExpirySeconds)
+		request, requestErr := attachmentstorage.ObjectRequestFromPath(user.ID, attachment.ObjectPath)
+		if requestErr != nil {
+			writeError(w, http.StatusBadGateway, "Could not prepare attachment access.")
+			return
+		}
+		signedURL, signErr := h.attachmentStorage.SignURL(r.Context(), request, attachmentURLExpirySeconds)
 		if signErr != nil {
 			writeError(w, http.StatusBadGateway, "Could not prepare attachment access.")
 			return
