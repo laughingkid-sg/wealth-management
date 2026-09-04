@@ -54,7 +54,7 @@ Repository layout:
 frontend/   React, TypeScript, Vite, and Supabase browser client
 backend/    Go HTTP API and independent background worker
 supabase/   Hosted-project configuration, migrations, seed data, and pgTAP tests
-docs/       Product and feature requirements plus technical contracts
+original_docs/  Product and feature requirements plus technical contracts (previous team)
 ```
 
 The browser uses the Supabase publishable key and the signed-in user's access token. It talks directly to Supabase for Auth, Accounts CRUD, safe reference reads, Realtime progress, and the narrowly constrained manual-transaction insert. Gmail integration, source evidence, attachment access, prompt/rule administration, canonical edits, and other privileged or multi-row workflows go through the Go API.
@@ -117,7 +117,7 @@ docker compose down
 
 The API and worker load the ignored root `.env` at container runtime. Compose supplies the local origins and callback for ports `8085` and `8086`; these values are not baked into an image. Browser API calls stay on the frontend origin at `/api`, and Vite proxies them across the private Compose network to `http://api:8080`. The frontend receives only public Supabase values and the non-secret routing settings `VITE_API_BASE_URL=/api` and `API_PROXY_TARGET=http://api:8080`.
 
-See [local development orchestration](docs/development.md) for configuration, health checks, rebuilds, cache volumes, and troubleshooting.
+See [local development orchestration](original_docs/development.md) for configuration, health checks, rebuilds, cache volumes, and troubleshooting.
 
 ### Optional code checks
 
@@ -136,12 +136,12 @@ Database migrations, pgTAP suites, and advisors run against the configured hoste
 
 ## Documentation
 
-- [Documentation index](docs/README.md)
-- [Local development orchestration](docs/development.md)
-- [Product overview](docs/product/overview.md)
-- [Accounts requirements](docs/features/accounts/README.md)
-- [Accounts technical implementation](docs/features/accounts/technical.md)
-- [Transactions requirements](docs/features/transactions/README.md)
-- [Transactions technical implementation](docs/features/transactions/technical.md)
+- [Documentation index](original_docs/README.md)
+- [Local development orchestration](original_docs/development.md)
+- [Product overview](original_docs/product/overview.md)
+- [Accounts requirements](original_docs/features/accounts/README.md)
+- [Accounts technical implementation](original_docs/features/accounts/technical.md)
+- [Transactions requirements](original_docs/features/transactions/README.md)
+- [Transactions technical implementation](original_docs/features/transactions/technical.md)
 
 Read the smallest relevant feature document before changing behavior; the technical pages contain the detailed schema, API, security, configuration, and verification contracts.

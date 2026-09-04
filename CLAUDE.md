@@ -99,7 +99,7 @@ Data model: [documentation/05-database.md](documentation/05-database.md).
 
 ## Backlog
 
-Requested-but-unbuilt work is in [`docs/TODO.md`](docs/TODO.md) (e.g. transaction
-delete UI, transaction title UI, Tengo engine). Note some backlog items already
+Requested-but-unbuilt work (e.g. transaction delete UI, transaction title UI, Tengo
+engine) is no longer tracked in a backlog file. Note some backlog items already
 exist at the data layer (`transactions.title`, `creation_method` values) — verify
 current state before implementing.

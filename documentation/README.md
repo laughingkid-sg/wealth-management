@@ -11,7 +11,7 @@ supporting workflows for **credit-card bills**, **account balances**, and
 **bulk document import**.
 
 This `documentation/` folder is a fresh, self-contained handover set. It does not
-replace the older `docs/` folder (product/feature requirements written by the
+replace the older `original_docs/` folder (product/feature requirements written by the
 previous team) — it complements it with a maintainer- and Claude-Code-oriented view
 of the real architecture, data model, and workflows.
 
@@ -61,7 +61,7 @@ Browser SPA ──▶ Supabase (Auth · RLS reads · Realtime · narrow writes)
 frontend/        React + TypeScript + Vite SPA (Supabase browser client)
 backend/         Go module: cmd/api, cmd/worker, internal/* packages
 supabase/        Migrations, seed, config.toml, pgTAP tests (functions/ is empty)
-docs/            Previous team's product & feature requirement docs (kept as-is)
+original_docs/   Previous team's product & feature requirement docs (archived)
 documentation/   This handover documentation set
 compose.yaml     Docker Compose dev stack (frontend + api + worker)
 AGENTS.md        Previous team's agent working agreement
