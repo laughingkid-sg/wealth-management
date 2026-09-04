@@ -123,19 +123,21 @@ supplied. Highlights and hard constraints enforced in code:
 | `TRANSACTION_TOKEN_ENCRYPTION_KEY` | Base64-encoded **32 bytes**. |
 | `ALIBABA_TOKEN_PLAN_API_KEY` | Required. |
 | `ALIBABA_TOKEN_PLAN_BASE_URL` | Must be `https`. Defaults to the SEA MaaS endpoint. |
-| `ALIBABA_TOKEN_PLAN_MODEL` | **Pinned** to `qwen3.8-flash` (config rejects other values). |
+| `ALIBABA_TOKEN_PLAN_MODEL` | Any non-empty value. **Defaults** to `qwen3.8-flash`. |
 | `FRONTEND_ORIGIN` | Used for CORS/redirects; `https` unless localhost dev. |
-| `GMAIL_SYNC_LABEL` | **Pinned** to `odin-finance`. |
-| `GMAIL_INITIAL_BACKFILL_MAX_MESSAGES` | **Pinned** to `5`. |
+| `GMAIL_SYNC_LABEL` | Any non-empty value. **Defaults** to `odin-finance`. |
+| `GMAIL_INITIAL_BACKFILL_MAX_MESSAGES` | Optional positive integer, **1–100**. Defaults to `5`. |
 | `WORKER_POLL_SECONDS` | Default 5. |
 | `OUTBOUND_HTTP_TIMEOUT_SECONDS` | Default 20, max 120. |
 | `BULK_IMPORT_ENABLED` | Default `false`. Gates bulk routes + worker handlers. |
 | `BULK_IMPORT_*` timeouts / byte caps | Bounded (see `.env.example`). |
 | `GOOGLE_TEST_REFRESH_TOKEN` | **Development only**; lets tests skip interactive OAuth. Rejected outside dev. |
 
-> The pinned values (`qwen3.8-flash`, `odin-finance`, backfill `5`) are enforced by
-> `config.go`. If the product needs to change them, change the constant/validation
-> in `internal/config/config.go`, not just the env file — otherwise startup fails.
+> The model, Gmail label, and initial backfill are **operator-configurable via env**
+> with sensible defaults (`qwen3.8-flash`, `odin-finance`, `5`); backfill is bounded
+> to `1–100` as a guardrail. The genuinely safety-critical validations remain strict
+> and *will* fail startup if violated: DB via the transaction pooler on `:6543` with
+> `sslmode=require`, a base64 32-byte encryption key, and https outside localhost dev.
 
 ## Conventions in the Go code
 

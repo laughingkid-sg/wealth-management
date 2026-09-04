@@ -18,7 +18,7 @@ Domain and codebase terms, as used in Wealth Builder.
 | **Sync run** | One Gmail refresh operation, tracked with status + counters. Table: `public.transaction_sync_runs`. |
 | **Backfill** | The first Gmail sync, which imports at most `GMAIL_INITIAL_BACKFILL_MAX_MESSAGES` (=5) recent messages. |
 | **History sync** | Later Gmail syncs that use the Gmail History API with bounded recovery, tracked by `sync_cursor`. |
-| **`odin-finance`** | The exact Gmail label the ingester reads from (`GMAIL_SYNC_LABEL`, pinned). |
+| **`odin-finance`** | The default Gmail label the ingester reads from (`GMAIL_SYNC_LABEL`, env-configurable). |
 | **Review / Dangling / Failed queues** | Outcomes for sources that couldn't be confidently turned into a transaction (`data_sources.parse_status` = `review_required` / `dangling` / `failed`). |
 | **Reconciliation** | Matching a parsed candidate to an account (via typed matching keys) and creating/linking a transaction, with conservative dedup. Package: `internal/reconciliation`. |
 | **Matching key** | A typed, normalized identifier used to match evidence to an account. Stored in `private.account_matching_keys`; **never sent to the LLM**. |
@@ -37,5 +37,5 @@ Domain and codebase terms, as used in Wealth Builder.
 | **Transaction pooler** | Supabase's connection pooler on port `6543`; the API/worker connect only through it (`sslmode=require`). |
 | **Service role** | The privileged Supabase key the server uses; must never reach the browser. |
 | **Publishable key** | The public Supabase key the browser uses (with the user access token). |
-| **Qwen / Token Plan** | The LLM parser: Alibaba Cloud Token Plan, OpenAI-compatible endpoint, model pinned to `qwen3.8-flash`. |
+| **Qwen / Token Plan** | The LLM parser: Alibaba Cloud Token Plan, OpenAI-compatible endpoint, model defaults to `qwen3.8-flash` (env-configurable). |
 | **Provider** | An external service the worker calls: Gmail, the LLM, or Supabase Storage. |

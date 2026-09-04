@@ -52,7 +52,7 @@ tracked in [`docs/TODO.md`](../docs/TODO.md). Note the database **already has** 
 | Frontend | React 19, TypeScript, Vite 8, `@supabase/supabase-js`, `lucide-react` icons. No router library (URL query-param navigation), no global state library. Lint via **oxlint**. |
 | Backend | Go 1.23, standard-library `net/http` with Go 1.22+ method-and-pattern routing, `jackc/pgx/v5` pool, `microcosm-cc/bluemonday` for HTML sanitisation. No web framework. |
 | Data / Auth | Hosted Supabase (Postgres 17, Auth, Realtime, Storage). |
-| LLM parser | Alibaba Cloud "Token Plan" (Qwen, OpenAI-compatible endpoint), model pinned to `qwen3.8-flash`. |
+| LLM parser | Alibaba Cloud "Token Plan" (Qwen, OpenAI-compatible endpoint), model defaults to `qwen3.8-flash` (env-configurable). |
 | Dev orchestration | Docker Compose (`compose.yaml`), Air hot-reload for Go. |
 
 ## High-level request routing

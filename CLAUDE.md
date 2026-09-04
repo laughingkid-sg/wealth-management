@@ -62,9 +62,11 @@ Env files (git-ignored): `cp -n backend/.env.example .env` and
 - **Use the hosted dev project**; do not run `supabase start`.
 - **The model never sees** account metadata or matching keys.
 - Money is stored in **minor units** (`*_amount_minor` bigint).
-- Config pins these — change the validation in `internal/config/config.go` if the
-  product needs different values: LLM model `qwen3.8-flash`, Gmail label
-  `odin-finance`, initial backfill `5`, DB via pooler `:6543` + `sslmode=require`.
+- Config: LLM model, Gmail label, and initial backfill are env-configurable with
+  defaults (`qwen3.8-flash`, `odin-finance`, `5`; backfill bounded 1–100). The strict,
+  startup-failing checks are the safety-critical ones — DB via pooler `:6543` +
+  `sslmode=require`, base64 32-byte key, https outside localhost dev. See
+  `internal/config/config.go`.
 - **Bulk Import** is gated by `BULK_IMPORT_ENABLED` (default `false`): its API routes
   and worker handlers only exist when enabled.
 
