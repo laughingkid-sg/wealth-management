@@ -24,13 +24,14 @@ uses hand-written components + CSS files per feature.
 ```text
 frontend/src/
 ├── main.tsx                 React root
-├── App.tsx                  Shell: auth gate, sidebar nav, Accounts page, page router
+├── App.tsx                  Slim shell: auth gate + LoginPage; renders AccountsPage
+├── workspace.ts             WorkspacePage type + workspacePageFromLocation() (tiny nav module)
 ├── App.css / index.css      Global styles
 ├── lib/
 │   ├── supabase.ts          createClient<Database>() from VITE_ env; isSupabaseConfigured
 │   └── database.types.ts    Generated Supabase types (Database)
 └── features/
-    ├── accounts/            model / validation / interactions (Accounts UI lives in App.tsx)
+    ├── accounts/            AccountsPage (workspace shell) + model / validation / interactions
     ├── transactions/        TransactionsPage + dialogs + settings + prompt preview + api.ts
     ├── bulk-import/         BulkImportPage + api.ts + model.ts
     └── account-balances/    AccountFinanceDetailPage + CreditCardPage + api.ts + viewModel.ts
@@ -40,22 +41,27 @@ Each feature folder keeps its **models/view-models** and its **`api.ts`** client
 next to its components, plus a `.css` file. This is the module boundary: work on a
 feature by staying inside its folder plus shared `lib/`.
 
-## The app shell (`App.tsx`)
+## The app shell (`App.tsx` + `AccountsPage.tsx`)
 
-`App.tsx` is large and does several jobs:
+`App.tsx` is now a slim (~150-line) shell:
 
 - **Auth gate.** On mount it calls `supabase.auth.getSession()` and subscribes to
   `onAuthStateChange`. If not configured → setup screen; if no session →
-  `LoginPage` (email/password only, no registration); otherwise the workspace.
-- **Navigation.** There is no route library. A `WorkspacePage` union type
+  `LoginPage` (email/password only, no registration); otherwise it renders
+  `AccountsPage`.
+
+`features/accounts/AccountsPage.tsx` is the **workspace shell** — the large component
+that owns navigation and hosts every feature page:
+
+- **Navigation.** There is no route library. The `WorkspacePage` union type
   (`accounts | transactions | bulk-import | credit-card | transaction-settings |
-  transaction-global-settings | transaction-prompt-preview`) is driven by the
-  `?page=` query param via `history.pushState` + `popstate`. `?gmail=` forces the
-  transactions page (used by the OAuth return).
-- **Accounts UI** is implemented directly in `App.tsx` (`AccountsPage`,
-  `AccountForm`). It reads/writes the `accounts` table **directly through
-  `supabase-js`** (RLS-guarded): list/order, insert, update, and soft-delete via
-  `deleted_at`.
+  transaction-global-settings | transaction-prompt-preview`) and
+  `workspacePageFromLocation()` live in `src/workspace.ts`; the active page is driven
+  by the `?page=` query param via `history.pushState` + `popstate` (in `App.tsx`).
+  `?gmail=` forces the transactions page (used by the OAuth return).
+- **Accounts UI** (`AccountsPage`, `AccountForm`, `SideNav`) reads/writes the
+  `accounts` table **directly through `supabase-js`** (RLS-guarded): list/order,
+  insert, update, and soft-delete via `deleted_at`.
 - **Lazy loading.** All other pages are `React.lazy` + `Suspense` code-split
   chunks (transactions, bulk import, credit card, settings, prompt preview,
   account finance detail).
