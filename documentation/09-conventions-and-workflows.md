@@ -78,8 +78,8 @@ constraints, add/extend a pgTAP test.
 ## Documentation upkeep
 
 - This `documentation/` set is the maintainer/architecture view.
-- `docs/` holds the previous team's product + per-feature requirement/technical docs
-  and the `docs/TODO.md` backlog. If you keep using that structure, update the
-  affected feature's `README.md`/`technical.md` when its behaviour/data/API changes,
-  and only touch `docs/product/overview.md` for genuine cross-feature decisions.
+- `original_docs/` holds the previous team's archived product + per-feature
+  requirement/technical docs. If you keep using that structure, update the affected
+  feature's `README.md`/`technical.md` when its behaviour/data/API changes, and only
+  touch `original_docs/product/overview.md` for genuine cross-feature decisions.
 - When a change spans code + schema + docs, update all three together.

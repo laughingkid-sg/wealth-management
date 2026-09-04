@@ -51,10 +51,10 @@ Keep the frontend, API, and database concerns separate. Browser code may use Sup
 
 ## Documentation structure
 
-- `docs/README.md` is the documentation index and describes how to find the right layer.
-- `docs/product/` contains cross-feature product decisions. Read it only when a change depends on product-wide context.
-- `docs/features/<feature>/README.md` contains that feature's requirements and scope.
-- `docs/features/<feature>/technical.md` contains that feature's implementation, data, and verification details.
+- `original_docs/README.md` is the documentation index and describes how to find the right layer.
+- `original_docs/product/` contains cross-feature product decisions. Read it only when a change depends on product-wide context.
+- `original_docs/features/<feature>/README.md` contains that feature's requirements and scope.
+- `original_docs/features/<feature>/technical.md` contains that feature's implementation, data, and verification details.
 - Update only the affected feature documents and any genuinely affected product-level document; do not require unrelated feature documents to be read or changed.
 
 ## Git workflow

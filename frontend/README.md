@@ -20,4 +20,4 @@ npm run build
 npm run lint
 ```
 
-Read the [Accounts feature documentation](../docs/features/accounts/README.md) before changing Accounts behaviour, and its [technical implementation](../docs/features/accounts/technical.md) before changing Supabase or frontend data access.
+Read the [Accounts feature documentation](../original_docs/features/accounts/README.md) before changing Accounts behaviour, and its [technical implementation](../original_docs/features/accounts/technical.md) before changing Supabase or frontend data access.

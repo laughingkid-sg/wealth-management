@@ -143,5 +143,5 @@ canonical definition (later migrations can reference, not redefine, the limits).
 | 5 | Decide parser-rule layering (drop shared layer or add admin auth) | Med | Med | Med | needs product decision |
 | 6 | Single canonical storage-bucket definition | Low | Low | Low | ✅ done |
 
-These are recommendations, not committed work. Promote any of them into the team's
-active backlog (`docs/TODO.md`) when you decide to act.
+These are recommendations, not committed work. Promote any of them into your team's
+active backlog when you decide to act.

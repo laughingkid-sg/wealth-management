@@ -40,8 +40,8 @@ payment detection, payoff).
 | Credit Card | Delivered | Opening balances, spending treatments, bulk-generated bills, reconciliation, payment detection, payoff. |
 | Dashboard / Investments / Goals / AI assistant | **Not built** | Present in the sidebar as disabled "Soon" items. |
 
-Backlog items (e.g. transaction delete UI, transaction title UI, Tengo engine) are
-tracked in [`docs/TODO.md`](../docs/TODO.md). Note the database **already has** a
+Backlog items (e.g. transaction delete UI, transaction title UI, Tengo engine) were
+tracked by the previous team. Note the database **already has** a
 `transactions.title` column and a `creation_method` that includes
 `credit_card_statement`; some backlog items are partially present at the data layer.
 
