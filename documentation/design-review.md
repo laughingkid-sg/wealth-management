@@ -42,7 +42,7 @@ and exactly `5`, hard-failing startup otherwise.
   Safety-critical validations are unchanged. See `internal/config/config.go` and
   `internal/config/config_test.go`.
 
-### 2. A few god-files  · impact: high (readability) · effort: med · risk: low  · ◑ in progress
+### 2. A few god-files  · impact: high (readability) · effort: med · risk: low  · ✅ done
 | File | Lines | Note |
 | --- | --- | --- |
 | `backend/internal/transactions/http.go` | ~1,755 | All transaction handlers in one file. |
@@ -63,8 +63,13 @@ settings / transactions), and extract `AccountsPage` out of `App.tsx`.
   functions) moved to `apiClient.ts`, leaving `api.ts` as the domain request functions;
   `api.ts` re-exports the public surface so no consumer import changed (`tsc`/`oxlint`
   clean).
-- **Remaining:** `account-balances/AccountFinanceDetailPage.tsx` (~1,400) is still a
-  single monolithic component — follow-up, lower priority.
+  `AccountFinanceDetailPage.tsx` `1400 → 535` — its shared types + pure helpers moved
+  to `financeHelpers.ts` (125) and its ten already-typed presentational sub-components
+  to `financeSections.tsx` (810); the file keeps the page orchestration and imports the
+  two. Pure relocation, no logic change; verified `tsc`/`oxlint`/`vite build` (option C,
+  since the feature has no runtime tests).
+- **All four named god-files are now split.** Optional further work: `financeSections.tsx`
+  (810) could be subdivided by tab (balance vs bills) later if desired.
 
 ### 3. Inconsistent frontend structure  · impact: low-med · effort: low · risk: low  · ✅ done
 Every feature is a folder under `features/` **except Accounts, which lives inside
@@ -132,7 +137,7 @@ canonical definition (later migrations can reference, not redefine, the limits).
 | # | Finding | Impact | Effort | Risk | Status |
 | --- | --- | --- | --- | --- | --- |
 | 1 | Relax over-pinned config validation | Med | Low | Low | ✅ done |
-| 2 | Split god-files (`transactions/http.go`, `App.tsx`, `api.ts`, `AccountFinanceDetailPage`) | High | Med | Low | ◑ partial (`App.tsx`, `http.go`, `api.ts` done; `AccountFinanceDetailPage` left) |
+| 2 | Split god-files (`transactions/http.go`, `App.tsx`, `api.ts`, `AccountFinanceDetailPage`) | High | Med | Low | ✅ done (all four) |
 | 3 | Move Accounts into `features/`; consider a tiny routes module | Low-Med | Low | Low | ✅ done |
 | 4 | Converge Bulk Import with the Transactions evidence pipeline | High | High | High | deferred / not now |
 | 5 | Decide parser-rule layering (drop shared layer or add admin auth) | Med | Med | Med | needs product decision |
