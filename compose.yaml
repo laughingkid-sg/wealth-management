@@ -1,0 +1,84 @@
+name: wealth-builder-dev
+
+x-backend-environment: &backend-environment
+  API_ADDRESS: ":8080"
+  FRONTEND_ORIGIN: "http://localhost:8085"
+  GOOGLE_OAUTH_REDIRECT_URL: "http://localhost:8086/v1/transactions/gmail/oauth/callback"
+
+x-backend-volumes: &backend-volumes
+  - ./backend:/app
+  - go_module_cache:/go/pkg/mod
+  - go_build_cache:/root/.cache/go-build
+
+services:
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    env_file:
+      - ./.env
+    environment: *backend-environment
+    init: true
+    ports:
+      - "127.0.0.1:8086:8080"
+    volumes: *backend-volumes
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 30s
+    networks:
+      - app
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    command: ["air", "-c", ".air.worker.toml"]
+    env_file:
+      - ./.env
+    environment: *backend-environment
+    init: true
+    volumes: *backend-volumes
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "pgrep", "-x", "worker"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 30s
+    networks:
+      - app
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    env_file:
+      - ./frontend/.env.local
+    environment:
+      API_PROXY_TARGET: "http://api:8080"
+      CHOKIDAR_USEPOLLING: "true"
+      VITE_API_BASE_URL: "/api"
+    init: true
+    ports:
+      - "127.0.0.1:8085:5173"
+    volumes:
+      - ./frontend:/app
+      - frontend_node_modules:/app/node_modules
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - app
+
+networks:
+  app:
+
+volumes:
+  frontend_node_modules:
+  go_build_cache:
+  go_module_cache:

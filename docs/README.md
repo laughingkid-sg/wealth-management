@@ -7,6 +7,7 @@ Documentation is organised by scope so a feature change does not require reading
 | Situation | Read |
 | --- | --- |
 | Product-wide direction, stack boundaries, or principles | [Product overview](product/overview.md) |
+| Starting or troubleshooting the local Docker Compose stack | [Local development orchestration](development.md) |
 | A change to Accounts behaviour or scope | [Accounts requirements](features/accounts/README.md) |
 | Accounts frontend, Supabase, data, RLS, or verification work | [Accounts technical implementation](features/accounts/technical.md) |
 | A change to Transactions behaviour or scope | [Transactions requirements](features/transactions/README.md) |

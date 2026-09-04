@@ -74,59 +74,52 @@ The API and worker share the server-only configuration and connect to Postgres t
 
 ## Run locally against hosted Supabase
 
-Local development uses the configured hosted Supabase project. Do not start a local Supabase or Docker stack for this repository.
+The default development stack runs the frontend, Go API, and Go worker in Docker Compose while continuing to use the configured hosted Supabase project. It intentionally contains no local Supabase service.
 
 Prerequisites:
 
-- Node.js/npm for the frontend.
-- Go 1.23 or newer for the API and worker.
+- Docker Desktop or another Docker installation with Compose v2.
 - A hosted Supabase project with the repository migrations applied and a provisioned email/password user.
-- Google OAuth credentials with the exact local callback registered.
-- Alibaba Cloud Token Plan credentials for the configured `qwen3.8-flash` parser.
+- Google OAuth credentials with `http://localhost:8086/v1/transactions/gmail/oauth/callback` registered exactly.
+- Alibaba Cloud Token Plan credentials for the configured parser.
 
-### 1. Configure the backend
-
-Create an ignored local file from the safe template and replace every placeholder with the matching hosted-project or provider value:
+Create the two ignored runtime configuration files from their safe templates when they do not already exist:
 
 ```bash
 cp -n backend/.env.example .env
+cp -n frontend/.env.example frontend/.env.local
 ```
 
-The example documents the complete contract. In particular, `SUPABASE_DB_URL` must be the transaction-pooler URL on port `6543` with `sslmode=require`, `GOOGLE_OAUTH_REDIRECT_URL` must exactly match the registered callback, and `FRONTEND_ORIGIN` must match the Vite origin. Do not commit `.env`.
+Populate `.env` with the server-only hosted Supabase, Google, encryption, and model-provider values. Populate `frontend/.env.local` with only `VITE_SUPABASE_URL` and `VITE_SUPABASE_PUBLISHABLE_KEY`. Never put the service-role key or another server secret in a `VITE_*` variable.
 
-The Go binaries read process environment variables; they do not load `.env` automatically. Start the API and worker in separate terminals, sourcing the same file in each:
+Start or rebuild the complete stack:
 
 ```bash
-cd backend
-set -a
-source ../.env
-set +a
-go run ./cmd/api
+docker compose up -d --build
 ```
+
+The services use bind-mounted source code and development hot reload:
+
+- Frontend: `http://localhost:8085`
+- API health check: `http://localhost:8086/healthz`
+- Worker: background-only, with no host port
+- Supabase: the hosted project configured in `.env`
+
+Useful commands:
 
 ```bash
-cd backend
-set -a
-source ../.env
-set +a
-go run ./cmd/worker
+docker compose ps
+docker compose logs -f frontend api worker
+docker compose restart api worker
+docker compose up -d --build
+docker compose down
 ```
 
-The API listens on `http://localhost:8080` by default and exposes `GET /healthz`.
+The API and worker load the ignored root `.env` at container runtime. Compose supplies the local origins and callback for ports `8085` and `8086`; these values are not baked into an image. Browser API calls stay on the frontend origin at `/api`, and Vite proxies them across the private Compose network to `http://api:8080`. The frontend receives only public Supabase values and the non-secret routing settings `VITE_API_BASE_URL=/api` and `API_PROXY_TARGET=http://api:8080`.
 
-### 2. Configure and start the frontend
+See [local development orchestration](docs/development.md) for configuration, health checks, rebuilds, cache volumes, and troubleshooting.
 
-```bash
-cd frontend
-cp -n .env.example .env.local
-# Set VITE_SUPABASE_URL and VITE_SUPABASE_PUBLISHABLE_KEY for the hosted project.
-npm install
-npm run dev
-```
-
-Vite serves the SPA on `http://localhost:5173` by default and proxies `/api` to the local Go API on port `8080`. Sign in with the provisioned Supabase user, then connect Gmail from Transactions when testing ingestion.
-
-### 3. Optional code checks
+### Optional code checks
 
 ```bash
 cd backend
@@ -144,6 +137,7 @@ Database migrations, pgTAP suites, and advisors run against the configured hoste
 ## Documentation
 
 - [Documentation index](docs/README.md)
+- [Local development orchestration](docs/development.md)
 - [Product overview](docs/product/overview.md)
 - [Accounts requirements](docs/features/accounts/README.md)
 - [Accounts technical implementation](docs/features/accounts/technical.md)

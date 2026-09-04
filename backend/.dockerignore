@@ -1,0 +1,15 @@
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+tmp/
+tmp-api/
+tmp-worker/
+bin/
+coverage/
+*.out
+*.log
+*.pem
+*.key
+.DS_Store
