@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/zhengteck/wealth-builder/backend/internal/database"
 	"github.com/zhengteck/wealth-builder/backend/internal/gmailconnection"
 	"github.com/zhengteck/wealth-builder/backend/internal/jobs"
 )
@@ -401,12 +402,27 @@ func (s *Store) UpdateConnectionCursor(ctx context.Context, userID uuid.UUID, cu
 
 // Claim implements jobs.Store with a single short, non-blocking PostgreSQL statement.
 func (s *Store) Claim(ctx context.Context, workerID string, now time.Time) (*jobs.Job, error) {
+	return s.claimKinds(ctx, workerID, now, nil)
+}
+
+func (s *Store) ClaimKinds(ctx context.Context, workerID string, now time.Time, kinds []jobs.Kind) (*jobs.Job, error) {
+	if len(kinds) == 0 {
+		return nil, nil
+	}
+	values := make([]string, len(kinds))
+	for index, kind := range kinds {
+		values[index] = string(kind)
+	}
+	return s.claimKinds(ctx, workerID, now, values)
+}
+
+func (s *Store) claimKinds(ctx context.Context, workerID string, now time.Time, kinds []string) (*jobs.Job, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if err = reapExpiredFinalAttempts(ctx, tx, now); err != nil {
+	if err = reapExpiredFinalAttemptsForKinds(ctx, tx, now, kinds); err != nil {
 		return nil, err
 	}
 	var job jobs.Job
@@ -415,7 +431,7 @@ func (s *Store) Claim(ctx context.Context, workerID string, now time.Time) (*job
 	err = tx.QueryRow(ctx, `
 			with candidate as (
 			select id from private.transaction_jobs
-			where attempts < max_attempts and (
+			where ($3::text[] is null or job_type=any($3::text[])) and attempts < max_attempts and (
 				(status = 'queued' and run_after <= $1)
 				or (status = 'running' and lease_expires_at <= $1)
 			)
@@ -425,7 +441,14 @@ func (s *Store) Claim(ctx context.Context, workerID string, now time.Time) (*job
 		update private.transaction_jobs job set status = 'running', attempts = job.attempts + 1,
 			leased_at = $1, lease_expires_at = $1::timestamptz + interval '5 minutes', leased_by = $2
 		from candidate where job.id = candidate.id
-		returning job.id, job.user_id, job.sync_run_id, job.job_type, job.payload, job.attempts, job.run_after, job.lease_expires_at`, now, workerID).Scan(&job.ID, &job.UserID, &job.SyncRunID, &job.Kind, &payload, &job.Attempts, &job.Available, &lease)
+		returning job.id, job.user_id, job.sync_run_id, job.data_source_id,
+			job.bulk_import_batch_id, job.bulk_import_document_id, job.bulk_import_chunk_id,
+			job.bulk_import_candidate_id, job.attempt_generation,
+			job.job_type, job.payload, job.attempts, job.run_after, job.lease_expires_at`, now, workerID, database.NullableTextArrayLiteral(kinds)).Scan(
+		&job.ID, &job.UserID, &job.SyncRunID, &job.SourceID, &job.BatchID, &job.DocumentID,
+		&job.ChunkID, &job.CandidateID, &job.Generation, &job.Kind, &payload,
+		&job.Attempts, &job.Available, &lease,
+	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		if commitErr := tx.Commit(ctx); commitErr != nil {
 			return nil, commitErr
@@ -468,13 +491,14 @@ func (s *Store) Complete(ctx context.Context, jobID uuid.UUID, workerID string) 
 	defer func() { _ = tx.Rollback(ctx) }()
 	var userID uuid.UUID
 	var syncRunID *uuid.UUID
+	var batchID *uuid.UUID
 	var kind jobs.Kind
 	err = tx.QueryRow(ctx, `
-		select user_id, sync_run_id, job_type
+		select user_id, sync_run_id, bulk_import_batch_id, job_type
 		from private.transaction_jobs
 		where id = $1 and status = 'running' and leased_by = $2
 			and lease_expires_at > now()
-		for update`, jobID, workerID).Scan(&userID, &syncRunID, &kind)
+		for update`, jobID, workerID).Scan(&userID, &syncRunID, &batchID, &kind)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("%w: job %s is not running for this worker", jobs.ErrLeaseLost, jobID)
 	}
@@ -499,7 +523,7 @@ func (s *Store) Complete(ctx context.Context, jobID uuid.UUID, workerID string) 
 		set status = 'completed', completed_at = now(), leased_at = null,
 			lease_expires_at = null, leased_by = null, last_error = null
 		where id = $1 and status = 'running' and leased_by = $2 and lease_expires_at > now()
-		returning user_id, sync_run_id`, jobID, workerID).Scan(&userID, &syncRunID)
+		returning user_id, sync_run_id, bulk_import_batch_id`, jobID, workerID).Scan(&userID, &syncRunID, &batchID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("%w: job %s is not running for this worker", jobs.ErrLeaseLost, jobID)
 	}
@@ -508,6 +532,11 @@ func (s *Store) Complete(ctx context.Context, jobID uuid.UUID, workerID string) 
 	}
 	if syncRunID != nil {
 		if err = refreshSyncRunProgress(ctx, tx, userID, *syncRunID); err != nil {
+			return err
+		}
+	}
+	if batchID != nil {
+		if err = refreshBulkBatchProgress(ctx, tx, userID, *batchID); err != nil {
 			return err
 		}
 	}
@@ -523,6 +552,8 @@ func (s *Store) Retry(ctx context.Context, jobID uuid.UUID, workerID string, _ i
 	cleanupRecoveryAt := retryAt.Add(sourceCleanupRetryCooldown)
 	var userID uuid.UUID
 	var syncRunID, sourceID *uuid.UUID
+	var batchID, documentID, chunkID, candidateID *uuid.UUID
+	var generation *int
 	var kind jobs.Kind
 	var status string
 	err = tx.QueryRow(ctx, `
@@ -559,9 +590,11 @@ func (s *Store) Retry(ctx context.Context, jobID uuid.UUID, workerID string, _ i
 					else 'Job failed; retry or inspect the sync run.'
 				end
 			where id = $1 and status = 'running' and leased_by = $4 and lease_expires_at > now()
-			returning user_id, sync_run_id, data_source_id, job_type, status`,
+			returning user_id, sync_run_id, data_source_id, bulk_import_batch_id,
+				bulk_import_document_id, bulk_import_chunk_id, bulk_import_candidate_id,
+				attempt_generation, job_type, status`,
 		jobID, retryAt, cleanupRecoveryAt, workerID, string(jobs.KindSourceAttachmentCleanup),
-	).Scan(&userID, &syncRunID, &sourceID, &kind, &status)
+	).Scan(&userID, &syncRunID, &sourceID, &batchID, &documentID, &chunkID, &candidateID, &generation, &kind, &status)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("%w: job %s is not running for this worker", jobs.ErrLeaseLost, jobID)
 	}
@@ -569,7 +602,7 @@ func (s *Store) Retry(ctx context.Context, jobID uuid.UUID, workerID string, _ i
 		return err
 	}
 	if status == "failed" {
-		if err = markTerminalJobFailure(ctx, tx, userID, syncRunID, sourceID, kind); err != nil {
+		if err = markTerminalJobFailure(ctx, tx, expiredJob{UserID: userID, SyncRunID: syncRunID, SourceID: sourceID, BatchID: batchID, DocumentID: documentID, ChunkID: chunkID, CandidateID: candidateID, Generation: generation, Kind: kind, Status: status}); err != nil {
 			return err
 		}
 	}
@@ -582,14 +615,23 @@ func (s *Store) Retry(ctx context.Context, jobID uuid.UUID, workerID string, _ i
 }
 
 type expiredJob struct {
-	UserID    uuid.UUID
-	SyncRunID *uuid.UUID
-	SourceID  *uuid.UUID
-	Kind      jobs.Kind
-	Status    string
+	UserID      uuid.UUID
+	SyncRunID   *uuid.UUID
+	SourceID    *uuid.UUID
+	BatchID     *uuid.UUID
+	DocumentID  *uuid.UUID
+	ChunkID     *uuid.UUID
+	CandidateID *uuid.UUID
+	Generation  *int
+	Kind        jobs.Kind
+	Status      string
 }
 
 func reapExpiredFinalAttempts(ctx context.Context, tx pgx.Tx, now time.Time) error {
+	return reapExpiredFinalAttemptsForKinds(ctx, tx, now, nil)
+}
+
+func reapExpiredFinalAttemptsForKinds(ctx context.Context, tx pgx.Tx, now time.Time, kinds []string) error {
 	cleanupRecoveryAt := now.Add(sourceCleanupRetryCooldown)
 	rows, err := tx.Query(ctx, `
 		update private.transaction_jobs
@@ -608,9 +650,12 @@ func reapExpiredFinalAttempts(ctx context.Context, tx pgx.Tx, now time.Time) err
 					then 'Attachment cleanup worker lease expired; cleanup remains queued for automatic retry.'
 				else 'Worker lease expired on the final attempt.'
 			end
-		where status = 'running' and lease_expires_at <= $1::timestamptz and attempts >= max_attempts
-		returning user_id, sync_run_id, data_source_id, job_type, status`,
-		now, cleanupRecoveryAt, string(jobs.KindSourceAttachmentCleanup),
+		where ($4::text[] is null or job_type=any($4::text[]))
+			and status = 'running' and lease_expires_at <= $1::timestamptz and attempts >= max_attempts
+		returning user_id, sync_run_id, data_source_id, bulk_import_batch_id,
+			bulk_import_document_id, bulk_import_chunk_id, bulk_import_candidate_id,
+			attempt_generation, job_type, status`,
+		now, cleanupRecoveryAt, string(jobs.KindSourceAttachmentCleanup), database.NullableTextArrayLiteral(kinds),
 	)
 	if err != nil {
 		return err
@@ -618,7 +663,7 @@ func reapExpiredFinalAttempts(ctx context.Context, tx pgx.Tx, now time.Time) err
 	expired := make([]expiredJob, 0)
 	for rows.Next() {
 		var job expiredJob
-		if err = rows.Scan(&job.UserID, &job.SyncRunID, &job.SourceID, &job.Kind, &job.Status); err != nil {
+		if err = rows.Scan(&job.UserID, &job.SyncRunID, &job.SourceID, &job.BatchID, &job.DocumentID, &job.ChunkID, &job.CandidateID, &job.Generation, &job.Kind, &job.Status); err != nil {
 			rows.Close()
 			return err
 		}
@@ -631,7 +676,7 @@ func reapExpiredFinalAttempts(ctx context.Context, tx pgx.Tx, now time.Time) err
 	rows.Close()
 	for _, job := range expired {
 		if job.Status == "failed" {
-			if err = markTerminalJobFailure(ctx, tx, job.UserID, job.SyncRunID, job.SourceID, job.Kind); err != nil {
+			if err = markTerminalJobFailure(ctx, tx, job); err != nil {
 				return err
 			}
 		}
@@ -644,28 +689,80 @@ func reapExpiredFinalAttempts(ctx context.Context, tx pgx.Tx, now time.Time) err
 	return nil
 }
 
-func markTerminalJobFailure(ctx context.Context, tx pgx.Tx, userID uuid.UUID, syncRunID, sourceID *uuid.UUID, kind jobs.Kind) error {
-	if sourceID != nil {
+func markTerminalJobFailure(ctx context.Context, tx pgx.Tx, job expiredJob) error {
+	if job.SourceID != nil && !isBulkJobKind(job.Kind) {
 		message := "Source parsing failed after all retry attempts."
-		if kind == jobs.KindReconcile {
+		if job.Kind == jobs.KindReconcile {
 			message = "Source reconciliation failed after all retry attempts."
 		}
 		if _, err := tx.Exec(ctx, `
 			update private.data_sources
 			set parse_status = 'failed', parse_error = $3
-			where id = $1 and user_id = $2`, *sourceID, userID, message); err != nil {
+			where id = $1 and user_id = $2`, *job.SourceID, job.UserID, message); err != nil {
 			return err
 		}
 	}
-	if kind == jobs.KindGmailIngest && syncRunID != nil {
+	if job.Kind == jobs.KindGmailIngest && job.SyncRunID != nil {
 		_, err := tx.Exec(ctx, `
 			update public.transaction_sync_runs
 			set status = 'failed', completed_at = now(),
 				error_summary = 'Gmail ingestion failed after all retry attempts.'
-			where id = $1 and user_id = $2 and status in ('queued', 'running')`, *syncRunID, userID)
+			where id = $1 and user_id = $2 and status in ('queued', 'running')`, *job.SyncRunID, job.UserID)
 		return err
 	}
+	if job.BatchID != nil && job.DocumentID != nil && job.Generation != nil {
+		if job.CandidateID != nil {
+			if _, err := tx.Exec(ctx, `update private.bulk_import_candidates set status='failed',error_summary='Worker failed after all retry attempts.' where id=$1 and user_id=$2 and attempt_generation=$3 and status='pending_reconciliation'`, *job.CandidateID, job.UserID, *job.Generation); err != nil {
+				return err
+			}
+			var remaining int
+			if err := tx.QueryRow(ctx, `select count(*) from private.bulk_import_candidates where document_id=$1 and user_id=$2 and attempt_generation=$3 and status='pending_reconciliation'`, *job.DocumentID, job.UserID, *job.Generation).Scan(&remaining); err != nil {
+				return err
+			}
+			if remaining == 0 && job.SourceID != nil {
+				if _, err := tx.Exec(ctx, `insert into private.transaction_jobs(user_id,data_source_id,job_type,bulk_import_batch_id,bulk_import_document_id,attempt_generation,payload) values($1,$2,$3,$4,$5,$6,'{}') on conflict do nothing`, job.UserID, *job.SourceID, string(jobs.KindBulkDocumentPostProcess), *job.BatchID, *job.DocumentID, *job.Generation); err != nil {
+					return err
+				}
+			}
+		} else {
+			if job.ChunkID != nil {
+				if _, err := tx.Exec(ctx, `update private.bulk_import_chunks set status='failed',completed_at=now(),error_summary='Worker failed after all retry attempts.' where id=$1 and user_id=$2 and attempt_generation=$3 and status in ('queued','parsing')`, *job.ChunkID, job.UserID, *job.Generation); err != nil {
+					return err
+				}
+			}
+			if _, err := tx.Exec(ctx, `update private.bulk_import_documents set status='failed',failed_count=greatest(failed_count,1),completed_at=now(),error_summary='Worker failed after all retry attempts.' where id=$1 and batch_id=$2 and user_id=$3 and attempt_generation=$4 and status not in ('completed','completed_with_errors','cancelled')`, *job.DocumentID, *job.BatchID, job.UserID, *job.Generation); err != nil {
+				return err
+			}
+		}
+		if err := refreshBulkBatchProgress(ctx, tx, job.UserID, *job.BatchID); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func isBulkJobKind(kind jobs.Kind) bool {
+	switch kind {
+	case jobs.KindBulkDocumentPrepare, jobs.KindBulkDocumentChunkParse,
+		jobs.KindBulkDocumentAggregate, jobs.KindBulkCandidateReconcile,
+		jobs.KindBulkDocumentPostProcess:
+		return true
+	default:
+		return false
+	}
+}
+
+const cancelDrainedBulkDocumentsSQL = `update private.bulk_import_documents d set status='cancelled',completed_at=coalesce(d.completed_at,now()),error_summary=null from public.bulk_import_batches b where d.batch_id=b.id and d.user_id=b.user_id and b.id=$2 and b.user_id=$1 and b.status='cancelling' and d.status not in ('completed','completed_with_errors','failed','cancelled') and not exists(select 1 from private.transaction_jobs j where j.bulk_import_document_id=d.id and j.user_id=d.user_id and j.status in ('queued','running'))`
+
+func refreshBulkBatchProgress(ctx context.Context, tx pgx.Tx, userID, batchID uuid.UUID) error {
+	if _, err := tx.Exec(ctx, `update private.bulk_import_candidates c set status='cancelled',reconciliation_reason='Bulk Import was cancelled.' from private.bulk_import_documents d join public.bulk_import_batches b on b.id=d.batch_id and b.user_id=d.user_id where c.document_id=d.id and c.user_id=d.user_id and b.id=$2 and b.user_id=$1 and b.status='cancelling' and c.status='pending_reconciliation' and not exists(select 1 from private.transaction_jobs j where j.bulk_import_candidate_id=c.id and j.user_id=c.user_id and j.status in ('queued','running'))`, userID, batchID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, cancelDrainedBulkDocumentsSQL, userID, batchID); err != nil {
+		return err
+	}
+	_, err := tx.Exec(ctx, `update public.bulk_import_batches b set file_count=p.files,document_count=p.documents,page_count=p.pages,parsed_candidate_count=p.candidates,created_count=p.created,attached_count=p.attached,review_count=p.review,failed_count=p.failed,duplicate_count=p.duplicates,status=case when b.status='cancelling' and p.active=0 then 'cancelled' when p.active=0 and p.failed>0 then 'completed_with_errors' when p.active=0 then 'completed' when b.status='queued' then 'running' else b.status end,started_at=case when b.status='queued' then coalesce(b.started_at,now()) else b.started_at end,completed_at=case when p.active=0 then coalesce(b.completed_at,now()) else null end from (select (select count(*) from private.bulk_import_files f where f.batch_id=$2 and f.user_id=$1)::int files,count(*)::int documents,coalesce(sum(d.page_count),0)::int pages,coalesce(sum(d.candidate_count),0)::int candidates,coalesce(sum(d.created_count),0)::int created,coalesce(sum(d.attached_count),0)::int attached,coalesce(sum(d.review_count),0)::int review,coalesce(sum(d.failed_count),0)::int failed,coalesce(sum(d.duplicate_count),0)::int duplicates,count(*) filter(where d.status in ('queued','preparing','parsing','aggregating','reconciling'))::int active from private.bulk_import_documents d where d.batch_id=$2 and d.user_id=$1) p where b.id=$2 and b.user_id=$1`, userID, batchID)
+	return err
 }
 
 func refreshSyncRunProgress(ctx context.Context, tx pgx.Tx, userID, runID uuid.UUID) error {

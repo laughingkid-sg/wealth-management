@@ -389,20 +389,8 @@ func (s *Store) StageSourceDeletion(ctx context.Context, userID, sourceID uuid.U
 		}
 	}
 
-	for start := 0; start < len(objectPaths); start += storageCleanupBatchSize {
-		end := min(start+storageCleanupBatchSize, len(objectPaths))
-		payload, marshalErr := json.Marshal(jobs.SourceAttachmentCleanupPayload{
-			SourceID: sourceID.String(), ObjectPaths: objectPaths[start:end],
-		})
-		if marshalErr != nil {
-			return SourceDeletionResult{}, fmt.Errorf("encode source attachment cleanup: %w", marshalErr)
-		}
-		if _, err = tx.Exec(ctx, `
-			insert into private.transaction_jobs
-				(user_id, job_type, payload, max_attempts)
-			values ($1, $2, $3::jsonb, $4)`, userID, string(jobs.KindSourceAttachmentCleanup), string(payload), storageCleanupMaxAttempts); err != nil {
-			return SourceDeletionResult{}, err
-		}
+	if err = enqueueAttachmentCleanupJobs(ctx, tx, userID, objectPaths); err != nil {
+		return SourceDeletionResult{}, err
 	}
 
 	for _, syncRunID := range syncRunIDs {
@@ -431,13 +419,24 @@ func lockTransactionUser(ctx context.Context, tx pgx.Tx, userID uuid.UUID) error
 		where user_id = $1 for update`, userID).Scan(&lockedUserID)
 }
 
-func collectSourceObjectPaths(ctx context.Context, tx pgx.Tx, userID, sourceID uuid.UUID, raw []byte) ([]string, error) {
-	paths := make(map[string]struct{})
+type scopedObjectPaths map[uuid.UUID]map[string]struct{}
+
+func (paths scopedObjectPaths) addOwned(userID uuid.UUID, objectPath string) {
+	scopeID, err := attachmentstorage.ScopeIDFromObjectPath(userID, objectPath)
+	if err != nil {
+		return
+	}
+	if paths[scopeID] == nil {
+		paths[scopeID] = make(map[string]struct{})
+	}
+	paths[scopeID][objectPath] = struct{}{}
+}
+
+func collectSourceObjectPaths(ctx context.Context, tx pgx.Tx, userID, sourceID uuid.UUID, raw []byte) (scopedObjectPaths, error) {
+	paths := make(scopedObjectPaths)
 	for _, attachment := range sourceAttachmentMetadata(raw) {
-		path := strings.TrimSpace(attachment.ObjectPath)
-		request := attachmentstorage.ObjectRequest{UserID: userID, SourceID: sourceID, ObjectPath: path}
-		if attachment.StorageStatus == "stored" && attachmentstorage.ValidateObjectRequest(request) == nil {
-			paths[path] = struct{}{}
+		if attachment.StorageStatus == "stored" {
+			paths.addOwned(userID, attachment.ObjectPath)
 		}
 	}
 	prefix := userID.String() + "/" + sourceID.String() + "/"
@@ -453,20 +452,62 @@ func collectSourceObjectPaths(ctx context.Context, tx pgx.Tx, userID, sourceID u
 		if err = rows.Scan(&path); err != nil {
 			return nil, err
 		}
-		request := attachmentstorage.ObjectRequest{UserID: userID, SourceID: sourceID, ObjectPath: path}
-		if attachmentstorage.ValidateObjectRequest(request) == nil {
-			paths[path] = struct{}{}
-		}
+		paths.addOwned(userID, path)
 	}
 	if err = rows.Err(); err != nil {
 		return nil, err
 	}
-	result := make([]string, 0, len(paths))
-	for path := range paths {
-		result = append(result, path)
+
+	preparedRows, err := tx.Query(ctx, `
+		select page.value ->> 'object_path'
+		from private.bulk_import_documents document
+		join private.bulk_import_chunks chunk
+			on chunk.document_id = document.id and chunk.user_id = document.user_id
+		cross join lateral jsonb_array_elements(coalesce(chunk.page_manifest -> 'pages', '[]'::jsonb)) page(value)
+		where document.data_source_id = $1 and document.user_id = $2`, sourceID, userID)
+	if err != nil {
+		return nil, err
 	}
-	sort.Strings(result)
-	return result, nil
+	defer preparedRows.Close()
+	for preparedRows.Next() {
+		var path *string
+		if err = preparedRows.Scan(&path); err != nil {
+			return nil, err
+		}
+		if path != nil {
+			paths.addOwned(userID, *path)
+		}
+	}
+	return paths, preparedRows.Err()
+}
+
+func enqueueAttachmentCleanupJobs(ctx context.Context, tx pgx.Tx, userID uuid.UUID, grouped scopedObjectPaths) error {
+	scopes := make([]uuid.UUID, 0, len(grouped))
+	for scopeID := range grouped {
+		scopes = append(scopes, scopeID)
+	}
+	sort.Slice(scopes, func(i, j int) bool { return scopes[i].String() < scopes[j].String() })
+	for _, scopeID := range scopes {
+		paths := make([]string, 0, len(grouped[scopeID]))
+		for path := range grouped[scopeID] {
+			paths = append(paths, path)
+		}
+		sort.Strings(paths)
+		for start := 0; start < len(paths); start += storageCleanupBatchSize {
+			end := min(start+storageCleanupBatchSize, len(paths))
+			payload, err := json.Marshal(jobs.SourceAttachmentCleanupPayload{SourceID: scopeID.String(), ObjectPaths: paths[start:end]})
+			if err != nil {
+				return fmt.Errorf("encode source attachment cleanup: %w", err)
+			}
+			if _, err = tx.Exec(ctx, `
+				insert into private.transaction_jobs
+					(user_id, job_type, payload, max_attempts)
+				values ($1, $2, $3::jsonb, $4)`, userID, string(jobs.KindSourceAttachmentCleanup), string(payload), storageCleanupMaxAttempts); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func sourceJobSyncRunIDs(ctx context.Context, tx pgx.Tx, userID, sourceID uuid.UUID) ([]uuid.UUID, error) {

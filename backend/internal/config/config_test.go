@@ -19,6 +19,9 @@ func TestLoadFromEnvAcceptsTransactionPoolerAndDevelopmentToken(t *testing.T) {
 	if cfg.GoogleTestRefreshToken != "test-only-token" {
 		t.Fatal("development refresh token was not loaded")
 	}
+	if cfg.BulkImportProviderTimeout.Seconds() != 30 || cfg.BulkImportRenderTimeout.Seconds() != 30 {
+		t.Fatalf("unexpected Bulk Import limits: %#v", cfg)
+	}
 }
 
 func TestLoadFromEnvRejectsDirectDatabaseHost(t *testing.T) {
@@ -84,7 +87,7 @@ func setValidEnvironment(t *testing.T) {
 	t.Setenv("ALIBABA_TOKEN_PLAN_API_KEY", "server-only")
 	t.Setenv("FRONTEND_ORIGIN", "http://localhost:5173")
 	t.Setenv("GMAIL_INITIAL_BACKFILL_MAX_MESSAGES", "5")
-	for _, key := range []string{"GOOGLE_TEST_REFRESH_TOKEN", "ALIBABA_TOKEN_PLAN_BASE_URL", "ALIBABA_TOKEN_PLAN_MODEL", "GMAIL_SYNC_LABEL", "WORKER_POLL_SECONDS", "OUTBOUND_HTTP_TIMEOUT_SECONDS"} {
+	for _, key := range []string{"GOOGLE_TEST_REFRESH_TOKEN", "ALIBABA_TOKEN_PLAN_BASE_URL", "ALIBABA_TOKEN_PLAN_MODEL", "GMAIL_SYNC_LABEL", "WORKER_POLL_SECONDS", "OUTBOUND_HTTP_TIMEOUT_SECONDS", "BULK_IMPORT_ENABLED", "BULK_IMPORT_RENDER_TIMEOUT_SECONDS", "BULK_IMPORT_PROVIDER_TIMEOUT_SECONDS", "BULK_IMPORT_MAX_RENDERED_PAGE_BYTES", "BULK_IMPORT_MAX_RENDERED_DOCUMENT_BYTES"} {
 		t.Setenv(key, "")
 	}
 }

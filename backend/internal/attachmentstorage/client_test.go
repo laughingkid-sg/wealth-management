@@ -231,6 +231,27 @@ func TestClientDeletesOwnedSourceObjectsInOneStorageRequest(t *testing.T) {
 	}
 }
 
+func TestScopeIDFromObjectPathUsesImmutableSecondSegment(t *testing.T) {
+	userID, firstScopeID, secondScopeID := uuid.New(), uuid.New(), uuid.New()
+	firstPath := userID.String() + "/" + firstScopeID.String() + "/first.png"
+	secondPath := userID.String() + "/" + secondScopeID.String() + "/second.png"
+	for path, want := range map[string]uuid.UUID{firstPath: firstScopeID, secondPath: secondScopeID} {
+		got, err := ScopeIDFromObjectPath(userID, path)
+		if err != nil || got != want {
+			t.Fatalf("ScopeIDFromObjectPath(%q) = %s, %v; want %s", path, got, err, want)
+		}
+	}
+	for _, path := range []string{
+		uuid.NewString() + "/" + firstScopeID.String() + "/foreign.png",
+		userID.String() + "/not-a-uuid/file.png",
+		userID.String() + "/" + firstScopeID.String() + "/../foreign.png",
+	} {
+		if _, err := ScopeIDFromObjectPath(userID, path); err == nil {
+			t.Fatalf("unsafe path accepted: %q", path)
+		}
+	}
+}
+
 func TestNormalizeSignedURLPreservesQueryAndRejectsUnsafeLocations(t *testing.T) {
 	base, _ := url.Parse("https://project.example.test")
 	client, err := New(&http.Client{}, base, "service-role")

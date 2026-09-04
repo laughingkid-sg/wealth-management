@@ -870,8 +870,8 @@ func TestListTransactionsReturnsFullProjectionAndTransferLink(t *testing.T) {
 }
 
 func TestAttachmentListingSignsOwnedPathWithoutExposingIt(t *testing.T) {
-	userID, sourceID := uuid.New(), uuid.New()
-	objectPath := userID.String() + "/" + sourceID.String() + "/private-receipt.png"
+	userID, sourceID, storedScopeID := uuid.New(), uuid.New(), uuid.New()
+	objectPath := userID.String() + "/" + storedScopeID.String() + "/private-receipt.png"
 	repository := &repositoryStub{attachments: []transactionstore.AttachmentRecord{{
 		ID: "attachment-1", Filename: "receipt.png", MIMEType: "image/png", ByteSize: 321,
 		SHA256: "abcdef", ParseEligible: true, ParseStatus: "parsed", ObjectPath: objectPath,
@@ -889,7 +889,7 @@ func TestAttachmentListingSignsOwnedPathWithoutExposingIt(t *testing.T) {
 	if strings.Contains(body, "object_path") || strings.Contains(body, objectPath) {
 		t.Fatalf("attachment response exposed storage path: %s", body)
 	}
-	if signer.expires != 300 || signer.request.UserID != userID || signer.request.SourceID != sourceID || signer.request.ObjectPath != objectPath {
+	if signer.expires != 300 || signer.request.UserID != userID || signer.request.SourceID != storedScopeID || signer.request.ObjectPath != objectPath {
 		t.Fatalf("sign request = %#v, expires=%d", signer.request, signer.expires)
 	}
 }

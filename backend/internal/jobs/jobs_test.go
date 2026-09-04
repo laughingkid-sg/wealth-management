@@ -128,6 +128,25 @@ type handlerFunc func(context.Context, Job) error
 
 func (f handlerFunc) Handle(ctx context.Context, job Job) error { return f(ctx, job) }
 
+type scopedMemoryStore struct {
+	*memoryStore
+	kinds []Kind
+}
+
+func (s *scopedMemoryStore) ClaimKinds(_ context.Context, _ string, _ time.Time, kinds []Kind) (*Job, error) {
+	s.kinds = append([]Kind(nil), kinds...)
+	return s.job, nil
+}
+
+func TestWorkerClaimsOnlyConfiguredKinds(t *testing.T) {
+	store := &scopedMemoryStore{memoryStore: &memoryStore{}}
+	allowed := []Kind{KindGmailIngest, KindSourceParse}
+	processed, err := (Worker{Store: store, WorkerID: "worker-1", Handler: Router{}, AllowedKinds: allowed}).ProcessOne(context.Background())
+	if err != nil || processed || len(store.kinds) != len(allowed) || store.kinds[0] != allowed[0] || store.kinds[1] != allowed[1] {
+		t.Fatalf("processed=%t err=%v kinds=%v", processed, err, store.kinds)
+	}
+}
+
 func TestWorkerRetriesWithBoundedBackoff(t *testing.T) {
 	now := time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC)
 	store := &memoryStore{job: &Job{ID: uuid.New(), Attempts: 3}}

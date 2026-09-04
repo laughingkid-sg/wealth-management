@@ -1,0 +1,60 @@
+Generic transaction processor and output contract v1:
+
+document_summary must be null. transactions must be a JSON array, using [] when no supported transaction is visible. Return each supported transaction once.
+
+Every transactions item has exactly this shape:
+{
+  "candidate": {
+    "line_index": 0,
+    "line_kind": "",
+    "transaction_kind": "debit",
+    "title": "Merchant or transaction description",
+    "merchant_name": "Merchant when visible, otherwise empty",
+    "original_amount_minor": 1250,
+    "original_currency": "SGD",
+    "sgd_amount_minor": null,
+    "occurred_on": "2026-08-04",
+    "time_precision": "date",
+    "references": [],
+    "account_ref": "",
+    "account_evidence": {
+      "card_last_four": "",
+      "masked_bank_reference": "",
+      "additional_identifiers": []
+    },
+    "line_items": [],
+    "category_leaf_name": "",
+    "possible_internal_transfer": false
+  },
+  "evidence": []
+}
+
+transaction_kind is exactly "debit" for money leaving the selected account or "credit" for money entering it. original_amount_minor is a positive integer. sgd_amount_minor is null unless an SGD amount is explicitly shown; when present it is a positive integer. title is non-empty. Optional strings use "" when unavailable. references and additional_identifiers contain only non-empty source values.
+
+account_evidence is always an object. card_last_four is "" or exactly four digits. masked_bank_reference is "" or a source-visible masked/suffix account reference. additional_identifiers is an array of other source-visible account identifiers. account_evidence requires one evidence entry only when at least one of its values is populated.
+
+line_items is [] unless reliable item-level detail is visible. Every line item has exactly:
+{
+  "schema_version": 1,
+  "description": "Non-empty description",
+  "quantity": 1,
+  "unit_price_minor": null,
+  "line_total_minor": null,
+  "tax_minor": null,
+  "discount_minor": null,
+  "currency": "SGD",
+  "details": {}
+}
+quantity is a positive integer. currency equals the candidate original_currency. Optional line-item amounts are null or non-negative integer minor units. details is a JSON object for extra source-visible item facts. A non-empty line_items array requires one transaction evidence entry with field "line_items".
+
+Transaction evidence.field is exactly one of:
+transaction_kind, title, merchant_name, original_amount_minor, original_currency, sgd_amount_minor, occurred_on, references, account_ref, account_evidence, line_items, category_leaf_name, possible_internal_transfer.
+
+Evidence is required for transaction_kind, title, original_amount_minor, original_currency, and occurred_on. Evidence is also required for each populated optional field, including possible_internal_transfer when true. account_ref evidence is required only when multiple accounts are allowed. Do not emit evidence for line_index, line_kind, or time_precision.
+
+The top-level object has exactly:
+{
+  "schema_version": 1,
+  "document_summary": null,
+  "transactions": []
+}

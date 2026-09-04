@@ -32,14 +32,19 @@ type Config struct {
 	TokenEncryptionKey      []byte
 	GoogleTestRefreshToken  string
 
-	AlibabaTokenPlanAPIKey string
-	AlibabaBaseURL         *url.URL
-	AlibabaModel           string
-	FrontendOrigin         *url.URL
-	GmailSyncLabel         string
-	InitialBackfillMax     int
-	WorkerPollInterval     time.Duration
-	OutboundHTTPTimeout    time.Duration
+	AlibabaTokenPlanAPIKey        string
+	AlibabaBaseURL                *url.URL
+	AlibabaModel                  string
+	FrontendOrigin                *url.URL
+	GmailSyncLabel                string
+	InitialBackfillMax            int
+	WorkerPollInterval            time.Duration
+	OutboundHTTPTimeout           time.Duration
+	BulkImportEnabled             bool
+	BulkImportRenderTimeout       time.Duration
+	BulkImportProviderTimeout     time.Duration
+	BulkImportMaxRenderedPage     int
+	BulkImportMaxRenderedDocument int
 }
 
 // LoadFromEnv validates the complete runtime contract before either process starts.
@@ -160,6 +165,25 @@ func LoadFromEnv() (Config, error) {
 		return Config{}, fmt.Errorf("OUTBOUND_HTTP_TIMEOUT_SECONDS must be at most 120")
 	}
 	cfg.OutboundHTTPTimeout = time.Duration(httpTimeoutSeconds) * time.Second
+	if cfg.BulkImportEnabled, err = optionalBool("BULK_IMPORT_ENABLED", false); err != nil {
+		return Config{}, err
+	}
+	bulkRenderSeconds, err := optionalPositiveInt("BULK_IMPORT_RENDER_TIMEOUT_SECONDS", 30)
+	if err != nil || bulkRenderSeconds > 60 {
+		return Config{}, fmt.Errorf("BULK_IMPORT_RENDER_TIMEOUT_SECONDS must be between 1 and 60")
+	}
+	cfg.BulkImportRenderTimeout = time.Duration(bulkRenderSeconds) * time.Second
+	bulkProviderSeconds, err := optionalPositiveInt("BULK_IMPORT_PROVIDER_TIMEOUT_SECONDS", 30)
+	if err != nil || bulkProviderSeconds > 30 {
+		return Config{}, fmt.Errorf("BULK_IMPORT_PROVIDER_TIMEOUT_SECONDS must be between 1 and 30")
+	}
+	cfg.BulkImportProviderTimeout = time.Duration(bulkProviderSeconds) * time.Second
+	if cfg.BulkImportMaxRenderedPage, err = optionalPositiveInt("BULK_IMPORT_MAX_RENDERED_PAGE_BYTES", 1024*1024); err != nil || cfg.BulkImportMaxRenderedPage > 1024*1024 {
+		return Config{}, fmt.Errorf("BULK_IMPORT_MAX_RENDERED_PAGE_BYTES must be between 1 and 1048576")
+	}
+	if cfg.BulkImportMaxRenderedDocument, err = optionalPositiveInt("BULK_IMPORT_MAX_RENDERED_DOCUMENT_BYTES", 50*1024*1024); err != nil || cfg.BulkImportMaxRenderedDocument > 50*1024*1024 || cfg.BulkImportMaxRenderedDocument < cfg.BulkImportMaxRenderedPage {
+		return Config{}, fmt.Errorf("BULK_IMPORT_MAX_RENDERED_DOCUMENT_BYTES must be between the page limit and 52428800")
+	}
 	return cfg, nil
 }
 
@@ -207,6 +231,18 @@ func optionalPositiveInt(name string, fallback int) (int, error) {
 		return fallback, nil
 	}
 	return parsePositiveInt(name, value)
+}
+
+func optionalBool(name string, fallback bool) (bool, error) {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, fmt.Errorf("%s must be true or false", name)
+	}
+	return parsed, nil
 }
 
 func parsePositiveInt(name, value string) (int, error) {
