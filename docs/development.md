@@ -2,6 +2,8 @@
 
 The development Compose stack keeps the three application processes running with automatic restarts and source hot reload. Supabase remains hosted: `compose.yaml` does not create Postgres, Auth, Storage, Realtime, or another Supabase service.
 
+The frontend and backend development images use Alpine Linux to keep their base layers small. Air is compiled in a separate build stage so its temporary module and compiler caches do not enter the backend image; the Go toolchain remains in the final development image so API and worker source changes still rebuild automatically.
+
 ## Services and ports
 
 | Service | Container process | Host access | Configuration |
@@ -91,7 +93,9 @@ Stop and remove application containers and the development network:
 docker compose down
 ```
 
-Source files stay on the host. Named volumes retain frontend dependencies and Go download/build caches between ordinary `down` and `up` operations. To clear only those Docker-managed development caches, use `docker compose down --volumes`; this does not alter hosted Supabase data.
+Source files stay on the host. Named volumes retain frontend dependencies and the Go module/build caches used by Air between ordinary `down` and `up` operations. These runtime caches are separate from the temporary cache used to compile Air while building the image. To clear only the Docker-managed development caches, use `docker compose down --volumes`; this does not alter hosted Supabase data.
+
+When switching an existing checkout from the former Debian-based images to Alpine, run `docker compose down --volumes` once before rebuilding. This prevents glibc-native frontend packages or compiled Go cache entries from being reused under musl. Subsequent ordinary `docker compose down` operations preserve the Alpine-compatible caches.
 
 ## Health and troubleshooting
 

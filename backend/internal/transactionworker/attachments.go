@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -30,10 +31,9 @@ func renderVisualAttachment(ctx context.Context, filename, mimeType string, cont
 	}
 }
 
-// convertImageToPNG uses macOS sips, the available local image converter, in
-// the same short-lived directory model as PDF rasterisation. Qwen only sees
-// PNG/JPEG/WebP/GIF data URLs; unsupported source formats are never sent as a
-// misleading MIME type.
+// convertImageToPNG uses the platform image converter in the same short-lived
+// directory model as PDF rasterisation. Qwen only sees PNG/JPEG/WebP/GIF data
+// URLs; unsupported source formats are never sent as a misleading MIME type.
 func convertImageToPNG(ctx context.Context, filename string, content []byte) []providers.AttachmentInput {
 	if len(content) == 0 || len(content) > 5*1024*1024 {
 		return nil
@@ -50,7 +50,8 @@ func convertImageToPNG(ctx context.Context, filename string, content []byte) []p
 	}
 	commandCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	if exec.CommandContext(commandCtx, "sips", "-s", "format", "png", input, "--out", output).Run() != nil {
+	command, args := imageConversionCommand(runtime.GOOS, input, output)
+	if exec.CommandContext(commandCtx, command, args...).Run() != nil {
 		return nil
 	}
 	converted, err := os.ReadFile(output)
@@ -58,6 +59,13 @@ func convertImageToPNG(ctx context.Context, filename string, content []byte) []p
 		return nil
 	}
 	return []providers.AttachmentInput{{Filename: strings.TrimSuffix(filename, filepath.Ext(filename)) + ".png", MIMEType: "image/png", Content: converted}}
+}
+
+func imageConversionCommand(goos, input, output string) (string, []string) {
+	if goos == "darwin" {
+		return "sips", []string{"-s", "format", "png", input, "--out", output}
+	}
+	return "magick", []string{input, "-strip", output}
 }
 
 func renderPDF(ctx context.Context, filename string, content []byte) []providers.AttachmentInput {
