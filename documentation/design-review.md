@@ -58,9 +58,13 @@ settings / transactions), and extract `AccountsPage` out of `App.tsx`.
   to `features/accounts/AccountsPage.tsx` (see #3). `transactions/http.go` `1755 → 1153`
   — the Gmail/sync handlers moved to `gmail.go` and the response/encoding helpers to
   `responses.go` (same package, no behaviour change; `go build`/`vet`/tests green).
-- **Remaining:** `features/transactions/api.ts` (~1,482) and
-  `account-balances/AccountFinanceDetailPage.tsx` (~1,400) are still monolithic —
-  follow-up, lower priority.
+  `transactions/api.ts` `1482 → 748` — the client core (consts, `TransactionApiError`,
+  HTTP `request`/`requestDataRest`/`mutateDataRest`, validation helpers, and `parse*`
+  functions) moved to `apiClient.ts`, leaving `api.ts` as the domain request functions;
+  `api.ts` re-exports the public surface so no consumer import changed (`tsc`/`oxlint`
+  clean).
+- **Remaining:** `account-balances/AccountFinanceDetailPage.tsx` (~1,400) is still a
+  single monolithic component — follow-up, lower priority.
 
 ### 3. Inconsistent frontend structure  · impact: low-med · effort: low · risk: low  · ✅ done
 Every feature is a folder under `features/` **except Accounts, which lives inside
@@ -128,7 +132,7 @@ canonical definition (later migrations can reference, not redefine, the limits).
 | # | Finding | Impact | Effort | Risk | Status |
 | --- | --- | --- | --- | --- | --- |
 | 1 | Relax over-pinned config validation | Med | Low | Low | ✅ done |
-| 2 | Split god-files (`transactions/http.go`, `App.tsx`, `api.ts`, `AccountFinanceDetailPage`) | High | Med | Low | ◑ partial (`App.tsx`, `http.go` done) |
+| 2 | Split god-files (`transactions/http.go`, `App.tsx`, `api.ts`, `AccountFinanceDetailPage`) | High | Med | Low | ◑ partial (`App.tsx`, `http.go`, `api.ts` done; `AccountFinanceDetailPage` left) |
 | 3 | Move Accounts into `features/`; consider a tiny routes module | Low-Med | Low | Low | ✅ done |
 | 4 | Converge Bulk Import with the Transactions evidence pipeline | High | High | High | deferred / not now |
 | 5 | Decide parser-rule layering (drop shared layer or add admin auth) | Med | Med | Med | needs product decision |
