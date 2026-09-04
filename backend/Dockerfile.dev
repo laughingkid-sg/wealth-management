@@ -1,23 +1,28 @@
-FROM golang:1.23.12-bookworm
-
+ARG GO_VERSION=1.23.12
 ARG AIR_VERSION=v1.61.7
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
+FROM golang:${GO_VERSION}-alpine AS air-builder
+
+ARG AIR_VERSION
+
+# Compile the development-only file watcher in an isolated stage so its module
+# and build caches are not carried into the runtime image.
+RUN CGO_ENABLED=0 GOBIN=/out go install github.com/air-verse/air@${AIR_VERSION} \
+    && rm -rf /go/pkg/mod /root/.cache/go-build
+
+FROM golang:${GO_VERSION}-alpine
+
+RUN apk add --no-cache \
         ca-certificates \
         curl \
         imagemagick \
+        imagemagick-heic \
         poppler-utils \
-        procps \
-    && rm -rf /var/lib/apt/lists/* \
-    && ln -sf /usr/bin/convert /usr/local/bin/magick
+        procps
 
-RUN go install github.com/air-verse/air@${AIR_VERSION}
+COPY --from=air-builder /out/air /usr/local/bin/air
 
 WORKDIR /app
-
-COPY go.mod go.sum ./
-RUN go mod download
 
 COPY . .
 
