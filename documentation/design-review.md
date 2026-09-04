@@ -25,7 +25,7 @@ few genuine low-risk simplifications — not about design mistakes.
 
 ## Findings (ranked)
 
-### 1. Config is over-pinned  · impact: med · effort: low · risk: low
+### 1. Config is over-pinned  · impact: med · effort: low · risk: low  · ✅ done
 `backend/internal/config/config.go` doesn't just *default* the model, Gmail label,
 and initial backfill — it **rejects** anything but `qwen3.8-flash`, `odin-finance`,
 and exactly `5`, hard-failing startup otherwise.
@@ -36,6 +36,11 @@ and exactly `5`, hard-failing startup otherwise.
   default." Keep the genuinely safety-critical validations (pooler host/port/ssl,
   32-byte key, https-outside-dev).
 - **Highest value-to-effort item.** Hours, not days.
+- **Resolved (2026-09-04):** the model and Gmail label now accept any non-empty
+  value (defaults retained); initial backfill is an optional positive integer bounded
+  to `1–100` (default `5`). The now-dead `requiredPositiveInt` helper was removed.
+  Safety-critical validations are unchanged. See `internal/config/config.go` and
+  `internal/config/config_test.go`.
 
 ### 2. A few god-files  · impact: high (readability) · effort: med · risk: low
 | File | Lines | Note |
@@ -102,7 +107,7 @@ canonical definition (later migrations can reference, not redefine, the limits).
 
 | # | Finding | Impact | Effort | Risk | Status |
 | --- | --- | --- | --- | --- | --- |
-| 1 | Relax over-pinned config validation | Med | Low | Low | proposed |
+| 1 | Relax over-pinned config validation | Med | Low | Low | ✅ done |
 | 2 | Split god-files (`transactions/http.go`, `App.tsx`, `api.ts`, `AccountFinanceDetailPage`) | High | Med | Low | proposed |
 | 3 | Move Accounts into `features/`; consider a tiny routes module | Low-Med | Low | Low | proposed |
 | 4 | Converge Bulk Import with the Transactions evidence pipeline | High | High | High | deferred / not now |

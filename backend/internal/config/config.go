@@ -15,6 +15,12 @@ const (
 	defaultAlibabaBaseURL = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
 	defaultAlibabaModel   = "qwen3.8-flash"
 	defaultGmailLabel     = "odin-finance"
+
+	// defaultInitialBackfillMax is used when GMAIL_INITIAL_BACKFILL_MAX_MESSAGES is
+	// unset. maxInitialBackfillMax is a guardrail so a typo cannot trigger a huge
+	// first import; the value itself is operator-configurable within [1, max].
+	defaultInitialBackfillMax = 5
+	maxInitialBackfillMax     = 100
 )
 
 // Config contains server-only configuration. Do not marshal or log it.
@@ -130,10 +136,9 @@ func LoadFromEnv() (Config, error) {
 	if cfg.AlibabaBaseURL.Scheme != "https" {
 		return Config{}, fmt.Errorf("ALIBABA_TOKEN_PLAN_BASE_URL must use https")
 	}
+	// The model is operator-configurable; environmentOr falls back to the default
+	// and trims blanks, so cfg.AlibabaModel is always non-empty.
 	cfg.AlibabaModel = environmentOr("ALIBABA_TOKEN_PLAN_MODEL", defaultAlibabaModel)
-	if cfg.AlibabaModel != defaultAlibabaModel {
-		return Config{}, fmt.Errorf("ALIBABA_TOKEN_PLAN_MODEL must be %q", defaultAlibabaModel)
-	}
 	if raw, err := getRequired("FRONTEND_ORIGIN"); err != nil {
 		return Config{}, err
 	} else if cfg.FrontendOrigin, err = parseURL("FRONTEND_ORIGIN", raw); err != nil {
@@ -142,15 +147,13 @@ func LoadFromEnv() (Config, error) {
 	if cfg.FrontendOrigin.Scheme != "https" && !(cfg.Environment == "development" && cfg.FrontendOrigin.Hostname() == "localhost") {
 		return Config{}, fmt.Errorf("FRONTEND_ORIGIN must use https outside localhost development")
 	}
+	// The sync label is operator-configurable; it falls back to the default.
 	cfg.GmailSyncLabel = environmentOr("GMAIL_SYNC_LABEL", defaultGmailLabel)
-	if cfg.GmailSyncLabel != defaultGmailLabel {
-		return Config{}, fmt.Errorf("GMAIL_SYNC_LABEL must be %q", defaultGmailLabel)
-	}
-	if cfg.InitialBackfillMax, err = requiredPositiveInt("GMAIL_INITIAL_BACKFILL_MAX_MESSAGES"); err != nil {
+	if cfg.InitialBackfillMax, err = optionalPositiveInt("GMAIL_INITIAL_BACKFILL_MAX_MESSAGES", defaultInitialBackfillMax); err != nil {
 		return Config{}, err
 	}
-	if cfg.InitialBackfillMax != 5 {
-		return Config{}, fmt.Errorf("GMAIL_INITIAL_BACKFILL_MAX_MESSAGES must be 5")
+	if cfg.InitialBackfillMax > maxInitialBackfillMax {
+		return Config{}, fmt.Errorf("GMAIL_INITIAL_BACKFILL_MAX_MESSAGES must be between 1 and %d", maxInitialBackfillMax)
 	}
 	pollSeconds, err := optionalPositiveInt("WORKER_POLL_SECONDS", 5)
 	if err != nil {
@@ -215,14 +218,6 @@ func environmentOr(name, fallback string) string {
 		return value
 	}
 	return fallback
-}
-
-func requiredPositiveInt(name string) (int, error) {
-	value := strings.TrimSpace(os.Getenv(name))
-	if value == "" {
-		return 0, fmt.Errorf("%s is required", name)
-	}
-	return parsePositiveInt(name, value)
 }
 
 func optionalPositiveInt(name string, fallback int) (int, error) {
