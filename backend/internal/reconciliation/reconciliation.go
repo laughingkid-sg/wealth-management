@@ -519,6 +519,26 @@ func DecodeParsedResponseBatchForRuleApplication(raw []byte) ([]ParsedResponse, 
 	return batch.Transactions, nil
 }
 
+// DecodeParsedResponsesForRuleApplication accepts either the multi-transaction
+// array shape {"transactions":[...]} or the legacy single-object shape
+// {"candidate":...,"evidence":...} (wrapped as a one-element slice). This lets
+// the worker consume both prompt v2 and v3 output during the transition. Like
+// the other rule-application decoders it defers required-field validation.
+func DecodeParsedResponsesForRuleApplication(raw []byte) ([]ParsedResponse, error) {
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &probe); err != nil || probe == nil {
+		return nil, fmt.Errorf("decode parsed response: not a JSON object")
+	}
+	if _, ok := probe["transactions"]; ok {
+		return DecodeParsedResponseBatchForRuleApplication(raw)
+	}
+	single, err := DecodeParsedResponseForRuleApplication(raw)
+	if err != nil {
+		return nil, err
+	}
+	return []ParsedResponse{single}, nil
+}
+
 func decodeParsedResponse(raw []byte) (ParsedResponse, error) {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
