@@ -301,13 +301,12 @@ func TestHandlerAssemblesSelectedPromptAndPersistsExactAudit(t *testing.T) {
 	userID, sourceID := uuid.New(), uuid.New()
 	raw := validResponseJSON(userID)
 	globalID, userRuleID := uuid.NewString(), uuid.NewString()
-	config := json.RawMessage(`{"extractors":{"card_last_four":{"pattern":"Mastercard\\s*\\(\\*{4}\\s*([0-9]{4})\\)","group":1}}}`)
 	normalized := "subject: Your FairPrice Group app receipt\nsender: FairPrice <no-reply@fairprice.com.sg>\ntext: Cafe Mastercard (**** 2562) SGD 5.00"
 	repository := &repositoryStub{parseInput: transactionstore.SourceParseInput{
 		ID: sourceID, Subject: "Your FairPrice Group app receipt",
 		Sender: "FairPrice <no-reply@fairprice.com.sg>", Content: "Cafe Mastercard (**** 2562) SGD 5.00",
 		NormalizedContent: normalized, DefaultInstructions: "prefer explicit receipt facts", DefaultInstructionsVersion: 3,
-		Rules:     []parserrules.Rule{{ID: globalID, Version: 2, Priority: 50, ContentMatcher: `FairPrice`, PromptFragment: "global guidance", ExtractionConfig: config}},
+		Rules:     []parserrules.Rule{{ID: globalID, Version: 2, Priority: 50, ContentMatcher: `FairPrice`, PromptFragment: "global guidance"}},
 		UserRules: []parserrules.UserRule{{ID: userRuleID, Name: "FairPrice receipts", Version: 4, Priority: 10, SenderMatchType: "domain", SenderMatchValue: "fairprice.com.sg", SubjectMatcher: `app receipt`, ContentMatcher: `Mastercard`, PromptFragment: "user rule guidance"}},
 	}}
 	parser := &parserCapture{result: providers.ParsedCandidate{
@@ -331,8 +330,8 @@ func TestHandlerAssemblesSelectedPromptAndPersistsExactAudit(t *testing.T) {
 		t.Fatal("email source content was promoted into the system prompt")
 	}
 	result := repository.parseResult
-	if result == nil || len(result.Candidates) != 1 || result.Candidates[0].Candidate.AccountEvidence.CardLastFour != "2562" || !result.Candidates[0].Candidate.AutoEligible {
-		t.Fatalf("deterministic rule did not run after Qwen: %#v", result)
+	if result == nil || len(result.Candidates) != 1 {
+		t.Fatalf("expected one persisted candidate after the model call: %#v", result)
 	}
 	if result.RuleID != globalID || result.RuleVersion != 2 || result.UserRuleID != userRuleID || result.UserRuleVersion != 4 {
 		t.Fatalf("rule provenance = %#v", result.SourceParseAudit)

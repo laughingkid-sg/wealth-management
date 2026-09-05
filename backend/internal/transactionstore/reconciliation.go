@@ -203,7 +203,7 @@ func sourceAttachmentMetadata(raw []byte) []SourceAttachment {
 func (s *Store) loadActiveGmailParserRules(ctx context.Context) ([]parserrules.Rule, error) {
 	rows, err := s.pool.Query(ctx, `
 		select id, name, version, priority, coalesce(sender_matcher, ''), coalesce(content_matcher, ''),
-			coalesce(prompt_fragment, ''), extraction_config
+			coalesce(prompt_fragment, '')
 		from private.source_parser_rules
 		where provider = 'gmail' and active = true
 		order by priority desc, id asc`)
@@ -214,7 +214,7 @@ func (s *Store) loadActiveGmailParserRules(ctx context.Context) ([]parserrules.R
 	rules := make([]parserrules.Rule, 0)
 	for rows.Next() {
 		var rule parserrules.Rule
-		if err := rows.Scan(&rule.ID, &rule.Name, &rule.Version, &rule.Priority, &rule.SenderMatcher, &rule.ContentMatcher, &rule.PromptFragment, &rule.ExtractionConfig); err != nil {
+		if err := rows.Scan(&rule.ID, &rule.Name, &rule.Version, &rule.Priority, &rule.SenderMatcher, &rule.ContentMatcher, &rule.PromptFragment); err != nil {
 			return nil, err
 		}
 		rules = append(rules, rule)

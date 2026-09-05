@@ -2,7 +2,6 @@ package transactionstore
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"time"
 
@@ -25,7 +24,6 @@ type GlobalSourceParserRule struct {
 	SenderMatcher    *string         `json:"sender_matcher"`
 	ContentMatcher   *string         `json:"content_matcher"`
 	PromptFragment   string          `json:"prompt_fragment"`
-	ExtractionConfig json.RawMessage `json:"extraction_config"`
 	Version          int             `json:"version"`
 	Priority         int             `json:"priority"`
 	Active           bool            `json:"active"`
@@ -56,7 +54,7 @@ type PromptPreviewSource struct {
 func (s *Store) ListGlobalSourceParserRules(ctx context.Context) ([]GlobalSourceParserRule, error) {
 	rows, err := s.pool.Query(ctx, `
 		select id, name, provider, sender_matcher, content_matcher,
-			coalesce(prompt_fragment, ''), extraction_config, version,
+			coalesce(prompt_fragment, ''), version,
 			priority, active, updated_by_user_id, created_at, updated_at
 		from private.source_parser_rules
 		order by priority desc, name asc, id asc`)
@@ -79,7 +77,7 @@ func (s *Store) GetGlobalSourceParserRule(ctx context.Context, ruleID uuid.UUID)
 	var rule GlobalSourceParserRule
 	err := s.pool.QueryRow(ctx, `
 		select id, name, provider, sender_matcher, content_matcher,
-			coalesce(prompt_fragment, ''), extraction_config, version,
+			coalesce(prompt_fragment, ''), version,
 			priority, active, updated_by_user_id, created_at, updated_at
 		from private.source_parser_rules
 		where id = $1`, ruleID).Scan(globalSourceParserRuleFields(&rule)...)
@@ -94,10 +92,10 @@ func (s *Store) CreateGlobalSourceParserRule(ctx context.Context, userID uuid.UU
 	err := s.pool.QueryRow(ctx, `
 		insert into private.source_parser_rules (
 			name, provider, sender_matcher, content_matcher, prompt_fragment,
-			extraction_config, priority, active, updated_by_user_id
-		) values ($1, $2, $3, $4, $5, '{}'::jsonb, $6, $7, $8)
+			priority, active, updated_by_user_id
+		) values ($1, $2, $3, $4, $5, $6, $7, $8)
 		returning id, name, provider, sender_matcher, content_matcher,
-			coalesce(prompt_fragment, ''), extraction_config, version,
+			coalesce(prompt_fragment, ''), version,
 			priority, active, updated_by_user_id, created_at, updated_at`,
 		input.Name, input.Provider, input.SenderMatcher, input.ContentMatcher,
 		input.PromptFragment, input.Priority, input.Active, userID,
@@ -116,7 +114,7 @@ func (s *Store) UpdateGlobalSourceParserRule(ctx context.Context, userID, ruleID
 			active = $9, updated_by_user_id = $10, version = version + 1
 		where id = $1 and version = $2
 		returning id, name, provider, sender_matcher, content_matcher,
-			coalesce(prompt_fragment, ''), extraction_config, version,
+			coalesce(prompt_fragment, ''), version,
 			priority, active, updated_by_user_id, created_at, updated_at`,
 		ruleID, input.ExpectedVersion, input.Name, input.Provider,
 		input.SenderMatcher, input.ContentMatcher, input.PromptFragment,
@@ -193,7 +191,7 @@ func (s *Store) ListPromptPreviewSources(ctx context.Context, userID uuid.UUID, 
 func globalSourceParserRuleFields(rule *GlobalSourceParserRule) []any {
 	return []any{
 		&rule.ID, &rule.Name, &rule.Provider, &rule.SenderMatcher,
-		&rule.ContentMatcher, &rule.PromptFragment, &rule.ExtractionConfig,
+		&rule.ContentMatcher, &rule.PromptFragment,
 		&rule.Version, &rule.Priority, &rule.Active, &rule.UpdatedByUserID,
 		&rule.CreatedAt, &rule.UpdatedAt,
 	}

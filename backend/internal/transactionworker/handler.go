@@ -175,7 +175,7 @@ func (h Handler) handleSourceParse(ctx context.Context, job jobs.Job) error {
 	invalidCount := 0
 	var firstInvalid error
 	for _, parsed := range batch {
-		hardened, postProcessNote, herr := h.hardenParsedCandidate(ctx, job.UserID, selection.HasGlobalRule, selection.GlobalRule, input.NormalizedContent, parsed)
+		hardened, postProcessNote, herr := h.hardenParsedCandidate(ctx, job.UserID, input.NormalizedContent, parsed)
 		if postProcessNote != "" {
 			audit.PostProcess = postProcessNote
 		}
@@ -207,11 +207,11 @@ func (h Handler) handleSourceParse(ctx context.Context, job jobs.Job) error {
 }
 
 // hardenParsedCandidate applies the full server-side hardening sequence to one
-// model candidate: evidence checks, ownership binding, any deterministic rule,
-// the Tengo post-process stage, account-evidence sanitization, auto-eligibility,
-// and re-validation. It returns the hardened response, the post-process audit
-// note, and an error if the candidate is invalid after hardening.
-func (h Handler) hardenParsedCandidate(ctx context.Context, userID uuid.UUID, hasRule bool, rule parserrules.AppliedRule, normalizedContent string, parsed reconciliation.ParsedResponse) (reconciliation.ParsedResponse, string, error) {
+// model candidate: evidence checks, ownership binding, the Tengo post-process
+// stage, account-evidence sanitization, auto-eligibility, and re-validation. It
+// returns the hardened response, the post-process audit note, and an error if
+// the candidate is invalid after hardening.
+func (h Handler) hardenParsedCandidate(ctx context.Context, userID uuid.UUID, normalizedContent string, parsed reconciliation.ParsedResponse) (reconciliation.ParsedResponse, string, error) {
 	reconciliation.DiscardInvalidOptionalCategoryCitation(&parsed)
 	if err := reconciliation.ValidateEvidenceEntries(parsed); err != nil {
 		return parsed, "", err
@@ -220,13 +220,8 @@ func (h Handler) hardenParsedCandidate(ctx context.Context, userID uuid.UUID, ha
 	// requested from or accepted from the model response.
 	parsed.Candidate.UserID = userID.String()
 	parsed.Candidate.Confidence = reconciliation.AggregateConfidence(parsed.Evidence)
-	if hasRule {
-		if err := applyDeterministicRule(&parsed.Candidate, &parsed.Evidence, rule); err != nil {
-			return parsed, "", err
-		}
-	}
-	// Post-process runs after any deterministic rule and before the server
-	// re-asserts its invariants below.
+	// The Tengo post-process stage is the sole deterministic mutation step; it
+	// runs before the server re-asserts its invariants below.
 	parsed, postProcessNote := h.postprocessCandidate(ctx, parsed)
 	parsed.Candidate.AccountEvidence = reconciliation.SanitizeAccountEvidenceForMatching(parsed.Candidate.AccountEvidence, normalizedContent)
 	parsed.Candidate.AutoEligible = reconciliation.DeriveAutoEligibility(parsed.Candidate, normalizedContent)

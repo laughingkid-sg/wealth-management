@@ -1210,7 +1210,7 @@ func TestGlobalSettingsListsExactRuleProjectionWithoutCaching(t *testing.T) {
 	repository := &repositoryStub{globalRules: []transactionstore.GlobalSourceParserRule{{
 		ID: ruleID, Name: "Masked card", Provider: "gmail",
 		SenderMatcher: stringPointer(`@example\.test$`), ContentMatcher: stringPointer(`\*{4} 2562`),
-		PromptFragment: "Read the payment method.", ExtractionConfig: json.RawMessage(`{"extractors":{}}`),
+		PromptFragment: "Read the payment method.",
 		Version: 3, Priority: 50, Active: true, UpdatedByUserID: &updatedBy,
 		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}}}
@@ -1229,7 +1229,6 @@ func TestGlobalSettingsListsExactRuleProjectionWithoutCaching(t *testing.T) {
 		t.Fatalf("decode error=%v body=%s", err, response.Body.String())
 	}
 	if body.Rules[0].ID != ruleID || body.Rules[0].Name != "Masked card" ||
-		string(body.Rules[0].ExtractionConfig) != `{"extractors":{}}` ||
 		body.Rules[0].UpdatedByUserID == nil || *body.Rules[0].UpdatedByUserID != updatedBy {
 		t.Fatalf("rule projection = %#v", body.Rules[0])
 	}
@@ -1266,10 +1265,9 @@ func TestCreateGlobalSourceRuleValidatesAndBindsAuthenticatedEditor(t *testing.T
 	}
 }
 
-func TestGlobalSourceRuleRejectsInvalidMatcherAndReadOnlyExtractionConfig(t *testing.T) {
+func TestGlobalSourceRuleRejectsInvalidMatcher(t *testing.T) {
 	for name, body := range map[string]string{
 		"invalid RE2":                 `{"name":"Rule","provider":"gmail","sender_matcher":"[","prompt_fragment":"","priority":0,"active":true}`,
-		"read-only extraction config": `{"name":"Rule","provider":"gmail","prompt_fragment":"","extraction_config":{},"priority":0,"active":true}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			repository := &repositoryStub{}
@@ -1333,8 +1331,8 @@ func TestAutomaticPromptPreviewReusesProductionSelectionAndOmitsDynamicContent(t
 		NormalizedContent:   "subject: Your FairPrice Group app receipt\nsender: FairPrice <receipt@fairprice.com.sg>\ntext: BODY-SHOULD-NOT-APPEAR Mastercard (**** 2562)",
 		DefaultInstructions: "Prefer explicit source facts.", DefaultInstructionsVersion: 3,
 		Rules: []parserrules.Rule{
-			{ID: uuid.NewString(), Name: "Higher non-match", Version: 1, Priority: 100, ContentMatcher: "DigitalOcean", ExtractionConfig: json.RawMessage(`{}`)},
-			{ID: globalID, Name: "Masked card", Version: 2, Priority: 50, ContentMatcher: `Mastercard \(\*{4} 2562\)`, PromptFragment: "Read the payment method.", ExtractionConfig: json.RawMessage(`{}`)},
+			{ID: uuid.NewString(), Name: "Higher non-match", Version: 1, Priority: 100, ContentMatcher: "DigitalOcean"},
+			{ID: globalID, Name: "Masked card", Version: 2, Priority: 50, ContentMatcher: `Mastercard \(\*{4} 2562\)`, PromptFragment: "Read the payment method."},
 		},
 		UserRules: []parserrules.UserRule{{
 			ID: userRuleID, Name: "FairPrice", Version: 4, Priority: 10,
