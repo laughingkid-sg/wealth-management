@@ -391,13 +391,21 @@ Done + validated on branch `codex/transaction-parsing-revamp` (PR #22):
   sources (per-candidate create/attach), replacing the now-defunct per-source form.
 - **P6 backend**: script management API (CRUD + activate + dry-run).
 - **P6 frontend**: Parser Scripts page + candidate/script API+model layer (tsc/lint/build).
+- **P7 frontend (additive)**: Parsing Pipeline overview page showing all stages in order
+  (editable stages link to their editors + show the active script; read-only stages for
+  context; assembled preview via prompt-preview). Existing settings pages left in place.
+- **T1**: regex deterministic extraction retired — `applyDeterministicRule` +
+  `ExtractionConfig`/`Values` removed, global-rule matching is sender/content-only, Tengo
+  post-process is the sole deterministic path. Verified live.
 
-Remaining (need visual QA — best done interactively):
-- **P7**: unified pipeline settings view (flagship UI; also folds in the existing
-  settings/global-settings/prompt-preview pages per T7 — a full-replace best done with
-  visual iteration).
-- **FE polish**: CSS for the new `scripts-*` / `candidate-*` classes; transfer-from-a-
-  single-candidate flow (the old per-source transfer path is not yet per-candidate).
+Remaining (need visual QA / follow-up):
+- **P7 full-replace (T7)**: fold settings / global-settings / prompt-preview into the
+  pipeline view and retire those pages — best done with visual iteration.
+- **FE polish**: CSS for the new `scripts-*` / `candidate-*` / `pipeline-*` classes;
+  transfer-from-a-single-candidate flow.
+- **Schema follow-up**: drop the now-dormant `source_parser_rules.extraction_config`
+  column and update the pgTAP suites that still assert it.
+- **P8**: seed initial pre/post scripts + end-to-end acceptance.
 - **P8**: seed initial scripts + enable + end-to-end acceptance.
 - **T1 cleanup**: remove `applyDeterministicRule`/`ExtractionConfig` + drop the
   `extraction_config` column. Note this is a real refactor: `parserrules.applyOne`
