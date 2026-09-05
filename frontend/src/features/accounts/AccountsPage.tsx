@@ -91,6 +91,11 @@ const ScriptsManagementPage = lazy(() =>
     ({ ScriptsManagementPage: Page }) => ({ default: Page }),
   ),
 );
+const ParsingPipelinePage = lazy(() =>
+  import("../transactions/ParsingPipelinePage").then(
+    ({ ParsingPipelinePage: Page }) => ({ default: Page }),
+  ),
+);
 
 type FinanceAccountSelection = Pick<
   Account,
@@ -498,6 +503,7 @@ const transactionNavigation = [
   { label: "Transactions", icon: ArrowLeftRight, page: "transactions" as const },
   { label: "Credit Card", icon: ReceiptText, page: "credit-card" as const },
   { label: "Bulk Import", icon: FileSearch, page: "bulk-import" as const },
+  { label: "Pipeline", icon: FileSearch, page: "transaction-pipeline" as const },
   { label: "Prompt Preview", icon: FileSearch, page: "transaction-prompt-preview" as const },
   { label: "Parser Scripts", icon: SlidersHorizontal, page: "transaction-scripts" as const },
   { label: "Global Settings", icon: Globe2, page: "transaction-global-settings" as const },
@@ -979,7 +985,8 @@ export function AccountsPage({
           activePage === "transaction-settings" ||
           activePage === "transaction-global-settings" ||
           activePage === "transaction-prompt-preview" ||
-          activePage === "transaction-scripts" ? (
+          activePage === "transaction-scripts" ||
+          activePage === "transaction-pipeline" ? (
             <Suspense
               fallback={(
                 <section aria-busy="true" aria-label="Loading transaction workspace" className="transaction-panel" role="status">
@@ -1031,6 +1038,9 @@ export function AccountsPage({
               )}
               {activePage === "transaction-scripts" && (
                 <ScriptsManagementPage session={session} />
+              )}
+              {activePage === "transaction-pipeline" && (
+                <ParsingPipelinePage session={session} onNavigate={onNavigate} />
               )}
             </Suspense>
           ) : financeAccount ? (
