@@ -5,7 +5,8 @@ export type WorkspacePage =
   | "credit-card"
   | "transaction-settings"
   | "transaction-global-settings"
-  | "transaction-prompt-preview";
+  | "transaction-prompt-preview"
+  | "transaction-scripts";
 
 export function workspacePageFromLocation(): WorkspacePage {
   const parameters = new URL(window.location.href).searchParams;
@@ -17,7 +18,8 @@ export function workspacePageFromLocation(): WorkspacePage {
     page === "credit-card" ||
     page === "transaction-settings" ||
     page === "transaction-global-settings" ||
-    page === "transaction-prompt-preview"
+    page === "transaction-prompt-preview" ||
+    page === "transaction-scripts"
   )
     return page;
   return "accounts";

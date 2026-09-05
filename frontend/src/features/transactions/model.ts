@@ -519,3 +519,37 @@ export function toRFC3339(value: string): string | null {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? null : date.toISOString();
 }
+
+export interface ScriptSummary {
+  script_key: string;
+  active_version: number;
+  version_count: number;
+}
+
+export interface ScriptVersion {
+  script_key: string;
+  version: number;
+  source: string;
+  checksum: string;
+  is_active: boolean;
+  notes: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SourceCandidate {
+  id: string;
+  output_ordinal: number;
+  status: string;
+  transaction_kind: TransactionKind;
+  title: string;
+  merchant_name: string;
+  original_amount_minor: number;
+  original_currency: string;
+  occurred_at: string;
+  suggested_account_id: string | null;
+  suggested_transaction_id: string | null;
+  reconciliation_reason: string;
+  match_confidence: number | null;
+  transaction_id: string | null;
+}
