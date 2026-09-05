@@ -1,7 +1,7 @@
 begin;
 
 create extension if not exists pgtap with schema extensions;
-select plan(6);
+select plan(8);
 
 insert into auth.users (id, email) values
   ('11111111-1111-1111-1111-111111111111', 'account-owner@example.com');
@@ -41,6 +41,16 @@ select throws_ok(
   '23514',
   null,
   'more than 20 tags are rejected'
+);
+
+select ok(
+  has_column_privilege('authenticated', 'public.accounts', 'tags', 'INSERT'),
+  'authenticated can write tags on insert'
+);
+
+select ok(
+  has_column_privilege('authenticated', 'public.accounts', 'tags', 'UPDATE'),
+  'authenticated can write tags on update'
 );
 
 select * from finish();
