@@ -45,7 +45,7 @@ func (s *repositoryStub) RecordFailedSourceParse(_ context.Context, _ uuid.UUID,
 	s.audit = audit
 	return nil
 }
-func (s *repositoryStub) LoadReconciliationInput(context.Context, uuid.UUID, uuid.UUID) (transactionstore.ReconciliationInput, error) {
+func (s *repositoryStub) LoadReconciliationInput(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (transactionstore.ReconciliationInput, error) {
 	return s.reconcileInput, nil
 }
 func (s *repositoryStub) PersistReconciliation(_ context.Context, _ uuid.UUID, result transactionstore.ReconciliationResult) error {
@@ -155,7 +155,7 @@ func TestHandlerPersistsValidatedResultAndQueuesReconciliation(t *testing.T) {
 	if err := handler.Handle(context.Background(), jobs.Job{Kind: jobs.KindSourceParse, UserID: userID, Payload: payload}); err != nil {
 		t.Fatal(err)
 	}
-	if repository.parseResult == nil || repository.invalid || repository.parseResult.ParsedResponse.Candidate.UserID != userID.String() {
+	if repository.parseResult == nil || repository.invalid || len(repository.parseResult.Candidates) != 1 || repository.parseResult.Candidates[0].Candidate.UserID != userID.String() {
 		t.Fatalf("unexpected parser persistence %#v invalid=%v", repository.parseResult, repository.invalid)
 	}
 }
@@ -176,14 +176,17 @@ func TestHandlerDemotesBareLLMCardSuffixBeforeAccountMatching(t *testing.T) {
 	if repository.invalid || result == nil {
 		t.Fatalf("invalid=%t result=%#v", repository.invalid, result)
 	}
-	evidence := result.ParsedResponse.Candidate.AccountEvidence
+	if len(result.Candidates) != 1 {
+		t.Fatalf("expected one candidate, got %d", len(result.Candidates))
+	}
+	evidence := result.Candidates[0].Candidate.AccountEvidence
 	if evidence.CardLastFour != "" || len(evidence.AdditionalIdentifiers) != 1 || evidence.AdditionalIdentifiers[0] != "1234" {
 		t.Fatalf("unsafe card evidence was not demoted: %#v", evidence)
 	}
-	if result.AutoEligible || string(result.ModelOutput) != string(raw) {
-		t.Fatalf("eligibility=%t model output changed=%t", result.AutoEligible, string(result.ModelOutput) != string(raw))
+	if result.Candidates[0].Candidate.AutoEligible || string(result.ModelOutput) != string(raw) {
+		t.Fatalf("eligibility=%t model output changed=%t", result.Candidates[0].Candidate.AutoEligible, string(result.ModelOutput) != string(raw))
 	}
-	decision, err := reconciliation.Reconcile(result.ParsedResponse.Candidate, []reconciliation.AccountIdentity{{
+	decision, err := reconciliation.Reconcile(result.Candidates[0].Candidate, []reconciliation.AccountIdentity{{
 		ID: "account", UserID: userID.String(), MatchingKeys: []reconciliation.AccountMatchingKey{{KeyType: "card_last_four", NormalizedValue: "1234"}},
 	}}, nil)
 	if err != nil {
@@ -243,10 +246,10 @@ func TestHandlerRecoversOnlyInvalidOptionalCategoryCitation(t *testing.T) {
 		if err := handler.Handle(context.Background(), jobs.Job{Kind: jobs.KindSourceParse, UserID: userID, Payload: payload}); err != nil {
 			t.Fatal(err)
 		}
-		if repository.invalid || repository.parseResult == nil {
+		if repository.invalid || repository.parseResult == nil || len(repository.parseResult.Candidates) != 1 {
 			t.Fatalf("invalid=%t result=%#v", repository.invalid, repository.parseResult)
 		}
-		parsed := repository.parseResult.ParsedResponse
+		parsed := repository.parseResult.Candidates[0]
 		if parsed.Candidate.CategoryLeafName != "" || parsed.Candidate.AccountEvidence.CardLastFour != "2562" {
 			t.Fatalf("unexpected recovered candidate: %#v", parsed.Candidate)
 		}
@@ -298,13 +301,12 @@ func TestHandlerAssemblesSelectedPromptAndPersistsExactAudit(t *testing.T) {
 	userID, sourceID := uuid.New(), uuid.New()
 	raw := validResponseJSON(userID)
 	globalID, userRuleID := uuid.NewString(), uuid.NewString()
-	config := json.RawMessage(`{"extractors":{"card_last_four":{"pattern":"Mastercard\\s*\\(\\*{4}\\s*([0-9]{4})\\)","group":1}}}`)
 	normalized := "subject: Your FairPrice Group app receipt\nsender: FairPrice <no-reply@fairprice.com.sg>\ntext: Cafe Mastercard (**** 2562) SGD 5.00"
 	repository := &repositoryStub{parseInput: transactionstore.SourceParseInput{
 		ID: sourceID, Subject: "Your FairPrice Group app receipt",
 		Sender: "FairPrice <no-reply@fairprice.com.sg>", Content: "Cafe Mastercard (**** 2562) SGD 5.00",
 		NormalizedContent: normalized, DefaultInstructions: "prefer explicit receipt facts", DefaultInstructionsVersion: 3,
-		Rules:     []parserrules.Rule{{ID: globalID, Version: 2, Priority: 50, ContentMatcher: `FairPrice`, PromptFragment: "global guidance", ExtractionConfig: config}},
+		Rules:     []parserrules.Rule{{ID: globalID, Version: 2, Priority: 50, ContentMatcher: `FairPrice`, PromptFragment: "global guidance"}},
 		UserRules: []parserrules.UserRule{{ID: userRuleID, Name: "FairPrice receipts", Version: 4, Priority: 10, SenderMatchType: "domain", SenderMatchValue: "fairprice.com.sg", SubjectMatcher: `app receipt`, ContentMatcher: `Mastercard`, PromptFragment: "user rule guidance"}},
 	}}
 	parser := &parserCapture{result: providers.ParsedCandidate{
@@ -328,8 +330,8 @@ func TestHandlerAssemblesSelectedPromptAndPersistsExactAudit(t *testing.T) {
 		t.Fatal("email source content was promoted into the system prompt")
 	}
 	result := repository.parseResult
-	if result == nil || result.ParsedResponse.Candidate.AccountEvidence.CardLastFour != "2562" || !result.AutoEligible {
-		t.Fatalf("deterministic rule did not run after Qwen: %#v", result)
+	if result == nil || len(result.Candidates) != 1 {
+		t.Fatalf("expected one persisted candidate after the model call: %#v", result)
 	}
 	if result.RuleID != globalID || result.RuleVersion != 2 || result.UserRuleID != userRuleID || result.UserRuleVersion != 4 {
 		t.Fatalf("rule provenance = %#v", result.SourceParseAudit)
@@ -402,18 +404,18 @@ func TestLoadParseAttachmentsBoundsVisualCountAndAggregateBytes(t *testing.T) {
 }
 
 func TestHandlerPersistsReconciliationDecision(t *testing.T) {
-	userID, sourceID, accountID := uuid.New(), uuid.New(), uuid.New()
+	userID, sourceID, candidateID, accountID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	candidate := validCandidate(userID)
 	repository := &repositoryStub{reconcileInput: transactionstore.ReconciliationInput{
-		SourceID: sourceID, Candidate: candidate,
+		SourceID: sourceID, CandidateID: candidateID, Candidate: candidate,
 		Accounts: []reconciliation.AccountIdentity{{ID: accountID.String(), UserID: userID.String(), MatchingKeys: []reconciliation.AccountMatchingKey{{KeyType: "card_last_four", NormalizedValue: "1234"}}}},
 	}}
 	handler := Handler{Repository: repository}
-	payload, _ := json.Marshal(map[string]string{"data_source_id": sourceID.String()})
+	payload, _ := json.Marshal(map[string]string{"data_source_id": sourceID.String(), "source_candidate_id": candidateID.String()})
 	if err := handler.Handle(context.Background(), jobs.Job{Kind: jobs.KindReconcile, UserID: userID, Payload: payload}); err != nil {
 		t.Fatal(err)
 	}
-	if repository.reconcileResult == nil || repository.reconcileResult.Decision.Outcome != reconciliation.OutcomeCreate {
+	if repository.reconcileResult == nil || repository.reconcileResult.Decision.Outcome != reconciliation.OutcomeCreate || repository.reconcileResult.CandidateID != candidateID {
 		t.Fatalf("unexpected reconciliation result %#v", repository.reconcileResult)
 	}
 }

@@ -22,6 +22,9 @@ import type {
   SourceDeletionResult,
   SourceDebugField,
   SourceQueue,
+  ScriptSummary,
+  ScriptVersion,
+  SourceCandidate,
   SourceSummary,
   TransactionCategory,
   TransactionFilters,
@@ -745,4 +748,134 @@ export async function getExactSourceDebugField(
     contractError("source_debug_field identity does not match the requested field");
   }
   return result;
+}
+
+function parseScriptSummary(value: unknown): ScriptSummary {
+  const record = requiredRecord(value, "script");
+  return {
+    script_key: requiredString(record.script_key, "script.script_key"),
+    active_version: requiredInteger(record.active_version, "script.active_version"),
+    version_count: requiredInteger(record.version_count, "script.version_count"),
+  };
+}
+
+function parseScriptVersion(value: unknown): ScriptVersion {
+  const record = requiredRecord(value, "script_version");
+  return {
+    script_key: requiredString(record.script_key, "script_version.script_key"),
+    version: requiredInteger(record.version, "script_version.version"),
+    source: requiredString(record.source, "script_version.source"),
+    checksum: requiredString(record.checksum, "script_version.checksum"),
+    is_active: requiredBoolean(record.is_active, "script_version.is_active"),
+    notes: optionalString(record.notes, "script_version.notes") ?? "",
+    created_at: requiredString(record.created_at, "script_version.created_at"),
+    updated_at: requiredString(record.updated_at, "script_version.updated_at"),
+  };
+}
+
+export async function listScripts(session: Session, signal?: AbortSignal): Promise<ScriptSummary[]> {
+  const response = await request(session, `/v1/transactions/scripts`, { signal });
+  const items = requiredRecord(unwrapData(response), "scripts").scripts;
+  if (!Array.isArray(items)) contractError("scripts must be an array");
+  return items.map(parseScriptSummary);
+}
+
+export async function listScriptVersions(session: Session, key: string, signal?: AbortSignal): Promise<ScriptVersion[]> {
+  const response = await request(session, `/v1/transactions/scripts/${encodeURIComponent(key)}/versions`, { signal });
+  const items = requiredRecord(unwrapData(response), "versions").versions;
+  if (!Array.isArray(items)) contractError("versions must be an array");
+  return items.map(parseScriptVersion);
+}
+
+export async function getScriptVersion(session: Session, key: string, version: number, signal?: AbortSignal): Promise<ScriptVersion> {
+  const response = await request(session, `/v1/transactions/scripts/${encodeURIComponent(key)}/versions/${version}`, { signal });
+  return parseScriptVersion(unwrapData(response));
+}
+
+export async function createScriptVersion(session: Session, key: string, source: string, notes: string): Promise<ScriptVersion> {
+  const response = await request(session, `/v1/transactions/scripts/${encodeURIComponent(key)}/versions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ source, notes }),
+  });
+  return parseScriptVersion(unwrapData(response));
+}
+
+export async function activateScriptVersion(session: Session, key: string, version: number): Promise<void> {
+  await request(session, `/v1/transactions/scripts/${encodeURIComponent(key)}/activate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ version }),
+  });
+}
+
+export interface ScriptDryRunResult {
+  ok: boolean;
+  output: string;
+  error: string;
+}
+
+export async function dryRunScript(session: Session, source: string, input: string): Promise<ScriptDryRunResult> {
+  const body: { source: string; input?: unknown } = { source };
+  if (input.trim() !== "") {
+    body.input = JSON.parse(input);
+  }
+  const response = await request(session, `/v1/transactions/scripts/dry-run`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const record = requiredRecord(unwrapData(response), "dry_run");
+  const ok = requiredBoolean(record.ok, "dry_run.ok");
+  return {
+    ok,
+    output: record.output === undefined ? "" : JSON.stringify(record.output, null, 2),
+    error: optionalString(record.error, "dry_run.error") ?? "",
+  };
+}
+
+function parseSourceCandidate(value: unknown): SourceCandidate {
+  const record = requiredRecord(value, "source_candidate");
+  return {
+    id: requiredString(record.id, "source_candidate.id"),
+    output_ordinal: requiredInteger(record.output_ordinal, "source_candidate.output_ordinal"),
+    status: requiredString(record.status, "source_candidate.status"),
+    transaction_kind: enumValue(record.transaction_kind, ["debit", "credit"], "source_candidate.transaction_kind"),
+    title: optionalString(record.title, "source_candidate.title") ?? "",
+    merchant_name: optionalString(record.merchant_name, "source_candidate.merchant_name") ?? "",
+    original_amount_minor: requiredInteger(record.original_amount_minor, "source_candidate.original_amount_minor"),
+    original_currency: optionalString(record.original_currency, "source_candidate.original_currency") ?? "",
+    occurred_at: requiredString(record.occurred_at, "source_candidate.occurred_at"),
+    suggested_account_id: optionalString(record.suggested_account_id, "source_candidate.suggested_account_id"),
+    suggested_transaction_id: optionalString(record.suggested_transaction_id, "source_candidate.suggested_transaction_id"),
+    reconciliation_reason: optionalString(record.reconciliation_reason, "source_candidate.reconciliation_reason") ?? "",
+    match_confidence:
+      record.match_confidence === null || record.match_confidence === undefined
+        ? null
+        : requiredInteger(record.match_confidence, "source_candidate.match_confidence"),
+    transaction_id: optionalString(record.transaction_id, "source_candidate.transaction_id"),
+  };
+}
+
+export async function listSourceCandidates(session: Session, sourceId: string, signal?: AbortSignal): Promise<SourceCandidate[]> {
+  const response = await request(session, `/v1/transactions/sources/${encodeURIComponent(sourceId)}/candidates`, { signal });
+  const items = requiredRecord(unwrapData(response), "candidates").candidates;
+  if (!Array.isArray(items)) contractError("candidates must be an array");
+  return items.map(parseSourceCandidate);
+}
+
+export async function attachCandidateToTransaction(session: Session, sourceId: string, candidateId: string, transactionId: string): Promise<void> {
+  await request(session, `/v1/transactions/sources/${encodeURIComponent(sourceId)}/candidates/${encodeURIComponent(candidateId)}/attach`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ transaction_id: transactionId }),
+  });
+}
+
+export async function createTransactionFromCandidate(session: Session, sourceId: string, candidateId: string, accountId: string): Promise<void> {
+  await request(session, `/v1/transactions/sources/${encodeURIComponent(sourceId)}/candidates/${encodeURIComponent(candidateId)}/create-transaction`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ account_id: accountId }),
+  });
 }

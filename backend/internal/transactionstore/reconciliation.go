@@ -2,6 +2,7 @@ package transactionstore
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -43,17 +44,31 @@ type SourceAttachment struct {
 
 type ReconciliationInput struct {
 	SourceID     uuid.UUID
+	CandidateID  uuid.UUID
 	Candidate    reconciliation.Candidate
 	Accounts     []reconciliation.AccountIdentity
 	Transactions []reconciliation.Transaction
 }
 
+// ParsedSourceResult records one model call that produced zero or more valid
+// candidates (one email may yield several transactions). InvalidCount is the
+// number of candidates dropped by validation (D2: drop invalid, keep valid);
+// it is recorded for the audit trail.
 type ParsedSourceResult struct {
 	SourceParseAudit
-	SyncRunID       *uuid.UUID
-	ParsedResponse  reconciliation.ParsedResponse
-	ParsedCandidate json.RawMessage
-	AutoEligible    bool
+	SyncRunID    *uuid.UUID
+	Candidates   []reconciliation.ParsedResponse
+	InvalidCount int
+}
+
+// persistedSourceCandidate is the JSON stored in
+// source_candidates.parsed_candidate: the parsed response plus the
+// server-derived confidence and auto-eligibility that are json:"-" on the
+// Candidate and must survive the round trip to reconciliation.
+type persistedSourceCandidate struct {
+	reconciliation.ParsedResponse
+	Confidence   float64 `json:"confidence"`
+	AutoEligible bool    `json:"auto_eligible"`
 }
 
 type AttachmentUsage struct{ ObjectPath, Filename, MIMEType string }
@@ -88,13 +103,20 @@ type SourceParseAudit struct {
 	UserRuleID            string
 	UserRuleVersion       int
 	AttachmentUsage       []AttachmentUsage
+	// PreProcess records the pre-process outcome: "" (inert / no script),
+	// "<key>:v<n>" (applied), or "fallback:<reason>" (script failed, original
+	// content used).
+	PreProcess string
+	// PostProcess records the post-process outcome using the same convention.
+	PostProcess string
 }
 
 type ReconciliationResult struct {
-	SourceID  uuid.UUID
-	SyncRunID *uuid.UUID
-	Candidate reconciliation.Candidate
-	Decision  reconciliation.Decision
+	SourceID    uuid.UUID
+	CandidateID uuid.UUID
+	SyncRunID   *uuid.UUID
+	Candidate   reconciliation.Candidate
+	Decision    reconciliation.Decision
 }
 
 func (s *Store) LoadSourceParseInput(ctx context.Context, userID, sourceID uuid.UUID) (SourceParseInput, error) {
@@ -181,7 +203,7 @@ func sourceAttachmentMetadata(raw []byte) []SourceAttachment {
 func (s *Store) loadActiveGmailParserRules(ctx context.Context) ([]parserrules.Rule, error) {
 	rows, err := s.pool.Query(ctx, `
 		select id, name, version, priority, coalesce(sender_matcher, ''), coalesce(content_matcher, ''),
-			coalesce(prompt_fragment, ''), extraction_config
+			coalesce(prompt_fragment, '')
 		from private.source_parser_rules
 		where provider = 'gmail' and active = true
 		order by priority desc, id asc`)
@@ -192,7 +214,7 @@ func (s *Store) loadActiveGmailParserRules(ctx context.Context) ([]parserrules.R
 	rules := make([]parserrules.Rule, 0)
 	for rows.Next() {
 		var rule parserrules.Rule
-		if err := rows.Scan(&rule.ID, &rule.Name, &rule.Version, &rule.Priority, &rule.SenderMatcher, &rule.ContentMatcher, &rule.PromptFragment, &rule.ExtractionConfig); err != nil {
+		if err := rows.Scan(&rule.ID, &rule.Name, &rule.Version, &rule.Priority, &rule.SenderMatcher, &rule.ContentMatcher, &rule.PromptFragment); err != nil {
 			return nil, err
 		}
 		rules = append(rules, rule)
@@ -243,13 +265,27 @@ func normalizedEmailContent(subject, sender, text string, receivedAt time.Time) 
 	return strings.Join(parts, "\n")
 }
 
-// SaveParsedSource records a validated parser result and queues reconciliation
-// atomically. The parser call itself must have completed before this method.
+// SaveParsedSource records one model call's valid candidates and queues a
+// reconciliation job per candidate, atomically. One email may yield several
+// transactions: each becomes a source_candidates row (origin gmail_email) under
+// a single audit attempt. An empty candidate list is a valid no-transaction
+// result: the source is marked parsed with no candidates and no jobs.
 func (s *Store) SaveParsedSource(ctx context.Context, userID uuid.UUID, result ParsedSourceResult) error {
-	if result.SourceID == uuid.Nil || !validJSONObject(result.ParsedCandidate) {
-		return errors.New("valid source ID and parser response are required")
+	if result.SourceID == uuid.Nil {
+		return errors.New("valid source ID is required")
 	}
-	confidence := confidencePercent(result.ParsedResponse.Candidate.Confidence)
+	persisted := make([]persistedSourceCandidate, 0, len(result.Candidates))
+	for _, response := range result.Candidates {
+		persisted = append(persisted, persistedSourceCandidate{
+			ParsedResponse: response,
+			Confidence:     response.Candidate.Confidence,
+			AutoEligible:   response.Candidate.AutoEligible,
+		})
+	}
+	batchJSON, err := json.Marshal(map[string]any{"transactions": persisted, "invalid_count": result.InvalidCount})
+	if err != nil {
+		return err
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -267,7 +303,9 @@ func (s *Store) SaveParsedSource(ctx context.Context, userID uuid.UUID, result P
 		"response_format": "json_object", "parser_rule_id": result.RuleID,
 		"parser_rule_version": result.RuleVersion, "user_parser_rule_id": result.UserRuleID,
 		"user_parser_rule_version": result.UserRuleVersion,
-		"attachment_usage":         result.AttachmentUsage, "auto_eligible": result.AutoEligible,
+		"attachment_usage":         result.AttachmentUsage,
+		"pre_process":              result.PreProcess, "post_process": result.PostProcess,
+		"candidate_count": len(persisted), "invalid_count": result.InvalidCount,
 	})
 	if err != nil {
 		return err
@@ -280,7 +318,8 @@ func (s *Store) SaveParsedSource(ctx context.Context, userID uuid.UUID, result P
 	if err != nil {
 		return err
 	}
-	_, err = tx.Exec(ctx, `
+	var attemptID uuid.UUID
+	if err = tx.QueryRow(ctx, `
 		insert into private.source_parse_attempts (
 			user_id, data_source_id, parser_rule_id, parser_rule_version,
 			user_parser_rule_id, user_parser_rule_version, model_name,
@@ -294,34 +333,46 @@ func (s *Store) SaveParsedSource(ctx context.Context, userID uuid.UUID, result P
 			case when $13 = 'null' then null else $13::json end,
 			case when $14 = 'null' then null else $14::json end, $15::jsonb,
 			'valid', now(), now()
-		)`, userID, result.SourceID, ruleID, result.RuleVersion,
+		) returning id`, userID, result.SourceID, ruleID, result.RuleVersion,
 		userRuleID, result.UserRuleVersion, result.Model, string(metadata),
-		string(result.ParsedCandidate), result.AssembledSystemPrompt,
+		string(batchJSON), result.AssembledSystemPrompt,
 		result.NormalizedInput, nullableJSON(result.ProviderRequest),
 		nullableJSON(result.ProviderResponse), nullableJSON(result.ModelOutput),
-		promptComponentsJSON(result.PromptComponents))
-	if err != nil {
+		promptComponentsJSON(result.PromptComponents)).Scan(&attemptID); err != nil {
 		return err
 	}
-	_, err = tx.Exec(ctx, `
-		update private.data_sources set parse_status = 'parsed', parse_confidence = $3,
-			parse_error = null, suggested_account_id = null, parser_rule_id = $4, parser_rule_version = nullif($5, 0)
-		where id = $1 and user_id = $2`, result.SourceID, userID, confidence, ruleID, result.RuleVersion)
-	if err != nil {
-		return err
+	for index, candidate := range persisted {
+		canonical, marshalErr := json.Marshal(candidate)
+		if marshalErr != nil {
+			return marshalErr
+		}
+		digest := sha256.Sum256(canonical)
+		var candidateID uuid.UUID
+		if err = tx.QueryRow(ctx, `
+			insert into private.source_candidates (
+				user_id, data_source_id, source_parse_attempt_id, origin,
+				attempt_generation, output_ordinal, fingerprint, parsed_candidate, status
+			) values ($1, $2, $3, 'gmail_email', 1, $4, $5, $6::jsonb, 'pending_reconciliation')
+			returning id`, userID, result.SourceID, attemptID, index, digest[:], string(canonical)).Scan(&candidateID); err != nil {
+			return err
+		}
+		payload, payloadErr := json.Marshal(map[string]string{
+			"data_source_id": result.SourceID.String(), "source_candidate_id": candidateID.String(),
+		})
+		if payloadErr != nil {
+			return payloadErr
+		}
+		if _, err = tx.Exec(ctx, `
+			insert into private.transaction_jobs (user_id, sync_run_id, data_source_id, job_type, payload)
+			values ($1, $2, $3, $4, $5::jsonb)`,
+			userID, result.SyncRunID, result.SourceID, string(jobs.KindReconcile), string(payload)); err != nil {
+			return err
+		}
 	}
-	payload, err := json.Marshal(map[string]string{"data_source_id": result.SourceID.String()})
-	if err != nil {
-		return err
-	}
-	_, err = tx.Exec(ctx, `
-		insert into private.transaction_jobs (user_id, sync_run_id, data_source_id, job_type, payload)
-		select $1, $2, $3, $4, $5::jsonb
-		where not exists (
-			select 1 from private.transaction_jobs
-			where user_id = $1 and data_source_id = $3 and job_type = $4 and status in ('queued', 'running')
-		)`, userID, result.SyncRunID, result.SourceID, string(jobs.KindReconcile), string(payload))
-	if err != nil {
+	if _, err = tx.Exec(ctx, `
+		update private.data_sources set parse_status = 'parsed', parse_confidence = null,
+			parse_error = null, suggested_account_id = null, parser_rule_id = $3, parser_rule_version = nullif($4, 0)
+		where id = $1 and user_id = $2`, result.SourceID, userID, ruleID, result.RuleVersion); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -359,6 +410,8 @@ func (s *Store) recordSourceParseError(ctx context.Context, userID uuid.UUID, au
 		"parser_rule_version": audit.RuleVersion, "user_parser_rule_id": audit.UserRuleID,
 		"user_parser_rule_version": audit.UserRuleVersion,
 		"attachment_usage":         audit.AttachmentUsage,
+		"pre_process":              audit.PreProcess,
+		"post_process":             audit.PostProcess,
 	})
 	if err != nil {
 		return err
@@ -425,40 +478,30 @@ func parseOptionalRuleProvenance(id string, version int) (*uuid.UUID, error) {
 	return &parsed, nil
 }
 
-func (s *Store) LoadReconciliationInput(ctx context.Context, userID, sourceID uuid.UUID) (ReconciliationInput, error) {
-	var raw, metadata []byte
+func (s *Store) LoadReconciliationInput(ctx context.Context, userID, sourceID, candidateID uuid.UUID) (ReconciliationInput, error) {
+	var raw []byte
 	err := s.pool.QueryRow(ctx, `
-		select attempt.parsed_candidate, attempt.request_metadata
-		from private.data_sources source
-		join lateral (
-			select parsed_candidate, request_metadata from private.source_parse_attempts
-			where user_id = source.user_id and data_source_id = source.id and validation_status = 'valid'
-			order by created_at desc, id desc limit 1
-		) attempt on true
-		where source.id = $1 and source.user_id = $2 and source.parse_status = 'parsed'`, sourceID, userID).Scan(&raw, &metadata)
+		select parsed_candidate from private.source_candidates
+		where id = $1 and user_id = $2 and data_source_id = $3 and status = 'pending_reconciliation'`,
+		candidateID, userID, sourceID).Scan(&raw)
 	if err != nil {
 		return ReconciliationInput{}, err
 	}
-	parsed, err := decodePersistedCandidate(raw, userID)
+	parsed, err := decodePersistedSourceCandidate(raw, userID)
 	if err != nil {
 		return ReconciliationInput{}, fmt.Errorf("decode persisted parse result: %w", err)
 	}
-	var metadataValue struct {
-		AutoEligible bool `json:"auto_eligible"`
-	}
-	if json.Unmarshal(metadata, &metadataValue) != nil {
-		return ReconciliationInput{}, errors.New("decode parser request metadata")
-	}
-	parsed.Candidate.AutoEligible = metadataValue.AutoEligible
 	accounts, err := s.loadOwnedAccountIdentities(ctx, userID)
 	if err != nil {
 		return ReconciliationInput{}, err
 	}
-	transactions, err := s.loadOwnedTransactions(ctx, userID, parsed.Candidate.OccurredAt)
+	// Exclude transactions already linked to this source so one email's later
+	// candidate cannot auto-attach to a transaction an earlier candidate created.
+	transactions, err := loadOwnedTransactionsExcludingSource(ctx, s.pool, userID, parsed.Candidate.OccurredAt, sourceID)
 	if err != nil {
 		return ReconciliationInput{}, err
 	}
-	return ReconciliationInput{SourceID: sourceID, Candidate: parsed.Candidate, Accounts: accounts, Transactions: transactions}, nil
+	return ReconciliationInput{SourceID: sourceID, CandidateID: candidateID, Candidate: parsed.Candidate, Accounts: accounts, Transactions: transactions}, nil
 }
 
 func (s *Store) loadOwnedAccountIdentities(ctx context.Context, userID uuid.UUID) ([]reconciliation.AccountIdentity, error) {
@@ -511,16 +554,20 @@ func loadOwnedAccountIdentities(ctx context.Context, querier reconciliationQueri
 	return accounts, nil
 }
 
-func (s *Store) loadOwnedTransactions(ctx context.Context, userID uuid.UUID, occurredAt time.Time) ([]reconciliation.Transaction, error) {
-	return loadOwnedTransactions(ctx, s.pool, userID, occurredAt)
-}
-
-func loadOwnedTransactions(ctx context.Context, querier reconciliationQuerier, userID uuid.UUID, occurredAt time.Time) ([]reconciliation.Transaction, error) {
+// loadOwnedTransactionsExcludingSource loads candidate match transactions in the
+// ±24h window, optionally excluding transactions already linked to excludeSource
+// (pass uuid.Nil to exclude none). The exclusion prevents one email's later
+// candidate from auto-attaching to a transaction an earlier candidate created.
+func loadOwnedTransactionsExcludingSource(ctx context.Context, querier reconciliationQuerier, userID uuid.UUID, occurredAt time.Time, excludeSource uuid.UUID) ([]reconciliation.Transaction, error) {
 	rows, err := querier.Query(ctx, `
 		select id, account_id, transaction_kind, coalesce(merchant_name, ''), original_amount_minor,
 			original_currency, occurred_at, coalesce(details -> 'references', '[]'::jsonb)
 		from public.transactions
-		where user_id = $1 and occurred_at between $2::timestamptz - interval '24 hours' and $2::timestamptz + interval '24 hours'`, userID, occurredAt)
+		where user_id = $1 and occurred_at between $2::timestamptz - interval '24 hours' and $2::timestamptz + interval '24 hours'
+			and id not in (
+				select transaction_id from private.transaction_data_sources
+				where user_id = $1 and data_source_id = $3 and detached_at is null and transaction_id is not null
+			)`, userID, occurredAt, excludeSource)
 	if err != nil {
 		return nil, err
 	}
@@ -548,6 +595,9 @@ func loadOwnedTransactions(ctx context.Context, querier reconciliationQuerier, u
 // Every outcome also locks the source, verifies ownership again, and updates
 // visible sync-run counters atomically.
 func (s *Store) PersistReconciliation(ctx context.Context, userID uuid.UUID, result ReconciliationResult) error {
+	if result.CandidateID == uuid.Nil {
+		return errors.New("reconciliation requires a candidate ID")
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -562,18 +612,13 @@ func (s *Store) PersistReconciliation(ctx context.Context, userID uuid.UUID, res
 			return err
 		}
 	}
-	var status string
-	if err = tx.QueryRow(ctx, `select parse_status from private.data_sources where id = $1 and user_id = $2 for update`, result.SourceID, userID).Scan(&status); err != nil {
+	// Guard on the candidate's own status, not the source rollup: sibling
+	// candidates from the same email reconcile independently.
+	var candidateStatus string
+	if err = tx.QueryRow(ctx, `select status from private.source_candidates where id = $1 and user_id = $2 and data_source_id = $3 for update`, result.CandidateID, userID, result.SourceID).Scan(&candidateStatus); err != nil {
 		return err
 	}
-	if status != "parsed" {
-		return tx.Commit(ctx)
-	}
-	var linked bool
-	if err = tx.QueryRow(ctx, `select exists(select 1 from private.transaction_data_sources where user_id = $1 and data_source_id = $2 and detached_at is null)`, userID, result.SourceID).Scan(&linked); err != nil {
-		return err
-	}
-	if linked {
+	if candidateStatus != "pending_reconciliation" {
 		return tx.Commit(ctx)
 	}
 	if serializedCreate {
@@ -581,7 +626,7 @@ func (s *Store) PersistReconciliation(ctx context.Context, userID uuid.UUID, res
 		if loadErr != nil {
 			return loadErr
 		}
-		transactions, loadErr := loadOwnedTransactions(ctx, tx, userID, result.Candidate.OccurredAt)
+		transactions, loadErr := loadOwnedTransactionsExcludingSource(ctx, tx, userID, result.Candidate.OccurredAt, result.SourceID)
 		if loadErr != nil {
 			return loadErr
 		}
@@ -598,75 +643,75 @@ func (s *Store) PersistReconciliation(ctx context.Context, userID uuid.UUID, res
 	suggestedTransaction := nullableUUID(result.Decision.TransactionID)
 	switch result.Decision.Outcome {
 	case reconciliation.OutcomeAttach:
-		transactionID, err := uuid.Parse(result.Decision.TransactionID)
-		if err != nil {
+		transactionID, perr := uuid.Parse(result.Decision.TransactionID)
+		if perr != nil {
 			return errors.New("reconciliation selected an invalid transaction")
 		}
-		command, err := tx.Exec(ctx, `
-			insert into private.transaction_data_sources (user_id, transaction_id, data_source_id, role, match_confidence, matched_by)
-			select $1, transaction.id, $2, 'other', $3, 'automatic'
-			from public.transactions transaction where transaction.id = $4 and transaction.user_id = $1`, userID, result.SourceID, score, transactionID)
-		if err != nil {
-			return err
+		command, cerr := tx.Exec(ctx, `
+			insert into private.transaction_data_sources (user_id, transaction_id, data_source_id, bulk_import_candidate_id, role, match_confidence, matched_by)
+			select $1, transaction.id, $2, $5, 'other', $3, 'automatic'
+			from public.transactions transaction where transaction.id = $4 and transaction.user_id = $1`, userID, result.SourceID, score, transactionID, result.CandidateID)
+		if cerr != nil {
+			return cerr
 		}
 		if command.RowsAffected() != 1 {
 			return errors.New("reconciliation selected a transaction not owned by the source user")
 		}
+		if _, err = tx.Exec(ctx, `update private.source_candidates set status = 'attached', transaction_id = $3, account_id = coalesce($4, account_id), match_confidence = $5, suggested_account_id = null, suggested_transaction_id = null, reconciliation_reason = null where id = $1 and user_id = $2`, result.CandidateID, userID, transactionID, suggestedAccount, score); err != nil {
+			return err
+		}
 		attached = 1
 	case reconciliation.OutcomeCreate:
-		accountID, err := uuid.Parse(result.Decision.AccountID)
-		if err != nil {
+		accountID, perr := uuid.Parse(result.Decision.AccountID)
+		if perr != nil {
 			return errors.New("reconciliation selected an invalid account")
 		}
-		lineItems, err := json.Marshal(result.Candidate.LineItems)
-		if err != nil {
-			return err
+		lineItems, merr := json.Marshal(result.Candidate.LineItems)
+		if merr != nil {
+			return merr
 		}
-		details, err := json.Marshal(map[string]any{"references": result.Candidate.References, "account_evidence": result.Candidate.AccountEvidence})
-		if err != nil {
-			return err
+		details, merr := json.Marshal(map[string]any{"references": result.Candidate.References, "account_evidence": result.Candidate.AccountEvidence})
+		if merr != nil {
+			return merr
 		}
-		categoryID, err := s.resolveCategoryLeaf(ctx, tx, result.Candidate.CategoryLeafName)
-		if err != nil {
-			return err
+		categoryID, cerr := s.resolveCategoryLeaf(ctx, tx, result.Candidate.CategoryLeafName)
+		if cerr != nil {
+			return cerr
 		}
 		var transactionID uuid.UUID
-		err = tx.QueryRow(ctx, `
+		if err = tx.QueryRow(ctx, `
 			insert into public.transactions (user_id, account_id, transaction_kind, title, merchant_name,
 				original_amount_minor, original_currency, sgd_amount_minor, occurred_at, category_id, line_items, details,
 				review_status, match_confidence, creation_method)
 			values ($1, $2, $3, $4, nullif($5, ''), $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, 'confirmed', $13, 'automatic_source')
 			returning id`, userID, accountID, string(result.Candidate.Kind), result.Candidate.Title,
 			result.Candidate.MerchantName, result.Candidate.OriginalAmountMinor, result.Candidate.OriginalCurrency,
-			result.Candidate.SGDAmountMinor, result.Candidate.OccurredAt, categoryID, string(lineItems), string(details), confidence).Scan(&transactionID)
-		if err != nil {
+			result.Candidate.SGDAmountMinor, result.Candidate.OccurredAt, categoryID, string(lineItems), string(details), confidence).Scan(&transactionID); err != nil {
 			return err
 		}
-		_, err = tx.Exec(ctx, `insert into private.transaction_data_sources (user_id, transaction_id, data_source_id, role, match_confidence, matched_by) values ($1, $2, $3, 'other', $4, 'automatic')`, userID, transactionID, result.SourceID, confidence)
-		if err != nil {
+		if _, err = tx.Exec(ctx, `insert into private.transaction_data_sources (user_id, transaction_id, data_source_id, bulk_import_candidate_id, role, match_confidence, matched_by) values ($1, $2, $3, $4, 'other', $5, 'automatic')`, userID, transactionID, result.SourceID, result.CandidateID, confidence); err != nil {
+			return err
+		}
+		if _, err = tx.Exec(ctx, `update private.source_candidates set status = 'created', transaction_id = $3, account_id = $4, match_confidence = $5, suggested_account_id = null, suggested_transaction_id = null, reconciliation_reason = null where id = $1 and user_id = $2`, result.CandidateID, userID, transactionID, accountID, confidence); err != nil {
 			return err
 		}
 		created, attached = 1, 1
 	case reconciliation.OutcomeReview:
-		_, err = tx.Exec(ctx, `update private.data_sources set parse_status = 'review_required', suggested_account_id = $3, suggested_transaction_id = $4, reconciliation_reason = $5 where id = $1 and user_id = $2`, result.SourceID, userID, suggestedAccount, suggestedTransaction, result.Decision.Reason)
-		if err != nil {
+		if _, err = tx.Exec(ctx, `update private.source_candidates set status = 'review_required', suggested_account_id = $3, suggested_transaction_id = $4, reconciliation_reason = $5, match_confidence = $6 where id = $1 and user_id = $2`, result.CandidateID, userID, suggestedAccount, suggestedTransaction, result.Decision.Reason, score); err != nil {
 			return err
 		}
 		review = 1
 	case reconciliation.OutcomeDangling:
-		_, err = tx.Exec(ctx, `update private.data_sources set parse_status = 'dangling', suggested_account_id = null, suggested_transaction_id = null, reconciliation_reason = $3 where id = $1 and user_id = $2`, result.SourceID, userID, result.Decision.Reason)
-		if err != nil {
+		if _, err = tx.Exec(ctx, `update private.source_candidates set status = 'dangling', suggested_account_id = null, suggested_transaction_id = null, reconciliation_reason = $3 where id = $1 and user_id = $2`, result.CandidateID, userID, result.Decision.Reason); err != nil {
 			return err
 		}
 		dangling = 1
 	default:
 		return fmt.Errorf("unsupported reconciliation outcome %q", result.Decision.Outcome)
 	}
-	if result.Decision.Outcome == reconciliation.OutcomeAttach || result.Decision.Outcome == reconciliation.OutcomeCreate {
-		_, err = tx.Exec(ctx, `update private.data_sources set suggested_account_id = $3, suggested_transaction_id = null, reconciliation_reason = null, parse_error = null where id = $1 and user_id = $2`, result.SourceID, userID, suggestedAccount)
-		if err != nil {
-			return err
-		}
+	// Recompute the source rollup from all its candidates.
+	if err = recomputeSourceParseRollup(ctx, tx, userID, result.SourceID); err != nil {
+		return err
 	}
 	if result.SyncRunID != nil {
 		_, err = tx.Exec(ctx, `

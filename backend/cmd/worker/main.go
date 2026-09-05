@@ -21,6 +21,8 @@ import (
 	"github.com/zhengteck/wealth-builder/backend/internal/ingestion"
 	"github.com/zhengteck/wealth-builder/backend/internal/jobs"
 	"github.com/zhengteck/wealth-builder/backend/internal/providers"
+	"github.com/zhengteck/wealth-builder/backend/internal/scriptengine"
+	"github.com/zhengteck/wealth-builder/backend/internal/scriptstore"
 	"github.com/zhengteck/wealth-builder/backend/internal/secret"
 	"github.com/zhengteck/wealth-builder/backend/internal/transactionstore"
 	"github.com/zhengteck/wealth-builder/backend/internal/transactionworker"
@@ -66,6 +68,7 @@ func main() {
 	}
 	processingHandler := transactionworker.Handler{
 		Repository: store, Parser: qwenClient, Attachments: attachmentClient, CleanupAttachments: attachmentClient,
+		Engine: scriptengine.New(scriptengine.DefaultOptions()), Scripts: scriptstore.New(pool),
 	}
 	handler := jobs.Router{
 		jobs.KindGmailIngest:             gmailHandler,

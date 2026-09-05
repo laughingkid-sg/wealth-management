@@ -454,10 +454,6 @@ export function GlobalTransactionSettingsPage({ session }: { session: Session })
                   <p>Content: {rule.content_matcher ?? "Any content"}</p>
                   {rule.prompt_fragment && <p className="global-rule-prompt">{rule.prompt_fragment}</p>}
                   <p>Last updated {formattedDate(rule.updated_at)} by {editorLabel(rule.updated_by_user_id)}</p>
-                  <details className="global-rule-config">
-                    <summary>Read-only extraction configuration</summary>
-                    <pre>{JSON.stringify(rule.extraction_config, null, 2)}</pre>
-                  </details>
                 </div>
                 <button
                   aria-label={`Edit ${rule.name}`}

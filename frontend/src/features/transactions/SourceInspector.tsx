@@ -30,6 +30,7 @@ import {
   type SanitizedEmail,
 } from "./api";
 import { AccountSelect } from "./TransactionForms";
+import { SourceCandidateResolver } from "./SourceCandidateResolver";
 import {
   formatAmount,
   formatDateTime,
@@ -889,7 +890,9 @@ export function SourceInspector({
             <h3 id="source-resolution-title">Choose where this evidence belongs</h3>
             <p className="muted">The server validates ownership and derives canonical fields from the stored, validated source candidate.</p>
           </div>
-          {accountsLoading ? (
+          {source.source_type === "gmail_email" ? (
+            <SourceCandidateResolver session={session} source={source} resolved={resolved} />
+          ) : accountsLoading ? (
             <p aria-live="polite" className="muted" role="status">Loading your accounts…</p>
           ) : accountsError ? (
             <section className="notice notice-error" role="alert">

@@ -4,7 +4,6 @@
 package parserrules
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/mail"
@@ -16,33 +15,24 @@ import (
 var ErrAmbiguousTopPriority = errors.New("multiple matching parser rules share the highest priority")
 
 type Rule struct {
-	ID               string
-	Name             string
-	Version          int
-	Priority         int
-	SenderMatcher    string
-	ContentMatcher   string
-	PromptFragment   string
-	ExtractionConfig json.RawMessage
+	ID             string
+	Name           string
+	Version        int
+	Priority       int
+	SenderMatcher  string
+	ContentMatcher string
+	PromptFragment string
 }
 
-type ExtractionConfig struct {
-	Constants  map[string]string       `json:"constants"`
-	Extractors map[string]CaptureField `json:"extractors"`
-}
-
-type CaptureField struct {
-	Pattern string `json:"pattern"`
-	Group   int    `json:"group"`
-}
-
+// AppliedRule is a matched global rule. Deterministic field extraction was
+// removed in favour of the Tengo post-process stage; a matched rule now
+// contributes only its prompt fragment (and, at the call site, its script keys).
 type AppliedRule struct {
 	ID             string
 	Name           string
 	Version        int
 	Priority       int
 	PromptFragment string
-	Values         map[string][]string
 }
 
 // UserRule is the worker-safe projection of an owner-scoped configurable rule.
@@ -94,40 +84,9 @@ func applyOne(sender, content string, rule Rule) (AppliedRule, bool) {
 	if !matches(rule.SenderMatcher, sender) || !matches(rule.ContentMatcher, content) {
 		return AppliedRule{}, false
 	}
-	var config ExtractionConfig
-	if len(rule.ExtractionConfig) == 0 || json.Unmarshal(rule.ExtractionConfig, &config) != nil {
-		return AppliedRule{}, false
-	}
-	values := make(map[string][]string)
-	for field, value := range config.Constants {
-		if !supportedField(field) || strings.TrimSpace(value) == "" {
-			return AppliedRule{}, false
-		}
-		values[field] = []string{strings.TrimSpace(value)}
-	}
-	for field, extractor := range config.Extractors {
-		if !supportedField(field) || strings.TrimSpace(extractor.Pattern) == "" || extractor.Group < 0 {
-			return AppliedRule{}, false
-		}
-		re, err := regexp.Compile(extractor.Pattern)
-		if err != nil {
-			return AppliedRule{}, false
-		}
-		allMatches := re.FindAllStringSubmatch(content, 10)
-		captured := make([]string, 0, len(allMatches))
-		for _, match := range allMatches {
-			if extractor.Group >= len(match) || strings.TrimSpace(match[extractor.Group]) == "" {
-				continue
-			}
-			captured = append(captured, strings.TrimSpace(match[extractor.Group]))
-		}
-		if len(captured) > 0 {
-			values[field] = captured
-		}
-	}
 	return AppliedRule{
 		ID: rule.ID, Name: rule.Name, Version: rule.Version, Priority: rule.Priority,
-		PromptFragment: strings.TrimSpace(rule.PromptFragment), Values: values,
+		PromptFragment: strings.TrimSpace(rule.PromptFragment),
 	}, true
 }
 
@@ -235,13 +194,4 @@ func matches(pattern, value string) bool {
 	}
 	re, err := regexp.Compile(pattern)
 	return err == nil && re.MatchString(value)
-}
-
-func supportedField(field string) bool {
-	switch field {
-	case "transaction_kind", "original_amount_minor", "original_currency", "sgd_amount_minor", "occurred_at", "merchant_name", "title", "references", "card_last_four", "masked_bank_reference", "additional_identifiers", "category_leaf_name":
-		return true
-	default:
-		return false
-	}
 }

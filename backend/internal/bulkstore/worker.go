@@ -543,7 +543,7 @@ func (s *Store) AggregateDocument(ctx context.Context, work bulkworker.Work) err
 			duplicate := inserted[*deduped[index].DuplicateOf]
 			duplicateOf = &duplicate
 		}
-		err = tx.QueryRow(ctx, `insert into private.bulk_import_candidates(user_id,batch_id,document_id,data_source_id,source_parse_attempt_id,attempt_generation,output_ordinal,fingerprint,parsed_candidate,account_id,status,duplicate_of_candidate_id,reconciliation_reason) values($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,$12,$13) on conflict(document_id,attempt_generation,output_ordinal) do update set updated_at=now() returning id`, work.UserID, work.BatchID, work.DocumentID, sourceID, record.AttemptID, work.Generation, index, fingerprint, string(candidateJSON), accountIDs[index], status, duplicateOf, map[bool]string{true: "exact candidate fingerprint repeated in document", false: ""}[duplicateOf != nil]).Scan(&inserted[index])
+		err = tx.QueryRow(ctx, `insert into private.source_candidates(user_id,batch_id,document_id,data_source_id,source_parse_attempt_id,attempt_generation,output_ordinal,fingerprint,parsed_candidate,account_id,status,duplicate_of_candidate_id,reconciliation_reason) values($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,$12,$13) on conflict(document_id,attempt_generation,output_ordinal) do update set updated_at=now() returning id`, work.UserID, work.BatchID, work.DocumentID, sourceID, record.AttemptID, work.Generation, index, fingerprint, string(candidateJSON), accountIDs[index], status, duplicateOf, map[bool]string{true: "exact candidate fingerprint repeated in document", false: ""}[duplicateOf != nil]).Scan(&inserted[index])
 		if err != nil {
 			return err
 		}
@@ -593,7 +593,7 @@ func (s *Store) LoadPostProcessInput(ctx context.Context, work bulkworker.Work) 
 		return input, err
 	}
 	input.DocumentSummary = append(json.RawMessage(nil), raw...)
-	rows, err := s.pool.Query(ctx, `select id from private.bulk_import_candidates where document_id=$1 and user_id=$2 and attempt_generation=$3 order by output_ordinal`, work.DocumentID, work.UserID, work.Generation)
+	rows, err := s.pool.Query(ctx, `select id from private.source_candidates where document_id=$1 and user_id=$2 and attempt_generation=$3 order by output_ordinal`, work.DocumentID, work.UserID, work.Generation)
 	if err != nil {
 		return input, err
 	}
@@ -615,7 +615,7 @@ func (s *Store) RecordGenericPostProcess(ctx context.Context, input bulkimport.P
 	}
 	defer tx.Rollback(ctx)
 	var candidateFailures, chunkFailures int
-	if err = tx.QueryRow(ctx, `select (select count(*)::int from private.bulk_import_candidates where document_id=$1 and user_id=$2 and attempt_generation=$3 and status='failed'),(select count(*)::int from private.bulk_import_chunks where document_id=$1 and user_id=$2 and attempt_generation=$3 and status='failed')`, input.DocumentID, input.UserID, input.AttemptGeneration).Scan(&candidateFailures, &chunkFailures); err != nil {
+	if err = tx.QueryRow(ctx, `select (select count(*)::int from private.source_candidates where document_id=$1 and user_id=$2 and attempt_generation=$3 and status='failed'),(select count(*)::int from private.bulk_import_chunks where document_id=$1 and user_id=$2 and attempt_generation=$3 and status='failed')`, input.DocumentID, input.UserID, input.AttemptGeneration).Scan(&candidateFailures, &chunkFailures); err != nil {
 		return err
 	}
 	failed, status := documentFailureOutcome(candidateFailures, chunkFailures)

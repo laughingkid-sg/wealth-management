@@ -13,7 +13,7 @@ import (
 	"github.com/zhengteck/wealth-builder/backend/internal/database"
 )
 
-func TestGlobalSourceRuleOptimisticUpdatePreservesExtractionConfigAndPreviewOwnership(t *testing.T) {
+func TestGlobalSourceRuleOptimisticUpdateAndPreviewOwnership(t *testing.T) {
 	databaseURL := os.Getenv("TRANSACTIONSTORE_TEST_DB_URL")
 	if databaseURL == "" {
 		t.Skip("TRANSACTIONSTORE_TEST_DB_URL is not configured")
@@ -55,14 +55,10 @@ func TestGlobalSourceRuleOptimisticUpdatePreservesExtractionConfigAndPreviewOwne
 		t.Fatal(err)
 	}
 	ruleID = created.ID
-	if created.Version != 1 || created.UpdatedByUserID == nil || *created.UpdatedByUserID != userID || string(created.ExtractionConfig) != `{}` {
-		t.Fatalf("created rule = %#v config=%s", created, created.ExtractionConfig)
+	if created.Version != 1 || created.UpdatedByUserID == nil || *created.UpdatedByUserID != userID {
+		t.Fatalf("created rule = %#v", created)
 	}
 
-	extractionConfig := `{"constants":{"transaction_kind":"debit"}}`
-	if _, err = pool.Exec(ctx, `update private.source_parser_rules set extraction_config = $2::jsonb where id = $1`, ruleID, extractionConfig); err != nil {
-		t.Fatal(err)
-	}
 	updated, err := store.UpdateGlobalSourceParserRule(ctx, otherUserID, ruleID, GlobalSourceParserRuleInput{
 		Name: "Updated integration rule", Provider: "gmail", PromptFragment: "Updated guidance.",
 		Priority: -12344, Active: false, ExpectedVersion: 1,
@@ -72,10 +68,6 @@ func TestGlobalSourceRuleOptimisticUpdatePreservesExtractionConfigAndPreviewOwne
 	}
 	if updated.Version != 2 || updated.UpdatedByUserID == nil || *updated.UpdatedByUserID != otherUserID {
 		t.Fatalf("updated rule = %#v", updated)
-	}
-	var decoded map[string]any
-	if err = json.Unmarshal(updated.ExtractionConfig, &decoded); err != nil || decoded["constants"] == nil {
-		t.Fatalf("extraction config was replaced: %s error=%v", updated.ExtractionConfig, err)
 	}
 	if _, err = store.UpdateGlobalSourceParserRule(ctx, userID, ruleID, GlobalSourceParserRuleInput{
 		Name: "Stale", Provider: "gmail", ExpectedVersion: 1,

@@ -1,7 +1,6 @@
 package transactionprompt
 
 import (
-	"encoding/json"
 	"strings"
 	"testing"
 
@@ -21,8 +20,8 @@ func TestSelectAutomaticUsesProductionMatchersAndStableAssemblyOrder(t *testing.
 		DefaultInstructions:        "Prefer source-stated timestamps.",
 		DefaultInstructionsVersion: 3,
 		Rules: []parserrules.Rule{
-			{ID: uuid.NewString(), Name: "Does not match", Version: 1, Priority: 100, ContentMatcher: `DigitalOcean`, ExtractionConfig: json.RawMessage(`{}`)},
-			{ID: globalID, Name: "Masked card", Version: 2, Priority: 50, ContentMatcher: `Mastercard \(\*{4} 2562\)`, PromptFragment: "Read the payment method.", ExtractionConfig: json.RawMessage(`{}`)},
+			{ID: uuid.NewString(), Name: "Does not match", Version: 1, Priority: 100, ContentMatcher: `DigitalOcean`},
+			{ID: globalID, Name: "Masked card", Version: 2, Priority: 50, ContentMatcher: `Mastercard \(\*{4} 2562\)`, PromptFragment: "Read the payment method."},
 		},
 		UserRules: []parserrules.UserRule{{
 			ID: userRuleID, Name: "FairPrice", Version: 4, Priority: 10,

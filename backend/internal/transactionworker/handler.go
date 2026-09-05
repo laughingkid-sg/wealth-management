@@ -25,7 +25,7 @@ type Repository interface {
 	SaveParsedSource(context.Context, uuid.UUID, transactionstore.ParsedSourceResult) error
 	RecordInvalidSourceParse(context.Context, uuid.UUID, transactionstore.SourceParseAudit, error) error
 	RecordFailedSourceParse(context.Context, uuid.UUID, transactionstore.SourceParseAudit, error) error
-	LoadReconciliationInput(context.Context, uuid.UUID, uuid.UUID) (transactionstore.ReconciliationInput, error)
+	LoadReconciliationInput(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (transactionstore.ReconciliationInput, error)
 	PersistReconciliation(context.Context, uuid.UUID, transactionstore.ReconciliationResult) error
 }
 
@@ -40,6 +40,10 @@ type Handler struct {
 	CleanupAttachments interface {
 		Delete(context.Context, []attachmentstorage.ObjectRequest) error
 	}
+	// Engine and Scripts drive the optional Tengo pre/post-process stages. Both
+	// nil (or no active script) leaves the stages inert, preserving today's flow.
+	Engine  ScriptEngine
+	Scripts ScriptResolver
 }
 
 const (
@@ -127,6 +131,13 @@ func (h Handler) handleSourceParse(ctx context.Context, job jobs.Job) error {
 		// Retrying cannot help until the conflicting settings are changed.
 		return nil
 	}
+	// Pre-process runs after rule selection (which matches on the original
+	// content) and before the model call. It cleans the content the LLM sees;
+	// downstream sanitize/auto-eligibility use this same content.
+	preProcessedContent, preProcessNote := h.preprocessNormalizedContent(ctx, input)
+	input.NormalizedContent = preProcessedContent
+	audit.NormalizedInput = preProcessedContent
+	audit.PreProcess = preProcessNote
 	attachments, usage, err := h.loadParseAttachments(ctx, job.UserID, sourceID, input.Attachments)
 	if err != nil {
 		audit.AttachmentUsage = usage
@@ -149,48 +160,79 @@ func (h Handler) handleSourceParse(ctx context.Context, job jobs.Job) error {
 		}
 		return fmt.Errorf("parse source: %w", err)
 	}
-	parsed, err := reconciliation.DecodeParsedResponseForRuleApplication(modelResult.JSON)
-	if err == nil {
-		reconciliation.DiscardInvalidOptionalCategoryCitation(&parsed)
-		// Model citations can only point at source content; rule: paths are
-		// introduced below by trusted server code.
-		err = reconciliation.ValidateEvidenceEntries(parsed)
-	}
-	if err == nil {
-		// Ownership is a property of the leased server-side job, never a field
-		// requested from or accepted from the model response.
-		parsed.Candidate.UserID = job.UserID.String()
-		parsed.Candidate.Confidence = reconciliation.AggregateConfidence(parsed.Evidence)
-		if selection.HasGlobalRule {
-			err = applyDeterministicRule(&parsed.Candidate, &parsed.Evidence, selection.GlobalRule)
-		}
-		if err == nil {
-			parsed.Candidate.AccountEvidence = reconciliation.SanitizeAccountEvidenceForMatching(parsed.Candidate.AccountEvidence, input.NormalizedContent)
-			parsed.Candidate.AutoEligible = reconciliation.DeriveAutoEligibility(parsed.Candidate, input.NormalizedContent)
-			err = reconciliation.ValidateParsedResponseAfterRule(parsed)
-		}
-		parsed.Candidate.Confidence = reconciliation.AggregateConfidence(parsed.Evidence)
-		if err == nil {
-			err = reconciliation.ValidateCandidate(parsed.Candidate)
-		}
-		if err != nil {
-			err = fmt.Errorf("validate server-bound parsed candidate: %w", err)
-		}
-	}
-	if err != nil {
-		if recordErr := h.Repository.RecordInvalidSourceParse(ctx, job.UserID, audit, err); recordErr != nil {
+	batch, decErr := reconciliation.DecodeParsedResponsesForRuleApplication(modelResult.JSON)
+	if decErr != nil {
+		// A response whose shape cannot be decoded is a bad model result:
+		// terminal, no retry.
+		if recordErr := h.Repository.RecordInvalidSourceParse(ctx, job.UserID, audit, decErr); recordErr != nil {
 			return fmt.Errorf("record invalid parser result: %w", recordErr)
 		}
 		return nil
 	}
+	// One email may parse into several transactions. Harden each independently;
+	// drop invalid candidates but keep the valid ones (D2).
+	valid := make([]reconciliation.ParsedResponse, 0, len(batch))
+	invalidCount := 0
+	var firstInvalid error
+	for _, parsed := range batch {
+		hardened, postProcessNote, herr := h.hardenParsedCandidate(ctx, job.UserID, input.NormalizedContent, parsed)
+		if postProcessNote != "" {
+			audit.PostProcess = postProcessNote
+		}
+		if herr != nil {
+			invalidCount++
+			if firstInvalid == nil {
+				firstInvalid = herr
+			}
+			continue
+		}
+		valid = append(valid, hardened)
+	}
+	if len(valid) == 0 && invalidCount > 0 {
+		// Nothing usable parsed: terminal invalid.
+		if recordErr := h.Repository.RecordInvalidSourceParse(ctx, job.UserID, audit, firstInvalid); recordErr != nil {
+			return fmt.Errorf("record invalid parser result: %w", recordErr)
+		}
+		return nil
+	}
+	// An empty valid set with no invalids is a benign no-transaction result (D3):
+	// SaveParsedSource marks the source parsed with no candidates and no jobs.
 	if err := h.Repository.SaveParsedSource(ctx, job.UserID, transactionstore.ParsedSourceResult{
 		SourceParseAudit: audit, SyncRunID: job.SyncRunID,
-		ParsedResponse: parsed, ParsedCandidate: canonicalParsedJSON(parsed),
-		AutoEligible: parsed.Candidate.AutoEligible,
+		Candidates: valid, InvalidCount: invalidCount,
 	}); err != nil {
 		return fmt.Errorf("persist parsed source: %w", err)
 	}
 	return nil
+}
+
+// hardenParsedCandidate applies the full server-side hardening sequence to one
+// model candidate: evidence checks, ownership binding, the Tengo post-process
+// stage, account-evidence sanitization, auto-eligibility, and re-validation. It
+// returns the hardened response, the post-process audit note, and an error if
+// the candidate is invalid after hardening.
+func (h Handler) hardenParsedCandidate(ctx context.Context, userID uuid.UUID, normalizedContent string, parsed reconciliation.ParsedResponse) (reconciliation.ParsedResponse, string, error) {
+	reconciliation.DiscardInvalidOptionalCategoryCitation(&parsed)
+	if err := reconciliation.ValidateEvidenceEntries(parsed); err != nil {
+		return parsed, "", err
+	}
+	// Ownership is a property of the leased server-side job, never a field
+	// requested from or accepted from the model response.
+	parsed.Candidate.UserID = userID.String()
+	parsed.Candidate.Confidence = reconciliation.AggregateConfidence(parsed.Evidence)
+	// The Tengo post-process stage is the sole deterministic mutation step; it
+	// runs before the server re-asserts its invariants below.
+	parsed, postProcessNote := h.postprocessCandidate(ctx, parsed)
+	parsed.Candidate.AccountEvidence = reconciliation.SanitizeAccountEvidenceForMatching(parsed.Candidate.AccountEvidence, normalizedContent)
+	parsed.Candidate.AutoEligible = reconciliation.DeriveAutoEligibility(parsed.Candidate, normalizedContent)
+	if err := reconciliation.ValidateParsedResponseAfterRule(parsed); err != nil {
+		return parsed, postProcessNote, fmt.Errorf("validate server-bound parsed candidate: %w", err)
+	}
+	parsed.Candidate.Confidence = reconciliation.AggregateConfidence(parsed.Evidence)
+	if err := reconciliation.ValidateCandidate(parsed.Candidate); err != nil {
+		return parsed, postProcessNote, fmt.Errorf("validate server-bound parsed candidate: %w", err)
+	}
+	return parsed, postProcessNote, nil
 }
 
 func jsonObjectAudit(raw []byte, fallbackField string) json.RawMessage {
@@ -244,14 +286,6 @@ func (h Handler) loadParseAttachments(ctx context.Context, userID, _ uuid.UUID, 
 	return attachments, usage, nil
 }
 
-func canonicalParsedJSON(parsed reconciliation.ParsedResponse) json.RawMessage {
-	encoded, err := json.Marshal(parsed)
-	if err != nil {
-		return nil
-	}
-	return encoded
-}
-
 func ruleID(rule parserrules.AppliedRule, present bool) string {
 	if !present {
 		return ""
@@ -287,7 +321,11 @@ func (h Handler) handleReconciliation(ctx context.Context, job jobs.Job) error {
 	if err != nil {
 		return err
 	}
-	input, err := h.Repository.LoadReconciliationInput(ctx, job.UserID, sourceID)
+	candidateID, err := candidateIDFromPayload(job.Payload)
+	if err != nil {
+		return err
+	}
+	input, err := h.Repository.LoadReconciliationInput(ctx, job.UserID, sourceID, candidateID)
 	if err != nil {
 		return fmt.Errorf("load reconciliation input: %w", err)
 	}
@@ -296,7 +334,7 @@ func (h Handler) handleReconciliation(ctx context.Context, job jobs.Job) error {
 		return fmt.Errorf("reconcile source: %w", err)
 	}
 	if err := h.Repository.PersistReconciliation(ctx, job.UserID, transactionstore.ReconciliationResult{
-		SourceID: input.SourceID, SyncRunID: job.SyncRunID, Candidate: input.Candidate, Decision: decision,
+		SourceID: input.SourceID, CandidateID: input.CandidateID, SyncRunID: job.SyncRunID, Candidate: input.Candidate, Decision: decision,
 	}); err != nil {
 		return fmt.Errorf("persist reconciliation: %w", err)
 	}
@@ -313,6 +351,20 @@ func sourceIDFromPayload(payload []byte) (uuid.UUID, error) {
 	id, err := uuid.Parse(decoded.DataSourceID)
 	if err != nil {
 		return uuid.Nil, errors.New("transaction job has invalid data source ID")
+	}
+	return id, nil
+}
+
+func candidateIDFromPayload(payload []byte) (uuid.UUID, error) {
+	var decoded struct {
+		SourceCandidateID string `json:"source_candidate_id"`
+	}
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		return uuid.Nil, fmt.Errorf("decode transaction job payload: %w", err)
+	}
+	id, err := uuid.Parse(decoded.SourceCandidateID)
+	if err != nil {
+		return uuid.Nil, errors.New("reconciliation job has invalid source candidate ID")
 	}
 	return id, nil
 }

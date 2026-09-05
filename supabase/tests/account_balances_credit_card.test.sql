@@ -275,7 +275,7 @@ insert into private.source_parse_attempts (
   '92000000-0000-0000-0000-000000000033', 1
 );
 
-insert into private.bulk_import_candidates (
+insert into private.source_candidates (
   id, user_id, batch_id, document_id, data_source_id,
   source_parse_attempt_id, attempt_generation, output_ordinal,
   fingerprint, parsed_candidate, account_id

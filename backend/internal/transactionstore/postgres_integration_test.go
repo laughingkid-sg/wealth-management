@@ -375,6 +375,7 @@ func TestSourcePipelinePersistsJSONWithProductionQueryMode(t *testing.T) {
 	defer func() {
 		cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cleanupCancel()
+		_, _ = pool.Exec(cleanupContext, `delete from private.transaction_jobs where user_id = $1`, userID)
 		_, _ = pool.Exec(cleanupContext, `delete from auth.users where id = $1`, userID)
 	}()
 	if _, err = pool.Exec(ctx, `
@@ -400,8 +401,7 @@ func TestSourcePipelinePersistsJSONWithProductionQueryMode(t *testing.T) {
 	if err = store.SaveParsedSource(ctx, userID, ParsedSourceResult{
 		SourceParseAudit: SourceParseAudit{SourceID: sourceID, Model: "test-model", PromptComponents: json.RawMessage(`{}`)},
 		SyncRunID:        &runID,
-		ParsedResponse:   reconciliation.ParsedResponse{Candidate: reconciliation.Candidate{Confidence: 0.75}},
-		ParsedCandidate:  json.RawMessage(`{"candidate":{},"evidence":[]}`), AutoEligible: true,
+		Candidates:       []reconciliation.ParsedResponse{{Candidate: reconciliation.Candidate{Confidence: 0.75, AutoEligible: true}}},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -793,6 +793,7 @@ func TestConcurrentStaleCreateDecisionsProduceOneCanonicalTransaction(t *testing
 	defer func() {
 		cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cleanupCancel()
+		_, _ = pool.Exec(cleanupContext, `delete from private.transaction_jobs where user_id = $1`, userID)
 		_, _ = pool.Exec(cleanupContext, `delete from auth.users where id = $1`, userID)
 	}()
 	if _, err = pool.Exec(ctx, `
@@ -806,16 +807,6 @@ func TestConcurrentStaleCreateDecisionsProduceOneCanonicalTransaction(t *testing
 		values ($1, $2, 'card_last_four', '**** 2562', '2562')`, userID, accountID); err != nil {
 		t.Fatal(err)
 	}
-	for index, sourceID := range sourceIDs {
-		if _, err = pool.Exec(ctx, `
-			insert into private.data_sources (
-				id, user_id, source_type, provider, provider_message_id, received_at, raw_data, parse_status
-			) values ($1, $2, 'gmail_email', 'gmail', $3, now(), '{}', 'parsed')`,
-			sourceID, userID, fmt.Sprintf("concurrent-create-%d-%s", index, sourceID)); err != nil {
-			t.Fatal(err)
-		}
-	}
-
 	occurredAt := time.Now().UTC().Truncate(time.Second)
 	candidate := reconciliation.Candidate{
 		UserID:              userID.String(),
@@ -834,21 +825,40 @@ func TestConcurrentStaleCreateDecisionsProduceOneCanonicalTransaction(t *testing
 		Confidence:   0.95,
 		AutoEligible: true,
 	}
+	store := New(pool)
+	candidateIDs := make([]uuid.UUID, len(sourceIDs))
+	for index, sourceID := range sourceIDs {
+		if _, err = pool.Exec(ctx, `
+			insert into private.data_sources (
+				id, user_id, source_type, provider, provider_message_id, received_at, raw_data, parse_status
+			) values ($1, $2, 'gmail_email', 'gmail', $3, now(), '{}', 'pending')`,
+			sourceID, userID, fmt.Sprintf("concurrent-create-%d-%s", index, sourceID)); err != nil {
+			t.Fatal(err)
+		}
+		if err = store.SaveParsedSource(ctx, userID, ParsedSourceResult{
+			SourceParseAudit: SourceParseAudit{SourceID: sourceID, Model: "test-model", PromptComponents: json.RawMessage(`{}`)},
+			Candidates:       []reconciliation.ParsedResponse{{Candidate: candidate}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err = pool.QueryRow(ctx, `select id from private.source_candidates where data_source_id = $1 and user_id = $2`, sourceID, userID).Scan(&candidateIDs[index]); err != nil {
+			t.Fatal(err)
+		}
+	}
 	staleDecision := reconciliation.Decision{
 		Outcome:   reconciliation.OutcomeCreate,
 		AccountID: accountID.String(),
 		Reason:    "reliable unmatched candidate",
 	}
-	store := New(pool)
 	results := make(chan error, len(sourceIDs))
 	start := make(chan struct{})
-	for _, sourceID := range sourceIDs {
-		go func(id uuid.UUID) {
+	for index, sourceID := range sourceIDs {
+		go func(id, candidateID uuid.UUID) {
 			<-start
 			results <- store.PersistReconciliation(ctx, userID, ReconciliationResult{
-				SourceID: id, Candidate: candidate, Decision: staleDecision,
+				SourceID: id, CandidateID: candidateID, Candidate: candidate, Decision: staleDecision,
 			})
-		}(sourceID)
+		}(sourceID, candidateIDs[index])
 	}
 	close(start)
 	for range sourceIDs {
@@ -1104,5 +1114,279 @@ func TestCreateTransactionFromSourcePreservesCategoryAndRejectsUnavailableAccoun
 				t.Fatalf("category = %#v, want %s", transaction.CategoryID, *testCase.want)
 			}
 		})
+	}
+}
+
+// validSourceParsedResponse builds a fully-cited candidate the persisted-candidate
+// decoder and reconciliation will accept. A blank cardLastFour yields a candidate
+// with no account evidence (which reconciles to dangling).
+func validSourceParsedResponse(userID uuid.UUID, title string, amount int64, occurredAt time.Time, cardLastFour string) reconciliation.ParsedResponse {
+	candidate := reconciliation.Candidate{
+		UserID:              userID.String(),
+		Kind:                reconciliation.KindDebit,
+		Title:               title,
+		MerchantName:        "FairPrice",
+		OriginalAmountMinor: amount,
+		OriginalCurrency:    "SGD",
+		OccurredAt:          occurredAt,
+		References:          []string{},
+		AccountEvidence:     reconciliation.AccountEvidence{AdditionalIdentifiers: []string{}},
+		LineItems:           []reconciliation.LineItem{},
+		Confidence:          0.9,
+		AutoEligible:        true,
+	}
+	evidence := []reconciliation.FieldEvidence{
+		{Field: "transaction_kind", SourcePath: "text.kind", Confidence: 0.9},
+		{Field: "title", SourcePath: "subject", Confidence: 0.9},
+		{Field: "merchant_name", SourcePath: "text.merchant", Confidence: 0.9},
+		{Field: "original_amount_minor", SourcePath: "text.amount", Confidence: 0.9},
+		{Field: "original_currency", SourcePath: "text.currency", Confidence: 0.9},
+		{Field: "occurred_at", SourcePath: "received_at", Confidence: 0.9},
+	}
+	if cardLastFour != "" {
+		candidate.AccountEvidence.CardLastFour = cardLastFour
+		evidence = append(evidence, reconciliation.FieldEvidence{Field: "account_evidence", SourcePath: "text.card", Confidence: 0.9})
+	}
+	return reconciliation.ParsedResponse{Candidate: candidate, Evidence: evidence}
+}
+
+// TestOneEmailParsesIntoIndependentlyReconciledTransactions is the P3c core: one
+// source with two candidates reconciles independently — one creates a transaction
+// (matched account) and one dangles (no account) — and the source rollup reflects
+// the worst outcome.
+func TestOneEmailParsesIntoIndependentlyReconciledTransactions(t *testing.T) {
+	databaseURL := os.Getenv("TRANSACTIONSTORE_TEST_DB_URL")
+	if databaseURL == "" {
+		t.Skip("TRANSACTIONSTORE_TEST_DB_URL is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	pool, err := database.OpenTransactionPooler(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	userID, accountID, sourceID := uuid.New(), uuid.New(), uuid.New()
+	if _, err = pool.Exec(ctx, `insert into auth.users (id, email) values ($1, $2)`, userID, "multi-"+userID.String()+"@example.test"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		c, cc := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cc()
+		_, _ = pool.Exec(c, `delete from private.transaction_jobs where user_id = $1`, userID)
+		_, _ = pool.Exec(c, `delete from auth.users where id = $1`, userID)
+	})
+	if _, err = pool.Exec(ctx, `
+		insert into public.accounts (id, user_id, side, account_type, name, institution_name)
+		values ($1, $2, 'asset', 'bank_account', 'Card', 'Bank')`, accountID, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `
+		insert into private.account_matching_keys (user_id, account_id, key_type, display_value, normalized_value)
+		values ($1, $2, 'card_last_four', '**** 4321', '4321')`, userID, accountID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `
+		insert into private.data_sources (id, user_id, source_type, provider, provider_message_id, received_at, raw_data, parse_status)
+		values ($1, $2, 'gmail_email', 'gmail', $3, now(), '{}', 'pending')`, sourceID, userID, "multi-"+sourceID.String()); err != nil {
+		t.Fatal(err)
+	}
+
+	occurredAt := time.Now().UTC().Truncate(time.Second)
+	store := New(pool)
+	if err = store.SaveParsedSource(ctx, userID, ParsedSourceResult{
+		SourceParseAudit: SourceParseAudit{SourceID: sourceID, Model: "test-model", PromptComponents: json.RawMessage(`{}`)},
+		Candidates: []reconciliation.ParsedResponse{
+			validSourceParsedResponse(userID, "Matched charge", 500, occurredAt, "4321"),
+			validSourceParsedResponse(userID, "Unlinked charge", 900, occurredAt, ""),
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	type row struct {
+		id     uuid.UUID
+		status string
+	}
+	rows, err := pool.Query(ctx, `select id, status from private.source_candidates where data_source_id = $1 and user_id = $2 order by output_ordinal`, sourceID, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidates := make([]row, 0, 2)
+	for rows.Next() {
+		var r row
+		if err = rows.Scan(&r.id, &r.status); err != nil {
+			t.Fatal(err)
+		}
+		candidates = append(candidates, r)
+	}
+	rows.Close()
+	if len(candidates) != 2 {
+		t.Fatalf("expected 2 candidate rows, got %d", len(candidates))
+	}
+
+	// Reconcile each candidate as the worker would.
+	for _, candidate := range candidates {
+		input, loadErr := store.LoadReconciliationInput(ctx, userID, sourceID, candidate.id)
+		if loadErr != nil {
+			t.Fatalf("LoadReconciliationInput(%s): %v", candidate.id, loadErr)
+		}
+		decision, recErr := reconciliation.Reconcile(input.Candidate, input.Accounts, input.Transactions)
+		if recErr != nil {
+			t.Fatalf("Reconcile(%s): %v", candidate.id, recErr)
+		}
+		if persistErr := store.PersistReconciliation(ctx, userID, ReconciliationResult{
+			SourceID: sourceID, CandidateID: candidate.id, Candidate: input.Candidate, Decision: decision,
+		}); persistErr != nil {
+			t.Fatalf("PersistReconciliation(%s): %v", candidate.id, persistErr)
+		}
+	}
+
+	var created, dangling int
+	if err = pool.QueryRow(ctx, `select count(*) filter (where status = 'created'), count(*) filter (where status = 'dangling') from private.source_candidates where data_source_id = $1 and user_id = $2`, sourceID, userID).Scan(&created, &dangling); err != nil {
+		t.Fatal(err)
+	}
+	if created != 1 || dangling != 1 {
+		t.Fatalf("candidate statuses = created %d dangling %d, want 1/1", created, dangling)
+	}
+	var transactionCount int
+	if err = pool.QueryRow(ctx, `select count(*) from public.transactions where user_id = $1`, userID).Scan(&transactionCount); err != nil {
+		t.Fatal(err)
+	}
+	if transactionCount != 1 {
+		t.Fatalf("transactions = %d, want 1", transactionCount)
+	}
+	var parseStatus string
+	if err = pool.QueryRow(ctx, `select parse_status from private.data_sources where id = $1 and user_id = $2`, sourceID, userID).Scan(&parseStatus); err != nil {
+		t.Fatal(err)
+	}
+	if parseStatus != "dangling" {
+		t.Fatalf("source rollup parse_status = %q, want dangling", parseStatus)
+	}
+}
+
+// TestManualCandidateActionsResolveReviewAndDangling covers P5: a user manually
+// creating a transaction from one dangling candidate and attaching another to an
+// existing transaction, with the source rollup returning to parsed.
+func TestManualCandidateActionsResolveReviewAndDangling(t *testing.T) {
+	databaseURL := os.Getenv("TRANSACTIONSTORE_TEST_DB_URL")
+	if databaseURL == "" {
+		t.Skip("TRANSACTIONSTORE_TEST_DB_URL is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	pool, err := database.OpenTransactionPooler(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	userID, accountID, sourceID, existingTxnID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	if _, err = pool.Exec(ctx, `insert into auth.users (id, email) values ($1, $2)`, userID, "manual-"+userID.String()+"@example.test"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		c, cc := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cc()
+		_, _ = pool.Exec(c, `delete from private.transaction_jobs where user_id = $1`, userID)
+		_, _ = pool.Exec(c, `delete from auth.users where id = $1`, userID)
+	})
+	if _, err = pool.Exec(ctx, `
+		insert into public.accounts (id, user_id, side, account_type, name, institution_name)
+		values ($1, $2, 'asset', 'bank_account', 'Card', 'Bank')`, accountID, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `
+		insert into public.transactions (id, user_id, account_id, transaction_kind, title, original_amount_minor, original_currency, occurred_at, creation_method)
+		values ($1, $2, $3, 'debit', 'Existing', 900, 'SGD', now(), 'manual')`, existingTxnID, userID, accountID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `
+		insert into private.data_sources (id, user_id, source_type, provider, provider_message_id, received_at, raw_data, parse_status)
+		values ($1, $2, 'gmail_email', 'gmail', $3, now(), '{}', 'pending')`, sourceID, userID, "manual-"+sourceID.String()); err != nil {
+		t.Fatal(err)
+	}
+
+	occurredAt := time.Now().UTC().Truncate(time.Second)
+	store := New(pool)
+	if err = store.SaveParsedSource(ctx, userID, ParsedSourceResult{
+		SourceParseAudit: SourceParseAudit{SourceID: sourceID, Model: "test-model", PromptComponents: json.RawMessage(`{}`)},
+		Candidates: []reconciliation.ParsedResponse{
+			validSourceParsedResponse(userID, "To create", 500, occurredAt, ""),
+			validSourceParsedResponse(userID, "To attach", 900, occurredAt, ""),
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reconcile both to dangling (no account evidence).
+	rows, err := pool.Query(ctx, `select id from private.source_candidates where data_source_id = $1 and user_id = $2 order by output_ordinal`, sourceID, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidateIDs := make([]uuid.UUID, 0, 2)
+	for rows.Next() {
+		var id uuid.UUID
+		if err = rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		candidateIDs = append(candidateIDs, id)
+	}
+	rows.Close()
+	if len(candidateIDs) != 2 {
+		t.Fatalf("want 2 candidates, got %d", len(candidateIDs))
+	}
+	for _, id := range candidateIDs {
+		input, loadErr := store.LoadReconciliationInput(ctx, userID, sourceID, id)
+		if loadErr != nil {
+			t.Fatal(loadErr)
+		}
+		decision, recErr := reconciliation.Reconcile(input.Candidate, input.Accounts, input.Transactions)
+		if recErr != nil {
+			t.Fatal(recErr)
+		}
+		if decision.Outcome != reconciliation.OutcomeDangling {
+			t.Fatalf("expected dangling, got %s", decision.Outcome)
+		}
+		if perr := store.PersistReconciliation(ctx, userID, ReconciliationResult{SourceID: sourceID, CandidateID: id, Candidate: input.Candidate, Decision: decision}); perr != nil {
+			t.Fatal(perr)
+		}
+	}
+
+	summaries, err := store.ListSourceCandidates(ctx, userID, sourceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 2 || summaries[0].Status != "dangling" || summaries[0].Title != "To create" {
+		t.Fatalf("unexpected candidate summaries: %#v", summaries)
+	}
+
+	// Create a transaction from the first dangling candidate.
+	created, err := store.CreateTransactionFromSourceCandidate(ctx, userID, sourceID, candidateIDs[0], accountID)
+	if err != nil {
+		t.Fatalf("CreateTransactionFromSourceCandidate: %v", err)
+	}
+	if created.ID == uuid.Nil {
+		t.Fatal("expected a created transaction")
+	}
+	// Attach the second dangling candidate to the pre-existing transaction.
+	if _, err = store.AttachSourceCandidate(ctx, userID, sourceID, candidateIDs[1], existingTxnID); err != nil {
+		t.Fatalf("AttachSourceCandidate: %v", err)
+	}
+
+	var createdCount, attachedCount int
+	if err = pool.QueryRow(ctx, `select count(*) filter (where status='created'), count(*) filter (where status='attached') from private.source_candidates where data_source_id=$1 and user_id=$2`, sourceID, userID).Scan(&createdCount, &attachedCount); err != nil {
+		t.Fatal(err)
+	}
+	if createdCount != 1 || attachedCount != 1 {
+		t.Fatalf("statuses = created %d attached %d, want 1/1", createdCount, attachedCount)
+	}
+	var parseStatus string
+	if err = pool.QueryRow(ctx, `select parse_status from private.data_sources where id=$1 and user_id=$2`, sourceID, userID).Scan(&parseStatus); err != nil {
+		t.Fatal(err)
+	}
+	if parseStatus != "parsed" {
+		t.Fatalf("rollup parse_status = %q, want parsed", parseStatus)
 	}
 }
