@@ -22,6 +22,8 @@ import (
 	"github.com/zhengteck/wealth-builder/backend/internal/database"
 	"github.com/zhengteck/wealth-builder/backend/internal/gmailconnection"
 	"github.com/zhengteck/wealth-builder/backend/internal/providers"
+	"github.com/zhengteck/wealth-builder/backend/internal/scriptengine"
+	"github.com/zhengteck/wealth-builder/backend/internal/scriptstore"
 	"github.com/zhengteck/wealth-builder/backend/internal/secret"
 	"github.com/zhengteck/wealth-builder/backend/internal/transactions"
 	"github.com/zhengteck/wealth-builder/backend/internal/transactionstore"
@@ -63,7 +65,9 @@ func main() {
 	}
 	mux := http.NewServeMux()
 	mux.Handle("GET /healthz", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }))
-	transactions.NewHandler(store, cfg.Environment == "development" && cfg.GoogleTestRefreshToken != "", oauthFlow, cfg.FrontendOrigin, attachmentClient).Register(mux, verifier)
+	transactions.NewHandler(store, cfg.Environment == "development" && cfg.GoogleTestRefreshToken != "", oauthFlow, cfg.FrontendOrigin, attachmentClient).
+		WithScripts(scriptstore.New(pool), scriptengine.New(scriptengine.DefaultOptions())).
+		Register(mux, verifier)
 	balanceHandler := accountbalances.NewHandler(accountbalances.NewService(accountbalancestore.New(pool), nil))
 	creditCardHandler := creditcard.NewHandler(creditcard.NewService(creditcardstore.New(pool), nil))
 	bulkRepository := bulkstore.New(pool, store, store)
