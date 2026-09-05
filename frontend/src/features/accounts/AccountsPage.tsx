@@ -1,4 +1,4 @@
-import { lazy, Suspense, type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Session } from "@supabase/supabase-js";
 import {
   ArchiveRestore,
@@ -39,7 +39,10 @@ import {
 import {
   buildMetadata,
   metadataEntries,
+  normalizeTags,
   validateAccountDraft,
+  MAX_TAGS,
+  MAX_TAG_LENGTH,
   type AccountDraft,
   type MetadataEntry,
 } from "./validation";
@@ -98,6 +101,7 @@ const newDraft = (): AccountDraft => ({
   notes: "",
   sort_order: 0,
   metadataEntries: [],
+  tags: [],
 });
 
 function AccountForm({
@@ -120,9 +124,11 @@ function AccountForm({
           notes: account.notes ?? "",
           sort_order: account.sort_order,
           metadataEntries: metadataEntries(account.metadata),
+          tags: account.tags ?? [],
         }
       : newDraft(),
   );
+  const [tagInput, setTagInput] = useState("");
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [requestError, setRequestError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -147,6 +153,28 @@ function AccountForm({
         itemIndex === index ? { ...entry, [field]: value } : entry,
       ),
     }));
+  const addTag = (raw: string) => {
+    const trimmed = raw.trim();
+    if (!trimmed) return;
+    setDraft((current) => ({
+      ...current,
+      tags: normalizeTags([...current.tags, trimmed]),
+    }));
+    setTagInput("");
+  };
+  const removeTag = (tag: string) =>
+    setDraft((current) => ({
+      ...current,
+      tags: current.tags.filter((item) => item !== tag),
+    }));
+  const handleTagKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (event.key === "Enter" || event.key === ",") {
+      event.preventDefault();
+      addTag(tagInput);
+    } else if (event.key === "Backspace" && !tagInput && draft.tags.length) {
+      removeTag(draft.tags[draft.tags.length - 1]);
+    }
+  };
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (savingRef.current) return;
@@ -164,6 +192,7 @@ function AccountForm({
       account_identifier: draft.account_identifier.trim() || null,
       notes: draft.notes.trim() || null,
       metadata: buildMetadata(draft.metadataEntries),
+      tags: normalizeTags(draft.tags),
       sort_order: draft.sort_order,
     };
     let savedSuccessfully = false;
@@ -380,6 +409,51 @@ function AccountForm({
             >
               + Add metadata field
             </button>
+          </fieldset>
+          <fieldset className="tag-editor">
+            <legend>
+              Tags <span className="optional">Optional</span>
+            </legend>
+            <p>
+              Short labels shown directly on the account row. Press Enter or comma
+              to add.
+            </p>
+            {draft.tags.length > 0 && (
+              <ul className="tag-editor-list">
+                {draft.tags.map((tag) => (
+                  <li className="tag-chip" key={tag}>
+                    <span>{tag}</span>
+                    <button
+                      type="button"
+                      className="tag-chip-remove"
+                      onClick={() => removeTag(tag)}
+                      aria-label={`Remove tag ${tag}`}
+                    >
+                      <X size={14} />
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+            <div className="tag-editor-input">
+              <input
+                aria-label="Add a tag"
+                value={tagInput}
+                onChange={(event) => setTagInput(event.target.value)}
+                onKeyDown={handleTagKeyDown}
+                onBlur={() => addTag(tagInput)}
+                maxLength={MAX_TAG_LENGTH}
+                placeholder={
+                  draft.tags.length >= MAX_TAGS
+                    ? "Tag limit reached"
+                    : "e.g. savings, joint, emergency-fund"
+                }
+                disabled={draft.tags.length >= MAX_TAGS}
+              />
+            </div>
+            {errors.tags && (
+              <span className="field-error">{errors.tags}</span>
+            )}
           </fieldset>
           {requestError && (
             <p className="form-error" role="alert">
@@ -645,7 +719,8 @@ export function AccountsPage({
           return (
             (!query ||
               account.name.toLowerCase().includes(query) ||
-              account.institution_name.toLowerCase().includes(query)) &&
+              account.institution_name.toLowerCase().includes(query) ||
+              (account.tags ?? []).some((tag) => tag.toLowerCase().includes(query))) &&
             (side === "all" || account.side === side) &&
             (type === "all" || account.account_type === type) &&
             (!institution || account.institution_name === institution) &&
@@ -746,6 +821,15 @@ export function AccountsPage({
                       {accountTypeLabel(account.account_type)} ·{" "}
                       {account.institution_name}
                     </p>
+                    {account.tags && account.tags.length > 0 && (
+                      <ul className="account-tags" aria-label="Tags">
+                        {account.tags.map((tag) => (
+                          <li className="account-tag" key={tag}>
+                            {tag}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
                     {account.deleted_at && (
                       <span className="archived-label">Archived</span>
                     )}
