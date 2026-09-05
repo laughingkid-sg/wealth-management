@@ -10,10 +10,11 @@ import (
 
 // TransactionParserVersion changes whenever the immutable platform prompt's
 // meaning changes. Configurable source and user fragments are versioned by the
-// database instead.
-const TransactionParserVersion = 2
+// database instead. v3 returns a transactions array (one email may parse into
+// several transactions).
+const TransactionParserVersion = 3
 
-//go:embed transactions/system_v2.txt
+//go:embed transactions/system_v3.txt
 var transactionParserSystemPrompt string
 
 // TransactionParserSystem returns the build-embedded platform prompt without

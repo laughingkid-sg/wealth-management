@@ -112,8 +112,8 @@ func TestParserSystemPromptDefinesStrictNestedJSONContract(t *testing.T) {
 			t.Fatalf("parser prompt is missing strict contract clause %q", snippet)
 		}
 	}
-	if ParserPlatformPromptVersion != 2 {
-		t.Fatalf("platform prompt version = %d, want 2", ParserPlatformPromptVersion)
+	if ParserPlatformPromptVersion != 3 {
+		t.Fatalf("platform prompt version = %d, want 3", ParserPlatformPromptVersion)
 	}
 }
 
