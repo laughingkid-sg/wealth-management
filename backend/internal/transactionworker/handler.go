@@ -176,6 +176,11 @@ func (h Handler) handleSourceParse(ctx context.Context, job jobs.Job) error {
 			err = applyDeterministicRule(&parsed.Candidate, &parsed.Evidence, selection.GlobalRule)
 		}
 		if err == nil {
+			// Post-process runs after any deterministic rule and before the
+			// server re-asserts its invariants below.
+			var postProcessNote string
+			parsed, postProcessNote = h.postprocessCandidate(ctx, parsed)
+			audit.PostProcess = postProcessNote
 			parsed.Candidate.AccountEvidence = reconciliation.SanitizeAccountEvidenceForMatching(parsed.Candidate.AccountEvidence, input.NormalizedContent)
 			parsed.Candidate.AutoEligible = reconciliation.DeriveAutoEligibility(parsed.Candidate, input.NormalizedContent)
 			err = reconciliation.ValidateParsedResponseAfterRule(parsed)
