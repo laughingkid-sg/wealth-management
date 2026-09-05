@@ -291,14 +291,6 @@ func (h Handler) loadParseAttachments(ctx context.Context, userID, _ uuid.UUID, 
 	return attachments, usage, nil
 }
 
-func canonicalParsedJSON(parsed reconciliation.ParsedResponse) json.RawMessage {
-	encoded, err := json.Marshal(parsed)
-	if err != nil {
-		return nil
-	}
-	return encoded
-}
-
 func ruleID(rule parserrules.AppliedRule, present bool) string {
 	if !present {
 		return ""
