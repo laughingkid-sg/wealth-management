@@ -378,7 +378,7 @@ pages either redirect into the relevant stage or are removed once parity is reac
 - Prompt v3 assertions.
 - Full: `go build ./... && go vet ./... && go test ./...`; `npm run lint && npm run build`.
 
-## Implementation status (2026-09-05)
+## Implementation status (2026-09-06)
 
 Done + validated on branch `codex/transaction-parsing-revamp` (PR #22):
 - **P0–P4** backend: schema/rename + `script_definitions`, batch decode + `script:`
@@ -397,20 +397,34 @@ Done + validated on branch `codex/transaction-parsing-revamp` (PR #22):
 - **T1**: regex deterministic extraction retired — `applyDeterministicRule` +
   `ExtractionConfig`/`Values` removed, global-rule matching is sender/content-only, Tengo
   post-process is the sole deterministic path. Verified live.
+- **P8 (seed)**: global-default scripts `email_pre_process` (whitespace cleanup) and
+  `transaction_post_process` (trim / uppercase currency / title fallback) seeded and
+  activated (migration `20260906120000`). Validated through `scriptengine` (compile + run
+  + strict-decode) and confirmed loadable-as-active via `scriptstore` against the dev DB.
+- **FE polish**: dedicated `parsing-pipeline.css` styling the pipeline overview, scripts
+  manager, and candidate resolver on the app's design tokens; buttons aligned to the
+  canonical `button button-*` classes.
+- **T1 FE fix**: frontend stopped requiring the removed `extraction_config` on the
+  global-rule response (it had begun throwing a contract error on list). Field dropped
+  from the type, response parser, and read-only settings display.
 
-Remaining (need visual QA / follow-up):
+Remaining (need visual QA / a product decision / an environment this session lacks):
 - **P7 full-replace (T7)**: fold settings / global-settings / prompt-preview into the
-  pipeline view and retire those pages — best done with visual iteration.
-- **FE polish**: CSS for the new `scripts-*` / `candidate-*` / `pipeline-*` classes;
-  transfer-from-a-single-candidate flow.
+  pipeline view and retire those pages. **Deliberately not done autonomously** — the
+  earlier P7 question was answered "additive" (keep the existing pages), and this deletes
+  working, tested UI, so it needs the user's confirmation + visual iteration.
 - **Schema follow-up**: drop the now-dormant `source_parser_rules.extraction_config`
-  column and update the pgTAP suites that still assert it.
-- **P8**: seed initial pre/post scripts + end-to-end acceptance.
-- **P8**: seed initial scripts + enable + end-to-end acceptance.
-- **T1 cleanup**: remove `applyDeterministicRule`/`ExtractionConfig` + drop the
-  `extraction_config` column. Note this is a real refactor: `parserrules.applyOne`
-  currently *requires* `extraction_config` to match a global rule, so global-rule
-  matching must be reworked to match on sender/content alone before the column is dropped.
+  column and update the two pgTAP suites that still assert it
+  (`transactions_configuration.test.sql`, `transactions_operations.test.sql`, whose
+  fixtures + assertions exercise the retired regex extraction). **Blocked on pgTAP
+  verification in this environment**: `supabase test db --linked` fails with
+  `plan(integer) does not exist` (pgtap not on the connection search_path) and
+  `supabase start` (local runner) is disallowed by the project rules — so the column is
+  left dormant rather than dropped with an unverified suite rewrite.
+- **P8 acceptance**: full Gmail → parse → reconcile run with the seeded scripts active is
+  an operator action against live inbox data; the automatable seed + engine/store checks
+  are done above.
+- **Visual QA**: the new pages are auth-gated; sign-in can't be automated here.
 
 ## 11. Build order (phased; each phase validated before the next)
 
