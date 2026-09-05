@@ -18,6 +18,7 @@ import { buildPromptPreview, listScripts } from "./api";
 import { manualPromptPreviewInput } from "./promptPreviewModel";
 import type { ScriptSummary } from "./model";
 import type { WorkspacePage } from "../../workspace";
+import "./parsing-pipeline.css";
 
 const preKey = "email_pre_process";
 const postKey = "transaction_post_process";
@@ -83,7 +84,7 @@ export function ParsingPipelinePage({
             <Wand2 aria-hidden size={18} />
             <span className="pipeline-stage-title">1 · Pre-processing</span>
             <span className="muted">clean the email before the LLM</span>
-            <button type="button" className="secondary-button" onClick={() => onNavigate("transaction-scripts")}>Manage</button>
+            <button type="button" className="button button-secondary" onClick={() => onNavigate("transaction-scripts")}>Manage</button>
           </div>
           <p className="muted mono">{preKey} · {loading ? "…" : activeLabel(scripts, preKey)}</p>
         </li>
@@ -93,7 +94,7 @@ export function ParsingPipelinePage({
             <Globe2 aria-hidden size={18} />
             <span className="pipeline-stage-title">2 · Global prompt</span>
             <span className="muted">platform + global rule fragment</span>
-            <button type="button" className="secondary-button" onClick={() => onNavigate("transaction-global-settings")}>Edit</button>
+            <button type="button" className="button button-secondary" onClick={() => onNavigate("transaction-global-settings")}>Edit</button>
           </div>
           <p className="muted"><Lock aria-hidden size={13} /> Platform prompt is immutable; global rule guidance is editable.</p>
         </li>
@@ -103,7 +104,7 @@ export function ParsingPipelinePage({
             <User aria-hidden size={18} />
             <span className="pipeline-stage-title">3 · User prompt</span>
             <span className="muted">your default + rule fragment</span>
-            <button type="button" className="secondary-button" onClick={() => onNavigate("transaction-settings")}>Edit</button>
+            <button type="button" className="button button-secondary" onClick={() => onNavigate("transaction-settings")}>Edit</button>
           </div>
         </li>
 
@@ -129,7 +130,7 @@ export function ParsingPipelinePage({
             <SlidersHorizontal aria-hidden size={18} />
             <span className="pipeline-stage-title">5 · Post-processing</span>
             <span className="muted">fix each candidate after the LLM</span>
-            <button type="button" className="secondary-button" onClick={() => onNavigate("transaction-scripts")}>Manage</button>
+            <button type="button" className="button button-secondary" onClick={() => onNavigate("transaction-scripts")}>Manage</button>
           </div>
           <p className="muted mono">{postKey} · {loading ? "…" : activeLabel(scripts, postKey)}</p>
         </li>
@@ -157,7 +158,7 @@ export function ParsingPipelinePage({
         <div className="pipeline-stage-head">
           <Eye aria-hidden size={18} />
           <h2 id="pipeline-preview-title">Assembled preview</h2>
-          <button type="button" className="secondary-button" onClick={() => onNavigate("transaction-prompt-preview")}>Open full preview</button>
+          <button type="button" className="button button-secondary" onClick={() => onNavigate("transaction-prompt-preview")}>Open full preview</button>
         </div>
         {loading ? (
           <p className="muted">Loading assembled prompt…</p>

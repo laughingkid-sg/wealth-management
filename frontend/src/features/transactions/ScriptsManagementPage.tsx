@@ -12,6 +12,7 @@ import {
   type ScriptDryRunResult,
 } from "./api";
 import { formatDateTime, type ScriptSummary, type ScriptVersion } from "./model";
+import "./parsing-pipeline.css";
 
 const defaultKeys = ["email_pre_process", "transaction_post_process"] as const;
 
@@ -150,7 +151,7 @@ export function ScriptsManagementPage({ session }: { session: Session }) {
           </h1>
           <p>Operator Tengo scripts that clean the email before the LLM and transform each candidate after it. Changes take effect once activated.</p>
         </div>
-        <button type="button" className="secondary-button" onClick={() => void refreshSummaries()}>
+        <button type="button" className="button button-secondary" onClick={() => void refreshSummaries()}>
           <RefreshCw aria-hidden size={16} /> Refresh
         </button>
       </header>
@@ -197,7 +198,7 @@ export function ScriptsManagementPage({ session }: { session: Session }) {
             disabled={busy}
           />
           <div className="scripts-actions">
-            <button type="button" className="primary-button" onClick={() => void handleCreate()} disabled={busy || loading}>
+            <button type="button" className="button button-primary" onClick={() => void handleCreate()} disabled={busy || loading}>
               <Plus aria-hidden size={16} /> Save as new version
             </button>
           </div>
@@ -217,7 +218,7 @@ export function ScriptsManagementPage({ session }: { session: Session }) {
                   {version.is_active ? (
                     <span className="badge success"><Check aria-hidden size={14} /> active</span>
                   ) : (
-                    <button type="button" className="secondary-button" onClick={() => void handleActivate(version.version)} disabled={busy}>
+                    <button type="button" className="button button-secondary" onClick={() => void handleActivate(version.version)} disabled={busy}>
                       Activate
                     </button>
                   )}
@@ -243,7 +244,7 @@ export function ScriptsManagementPage({ session }: { session: Session }) {
             disabled={busy}
             spellCheck={false}
           />
-          <button type="button" className="secondary-button" onClick={() => void handleDryRun()} disabled={busy}>
+          <button type="button" className="button button-secondary" onClick={() => void handleDryRun()} disabled={busy}>
             <Play aria-hidden size={16} /> Run
           </button>
           {dryRunResult && (

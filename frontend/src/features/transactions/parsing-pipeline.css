@@ -1,0 +1,337 @@
+/* Styles for the parsing-pipeline surfaces: the pipeline overview, the parser
+   scripts manager, and the per-source candidate resolver. Reuses the app's
+   design tokens and shared primitives (page-header, button-*, nav-item,
+   prompt-output, empty-state, form-error) so these pages match the rest of the
+   workspace. */
+
+/* Small shared primitives these pages introduce. */
+.mono {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.82rem;
+}
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: #fff;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+.badge.success {
+  border-color: #bfe3c6;
+  background: #eef8f0;
+  color: #1f7a3d;
+}
+.form-notice {
+  margin: 0;
+  padding: 10px 14px;
+  border-radius: 10px;
+  border: 1px solid #bfe3c6;
+  background: #eef8f0;
+  color: #1f7a3d;
+  font-weight: 600;
+}
+.segmented {
+  display: inline-flex;
+  padding: 3px;
+  gap: 3px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #f2f0ec;
+  width: fit-content;
+}
+.segmented button {
+  border: none;
+  background: transparent;
+  border-radius: 7px;
+  padding: 6px 14px;
+  font: inherit;
+  font-weight: 700;
+  color: var(--muted);
+  cursor: pointer;
+}
+.segmented button.active {
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: var(--shadow);
+}
+
+/* Pipeline overview page. */
+.pipeline-page {
+  display: grid;
+  gap: 22px;
+  max-width: 900px;
+}
+.pipeline-stages {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 12px;
+}
+.pipeline-stage {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--border-strong);
+  border-radius: 12px;
+  background: var(--surface);
+  padding: 14px 18px;
+  box-shadow: var(--shadow);
+}
+.pipeline-stage.editable {
+  border-left-color: var(--brand);
+}
+.pipeline-stage.readonly {
+  background: #faf9f7;
+  border-left-color: var(--border-strong);
+}
+.pipeline-stage-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.pipeline-stage-head svg {
+  color: var(--brand-deep);
+  flex: none;
+}
+.pipeline-stage-title {
+  font-weight: 750;
+  color: var(--ink);
+  letter-spacing: -0.01em;
+}
+.pipeline-stage-head .button,
+.pipeline-stage-head .badge {
+  margin-left: auto;
+}
+.pipeline-stage p {
+  margin: 8px 0 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.pipeline-preview {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  padding: 18px;
+  box-shadow: var(--shadow);
+  display: grid;
+  gap: 12px;
+}
+.pipeline-preview .pipeline-stage-head h2 {
+  margin: 0;
+  font-size: 1.05rem;
+}
+
+/* Parser scripts manager. */
+.scripts-page {
+  display: grid;
+  gap: 20px;
+}
+.scripts-layout {
+  display: grid;
+  grid-template-columns: minmax(200px, 240px) minmax(0, 1fr) minmax(240px, 320px);
+  gap: 20px;
+  align-items: start;
+}
+.scripts-keys {
+  display: grid;
+  gap: 8px;
+}
+.scripts-keys .nav-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  text-align: left;
+}
+.scripts-editor,
+.scripts-dryrun {
+  display: grid;
+  gap: 10px;
+  align-content: start;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  padding: 18px;
+  box-shadow: var(--shadow);
+}
+.scripts-editor label,
+.scripts-dryrun label {
+  font-weight: 700;
+  color: var(--ink);
+  font-size: 0.85rem;
+}
+.scripts-editor textarea,
+.scripts-dryrun textarea,
+.scripts-editor input {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid var(--border-strong);
+  border-radius: 9px;
+  padding: 10px 12px;
+  background: #fdfcfb;
+  resize: vertical;
+}
+.scripts-editor h2,
+.scripts-dryrun h2 {
+  margin: 8px 0 0;
+  font-size: 1rem;
+  letter-spacing: -0.02em;
+}
+.scripts-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+.scripts-versions {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+.scripts-versions li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: #fdfcfb;
+}
+.scripts-versions li > span:first-child {
+  font-weight: 750;
+}
+.scripts-versions li .button,
+.scripts-versions li .badge {
+  margin-left: auto;
+}
+.dryrun-output {
+  overflow: auto;
+  max-height: 320px;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: #f7f6f4;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.dryrun-output.error {
+  border-color: #e6b4ac;
+  background: #fbf0ee;
+  color: #a2321f;
+}
+
+@media (max-width: 960px) {
+  .scripts-layout {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Per-source candidate resolver (rendered inside the source inspector). */
+.candidate-resolver {
+  display: grid;
+  gap: 12px;
+}
+.candidate-resolver-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.candidate-resolver-header h3 {
+  margin: 0;
+  font-size: 0.98rem;
+  letter-spacing: -0.02em;
+}
+.candidate-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 12px;
+}
+.candidate-row {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  padding: 14px 16px;
+  display: grid;
+  gap: 10px;
+  box-shadow: var(--shadow);
+}
+.candidate-summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.candidate-title {
+  font-weight: 750;
+  color: var(--ink);
+}
+.candidate-summary .badge {
+  margin-left: auto;
+}
+.candidate-actions {
+  display: grid;
+  gap: 10px;
+}
+.candidate-create {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.candidate-create select {
+  flex: 1 1 220px;
+  border: 1px solid var(--border-strong);
+  border-radius: 9px;
+  padding: 9px 12px;
+  background: #fff;
+}
+.candidate-attach {
+  display: grid;
+  gap: 10px;
+}
+.candidate-search {
+  display: flex;
+  gap: 8px;
+}
+.candidate-search input {
+  flex: 1;
+  border: 1px solid var(--border-strong);
+  border-radius: 9px;
+  padding: 9px 12px;
+}
+.candidate-matches {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+.candidate-matches li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: #fdfcfb;
+}
+.candidate-matches li .button {
+  margin-left: auto;
+}

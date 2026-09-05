@@ -17,6 +17,7 @@ import {
   type SourceSummary,
   type TransactionListItem,
 } from "./model";
+import "./parsing-pipeline.css";
 
 function candidateResolved(status: string): boolean {
   return status === "created" || status === "attached";
@@ -144,7 +145,7 @@ function CandidateRow({
                   </option>
                 ))}
               </select>
-              <button type="button" className="primary-button" onClick={() => void handleCreate()} disabled={submitting}>
+              <button type="button" className="button button-primary" onClick={() => void handleCreate()} disabled={submitting}>
                 <Plus aria-hidden size={16} /> Create transaction
               </button>
             </div>
@@ -158,7 +159,7 @@ function CandidateRow({
                   onChange={(event) => setSearch(event.target.value)}
                   disabled={submitting}
                 />
-                <button type="button" className="secondary-button" onClick={() => void handleSearch()} disabled={searching || submitting}>
+                <button type="button" className="button button-secondary" onClick={() => void handleSearch()} disabled={searching || submitting}>
                   Search
                 </button>
               </div>
@@ -168,7 +169,7 @@ function CandidateRow({
                     <li key={match.id}>
                       <span>{match.title}</span>
                       <span className="muted">{formatAmount(match.original_amount_minor, match.original_currency)} · {formatDateTime(match.occurred_at)}</span>
-                      <button type="button" className="secondary-button" onClick={() => void handleAttach(match.id)} disabled={submitting}>
+                      <button type="button" className="button button-secondary" onClick={() => void handleAttach(match.id)} disabled={submitting}>
                         <Link2 aria-hidden size={14} /> Attach
                       </button>
                     </li>
@@ -252,7 +253,7 @@ export function SourceCandidateResolver({
     <div className="candidate-resolver">
       <div className="candidate-resolver-header">
         <h3>{candidates.length} candidate{candidates.length === 1 ? "" : "s"} · {pending} unresolved</h3>
-        <button type="button" className="secondary-button" onClick={() => setReload((value) => value + 1)}>
+        <button type="button" className="button button-secondary" onClick={() => setReload((value) => value + 1)}>
           <RefreshCw aria-hidden size={16} /> Refresh
         </button>
       </div>
