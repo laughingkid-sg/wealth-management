@@ -40,6 +40,10 @@ type Handler struct {
 	CleanupAttachments interface {
 		Delete(context.Context, []attachmentstorage.ObjectRequest) error
 	}
+	// Engine and Scripts drive the optional Tengo pre/post-process stages. Both
+	// nil (or no active script) leaves the stages inert, preserving today's flow.
+	Engine  ScriptEngine
+	Scripts ScriptResolver
 }
 
 const (
@@ -127,6 +131,13 @@ func (h Handler) handleSourceParse(ctx context.Context, job jobs.Job) error {
 		// Retrying cannot help until the conflicting settings are changed.
 		return nil
 	}
+	// Pre-process runs after rule selection (which matches on the original
+	// content) and before the model call. It cleans the content the LLM sees;
+	// downstream sanitize/auto-eligibility use this same content.
+	preProcessedContent, preProcessNote := h.preprocessNormalizedContent(ctx, input)
+	input.NormalizedContent = preProcessedContent
+	audit.NormalizedInput = preProcessedContent
+	audit.PreProcess = preProcessNote
 	attachments, usage, err := h.loadParseAttachments(ctx, job.UserID, sourceID, input.Attachments)
 	if err != nil {
 		audit.AttachmentUsage = usage

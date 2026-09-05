@@ -88,6 +88,10 @@ type SourceParseAudit struct {
 	UserRuleID            string
 	UserRuleVersion       int
 	AttachmentUsage       []AttachmentUsage
+	// PreProcess records the pre-process outcome: "" (inert / no script),
+	// "<key>:v<n>" (applied), or "fallback:<reason>" (script failed, original
+	// content used).
+	PreProcess string
 }
 
 type ReconciliationResult struct {
@@ -268,6 +272,7 @@ func (s *Store) SaveParsedSource(ctx context.Context, userID uuid.UUID, result P
 		"parser_rule_version": result.RuleVersion, "user_parser_rule_id": result.UserRuleID,
 		"user_parser_rule_version": result.UserRuleVersion,
 		"attachment_usage":         result.AttachmentUsage, "auto_eligible": result.AutoEligible,
+		"pre_process": result.PreProcess,
 	})
 	if err != nil {
 		return err
@@ -359,6 +364,7 @@ func (s *Store) recordSourceParseError(ctx context.Context, userID uuid.UUID, au
 		"parser_rule_version": audit.RuleVersion, "user_parser_rule_id": audit.UserRuleID,
 		"user_parser_rule_version": audit.UserRuleVersion,
 		"attachment_usage":         audit.AttachmentUsage,
+		"pre_process":              audit.PreProcess,
 	})
 	if err != nil {
 		return err
