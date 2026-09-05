@@ -712,11 +712,11 @@ func markTerminalJobFailure(ctx context.Context, tx pgx.Tx, job expiredJob) erro
 	}
 	if job.BatchID != nil && job.DocumentID != nil && job.Generation != nil {
 		if job.CandidateID != nil {
-			if _, err := tx.Exec(ctx, `update private.bulk_import_candidates set status='failed',error_summary='Worker failed after all retry attempts.' where id=$1 and user_id=$2 and attempt_generation=$3 and status='pending_reconciliation'`, *job.CandidateID, job.UserID, *job.Generation); err != nil {
+			if _, err := tx.Exec(ctx, `update private.source_candidates set status='failed',error_summary='Worker failed after all retry attempts.' where id=$1 and user_id=$2 and attempt_generation=$3 and status='pending_reconciliation'`, *job.CandidateID, job.UserID, *job.Generation); err != nil {
 				return err
 			}
 			var remaining int
-			if err := tx.QueryRow(ctx, `select count(*) from private.bulk_import_candidates where document_id=$1 and user_id=$2 and attempt_generation=$3 and status='pending_reconciliation'`, *job.DocumentID, job.UserID, *job.Generation).Scan(&remaining); err != nil {
+			if err := tx.QueryRow(ctx, `select count(*) from private.source_candidates where document_id=$1 and user_id=$2 and attempt_generation=$3 and status='pending_reconciliation'`, *job.DocumentID, job.UserID, *job.Generation).Scan(&remaining); err != nil {
 				return err
 			}
 			if remaining == 0 && job.SourceID != nil {
@@ -755,7 +755,7 @@ func isBulkJobKind(kind jobs.Kind) bool {
 const cancelDrainedBulkDocumentsSQL = `update private.bulk_import_documents d set status='cancelled',completed_at=coalesce(d.completed_at,now()),error_summary=null from public.bulk_import_batches b where d.batch_id=b.id and d.user_id=b.user_id and b.id=$2 and b.user_id=$1 and b.status='cancelling' and d.status not in ('completed','completed_with_errors','failed','cancelled') and not exists(select 1 from private.transaction_jobs j where j.bulk_import_document_id=d.id and j.user_id=d.user_id and j.status in ('queued','running'))`
 
 func refreshBulkBatchProgress(ctx context.Context, tx pgx.Tx, userID, batchID uuid.UUID) error {
-	if _, err := tx.Exec(ctx, `update private.bulk_import_candidates c set status='cancelled',reconciliation_reason='Bulk Import was cancelled.' from private.bulk_import_documents d join public.bulk_import_batches b on b.id=d.batch_id and b.user_id=d.user_id where c.document_id=d.id and c.user_id=d.user_id and b.id=$2 and b.user_id=$1 and b.status='cancelling' and c.status='pending_reconciliation' and not exists(select 1 from private.transaction_jobs j where j.bulk_import_candidate_id=c.id and j.user_id=c.user_id and j.status in ('queued','running'))`, userID, batchID); err != nil {
+	if _, err := tx.Exec(ctx, `update private.source_candidates c set status='cancelled',reconciliation_reason='Bulk Import was cancelled.' from private.bulk_import_documents d join public.bulk_import_batches b on b.id=d.batch_id and b.user_id=d.user_id where c.document_id=d.id and c.user_id=d.user_id and b.id=$2 and b.user_id=$1 and b.status='cancelling' and c.status='pending_reconciliation' and not exists(select 1 from private.transaction_jobs j where j.bulk_import_candidate_id=c.id and j.user_id=c.user_id and j.status in ('queued','running'))`, userID, batchID); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx, cancelDrainedBulkDocumentsSQL, userID, batchID); err != nil {

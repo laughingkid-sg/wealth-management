@@ -102,7 +102,7 @@ func (t *transaction) ProjectBillFromBulk(ctx context.Context, userID, documentI
 		return creditcard.BulkProjectionResult{}, err
 	}
 	var failedCandidates, failedChunks int
-	if err = t.tx.QueryRow(ctx, `select (select count(*)::int from private.bulk_import_candidates where user_id=$1 and document_id=$2 and attempt_generation=$3 and status='failed'),(select count(*)::int from private.bulk_import_chunks where user_id=$1 and document_id=$2 and attempt_generation=$3 and status='failed')`, userID, documentID, attemptGeneration).Scan(&failedCandidates, &failedChunks); err != nil {
+	if err = t.tx.QueryRow(ctx, `select (select count(*)::int from private.source_candidates where user_id=$1 and document_id=$2 and attempt_generation=$3 and status='failed'),(select count(*)::int from private.bulk_import_chunks where user_id=$1 and document_id=$2 and attempt_generation=$3 and status='failed')`, userID, documentID, attemptGeneration).Scan(&failedCandidates, &failedChunks); err != nil {
 		return creditcard.BulkProjectionResult{}, err
 	}
 	unresolvedCandidateCount := unresolvedBulkCount(failedCandidates, failedChunks)
@@ -138,7 +138,7 @@ func unresolvedBulkCount(failedCandidates, failedChunks int) int {
 func (t *transaction) projectLines(ctx context.Context, userID, billID, documentID uuid.UUID, generation int) (bool, error) {
 	rows, err := t.tx.Query(ctx, `
 		select id, fingerprint, parsed_candidate, status, transaction_id
-		from private.bulk_import_candidates
+		from private.source_candidates
 		where user_id = $1 and document_id = $2 and attempt_generation = $3
 		order by output_ordinal
 		for update`, userID, documentID, generation)

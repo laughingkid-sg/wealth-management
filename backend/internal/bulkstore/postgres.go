@@ -608,7 +608,7 @@ func (s *Store) ResolveCandidate(ctx context.Context, userID, candidateID uuid.U
 		return bulkimport.Candidate{}, errors.New("bulk candidate actions are not configured")
 	}
 	var kind bulkimport.DocumentType
-	err := s.pool.QueryRow(ctx, `select b.document_type_snapshot from private.bulk_import_candidates c join public.bulk_import_batches b on b.id=c.batch_id and b.user_id=c.user_id where c.id=$1 and c.user_id=$2`, candidateID, userID).Scan(&kind)
+	err := s.pool.QueryRow(ctx, `select b.document_type_snapshot from private.source_candidates c join public.bulk_import_batches b on b.id=c.batch_id and b.user_id=c.user_id where c.id=$1 and c.user_id=$2`, candidateID, userID).Scan(&kind)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return bulkimport.Candidate{}, bulkimport.ErrNotFound
 	}
@@ -622,7 +622,7 @@ func (s *Store) ResolveCandidate(ctx context.Context, userID, candidateID uuid.U
 }
 
 func (s *Store) ListCandidates(ctx context.Context, userID, batchID uuid.UUID) ([]bulkimport.Candidate, error) {
-	rows, err := s.pool.Query(ctx, `select id,batch_id,document_id,attempt_generation,output_ordinal,encode(fingerprint,'hex'),parsed_candidate,account_id,status,transaction_id,duplicate_of_candidate_id,reconciliation_reason from private.bulk_import_candidates where batch_id=$1 and user_id=$2 order by document_id,attempt_generation desc,output_ordinal`, batchID, userID)
+	rows, err := s.pool.Query(ctx, `select id,batch_id,document_id,attempt_generation,output_ordinal,encode(fingerprint,'hex'),parsed_candidate,account_id,status,transaction_id,duplicate_of_candidate_id,reconciliation_reason from private.source_candidates where batch_id=$1 and user_id=$2 order by document_id,attempt_generation desc,output_ordinal`, batchID, userID)
 	if err != nil {
 		return nil, err
 	}

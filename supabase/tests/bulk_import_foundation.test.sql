@@ -11,7 +11,7 @@ select has_table('private', 'bulk_import_batch_accounts', 'immutable batch Accou
 select has_table('private', 'bulk_import_documents', 'logical bulk documents exist');
 select has_table('private', 'bulk_import_files', 'signed-upload reservations exist');
 select has_table('private', 'bulk_import_chunks', 'bounded parse chunks exist');
-select has_table('private', 'bulk_import_candidates', 'multi-transaction candidates exist');
+select has_table('private', 'source_candidates', 'multi-transaction candidates exist');
 
 select has_column('public', 'transactions', 'time_precision', 'canonical transactions record exact or date-only precision');
 select has_column('private', 'transaction_jobs', 'attempt_generation', 'bulk jobs use a typed generation');
@@ -32,7 +32,7 @@ select ok(
       ('private', 'bulk_import_documents'),
       ('private', 'bulk_import_files'),
       ('private', 'bulk_import_chunks'),
-      ('private', 'bulk_import_candidates')
+      ('private', 'source_candidates')
     )
   ),
   'RLS is enabled on every new Bulk Import table'
@@ -49,7 +49,7 @@ select ok(
       ('private.bulk_import_documents'::regclass),
       ('private.bulk_import_files'::regclass),
       ('private.bulk_import_chunks'::regclass),
-      ('private.bulk_import_candidates'::regclass)
+      ('private.source_candidates'::regclass)
     ) as relation(name)
     cross join (values ('anon'), ('authenticated')) as role_name(name)
     where has_table_privilege(role_name.name, relation.name, 'SELECT')
@@ -81,7 +81,7 @@ select ok(
 select ok(
   exists (
     select 1 from pg_indexes
-    where schemaname = 'private' and tablename = 'bulk_import_candidates'
+    where schemaname = 'private' and tablename = 'source_candidates'
       and indexname = 'bulk_candidates_document_output_key'
   ),
   'candidate output ordinal is idempotent per document generation'

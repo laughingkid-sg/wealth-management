@@ -163,7 +163,7 @@ func (s *Store) ResolveBulkCandidate(ctx context.Context, userID, candidateID uu
 			return bulkimport.Candidate{}, bulkimport.ErrInvalid
 		}
 		row.AccountID = *resolution.AccountID
-		if _, err = tx.Exec(ctx, `update private.bulk_import_candidates set account_id=$3,status='pending_reconciliation',reconciliation_reason=null where id=$1 and user_id=$2`, row.ID, userID, row.AccountID); err != nil {
+		if _, err = tx.Exec(ctx, `update private.source_candidates set account_id=$3,status='pending_reconciliation',reconciliation_reason=null where id=$1 and user_id=$2`, row.ID, userID, row.AccountID); err != nil {
 			return bulkimport.Candidate{}, err
 		}
 		if err = enqueueBulkCandidateJob(ctx, tx, row); err != nil {
@@ -246,7 +246,7 @@ type bulkCandidateRow struct {
 
 func loadBulkCandidateForUpdate(ctx context.Context, tx pgx.Tx, userID, candidateID uuid.UUID, generation int) (bulkCandidateRow, persistedBulkCandidate, error) {
 	var row bulkCandidateRow
-	err := tx.QueryRow(ctx, `select c.id,c.batch_id,c.document_id,c.data_source_id,c.account_id,c.attempt_generation,c.status,b.document_type_snapshot,c.parsed_candidate from private.bulk_import_candidates c join public.bulk_import_batches b on b.id=c.batch_id and b.user_id=c.user_id where c.id=$1 and c.user_id=$2 and c.attempt_generation=$3 for update of c`, candidateID, userID, generation).Scan(&row.ID, &row.BatchID, &row.DocumentID, &row.SourceID, &row.AccountID, &row.Generation, &row.Status, &row.DocumentType, &row.Raw)
+	err := tx.QueryRow(ctx, `select c.id,c.batch_id,c.document_id,c.data_source_id,c.account_id,c.attempt_generation,c.status,b.document_type_snapshot,c.parsed_candidate from private.source_candidates c join public.bulk_import_batches b on b.id=c.batch_id and b.user_id=c.user_id where c.id=$1 and c.user_id=$2 and c.attempt_generation=$3 for update of c`, candidateID, userID, generation).Scan(&row.ID, &row.BatchID, &row.DocumentID, &row.SourceID, &row.AccountID, &row.Generation, &row.Status, &row.DocumentType, &row.Raw)
 	if err != nil {
 		return row, persistedBulkCandidate{}, err
 	}
@@ -311,7 +311,7 @@ func insertBulkTransactionWithKind(ctx context.Context, tx pgx.Tx, row bulkCandi
 
 func rowSourceUser(ctx context.Context, tx pgx.Tx, row bulkCandidateRow) uuid.UUID {
 	var userID uuid.UUID
-	_ = tx.QueryRow(ctx, `select user_id from private.bulk_import_candidates where id=$1`, row.ID).Scan(&userID)
+	_ = tx.QueryRow(ctx, `select user_id from private.source_candidates where id=$1`, row.ID).Scan(&userID)
 	return userID
 }
 
@@ -342,18 +342,18 @@ func finishBulkCandidate(ctx context.Context, tx pgx.Tx, row bulkCandidateRow, s
 
 func updateBulkCandidateOutcome(ctx context.Context, tx pgx.Tx, row bulkCandidateRow, status bulkimport.CandidateStatus, transactionID *uuid.UUID, reason string) error {
 	userID := rowSourceUser(ctx, tx, row)
-	_, err := tx.Exec(ctx, `update private.bulk_import_candidates set status=$3,transaction_id=$4,reconciliation_reason=$5,error_summary=null where id=$1 and user_id=$2`, row.ID, userID, status, transactionID, boundedBulkReason(reason))
+	_, err := tx.Exec(ctx, `update private.source_candidates set status=$3,transaction_id=$4,reconciliation_reason=$5,error_summary=null where id=$1 and user_id=$2`, row.ID, userID, status, transactionID, boundedBulkReason(reason))
 	if err != nil {
 		return err
 	}
-	_, err = tx.Exec(ctx, `update private.bulk_import_documents d set created_count=p.created,attached_count=p.attached,review_count=p.review,failed_count=p.failed+(select count(*)::int from private.bulk_import_chunks where document_id=$1 and user_id=$2 and attempt_generation=$3 and status='failed'),duplicate_count=p.duplicates from (select count(*) filter(where status='created')::int created,count(*) filter(where status='attached')::int attached,count(*) filter(where status='review_required')::int review,count(*) filter(where status='failed')::int failed,count(*) filter(where status='duplicate')::int duplicates from private.bulk_import_candidates where document_id=$1 and user_id=$2 and attempt_generation=$3) p where d.id=$1 and d.user_id=$2`, row.DocumentID, userID, row.Generation)
+	_, err = tx.Exec(ctx, `update private.bulk_import_documents d set created_count=p.created,attached_count=p.attached,review_count=p.review,failed_count=p.failed+(select count(*)::int from private.bulk_import_chunks where document_id=$1 and user_id=$2 and attempt_generation=$3 and status='failed'),duplicate_count=p.duplicates from (select count(*) filter(where status='created')::int created,count(*) filter(where status='attached')::int attached,count(*) filter(where status='review_required')::int review,count(*) filter(where status='failed')::int failed,count(*) filter(where status='duplicate')::int duplicates from private.source_candidates where document_id=$1 and user_id=$2 and attempt_generation=$3) p where d.id=$1 and d.user_id=$2`, row.DocumentID, userID, row.Generation)
 	return err
 }
 
 func enqueuePostProcessIfReady(ctx context.Context, tx pgx.Tx, row bulkCandidateRow) error {
 	userID := rowSourceUser(ctx, tx, row)
 	var remaining int
-	if err := tx.QueryRow(ctx, `select count(*) from private.bulk_import_candidates where document_id=$1 and user_id=$2 and attempt_generation=$3 and status='pending_reconciliation'`, row.DocumentID, userID, row.Generation).Scan(&remaining); err != nil || remaining != 0 {
+	if err := tx.QueryRow(ctx, `select count(*) from private.source_candidates where document_id=$1 and user_id=$2 and attempt_generation=$3 and status='pending_reconciliation'`, row.DocumentID, userID, row.Generation).Scan(&remaining); err != nil || remaining != 0 {
 		return err
 	}
 	_, err := tx.Exec(ctx, `insert into private.transaction_jobs(user_id,data_source_id,job_type,bulk_import_batch_id,bulk_import_document_id,attempt_generation,payload) values($1,$2,$3,$4,$5,$6,'{}') on conflict do nothing`, userID, row.SourceID, string(jobs.KindBulkDocumentPostProcess), row.BatchID, row.DocumentID, row.Generation)
@@ -384,7 +384,7 @@ func validateActiveAccounts(ctx context.Context, tx pgx.Tx, userID uuid.UUID, ac
 func (s *Store) loadBulkCandidate(ctx context.Context, userID, candidateID uuid.UUID) (bulkimport.Candidate, error) {
 	var item bulkimport.Candidate
 	var fingerprint []byte
-	err := s.pool.QueryRow(ctx, `select id,batch_id,document_id,attempt_generation,output_ordinal,fingerprint,parsed_candidate,account_id,status,transaction_id,duplicate_of_candidate_id,reconciliation_reason from private.bulk_import_candidates where id=$1 and user_id=$2`, candidateID, userID).Scan(&item.ID, &item.BatchID, &item.DocumentID, &item.AttemptGeneration, &item.Ordinal, &fingerprint, &item.ParsedCandidate, &item.AccountID, &item.Status, &item.TransactionID, &item.DuplicateOfID, &item.Reason)
+	err := s.pool.QueryRow(ctx, `select id,batch_id,document_id,attempt_generation,output_ordinal,fingerprint,parsed_candidate,account_id,status,transaction_id,duplicate_of_candidate_id,reconciliation_reason from private.source_candidates where id=$1 and user_id=$2`, candidateID, userID).Scan(&item.ID, &item.BatchID, &item.DocumentID, &item.AttemptGeneration, &item.Ordinal, &fingerprint, &item.ParsedCandidate, &item.AccountID, &item.Status, &item.TransactionID, &item.DuplicateOfID, &item.Reason)
 	item.Fingerprint = fmt.Sprintf("%x", fingerprint)
 	return item, err
 }

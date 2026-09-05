@@ -70,7 +70,7 @@ func (t *transaction) CreateTransactionFromPinnedCandidate(ctx context.Context, 
 		from private.credit_card_statement_lines line
 		join private.credit_card_statements statement
 			on statement.id = line.statement_id and statement.user_id = line.user_id
-		join private.bulk_import_candidates candidate
+		join private.source_candidates candidate
 			on candidate.id = line.bulk_candidate_id and candidate.user_id = line.user_id
 		where line.id = $1 and line.statement_id = $2 and line.user_id = $3
 		for update of line, candidate`, lineID, billID, userID).
@@ -138,7 +138,7 @@ func (t *transaction) CreateTransactionFromPinnedCandidate(ctx context.Context, 
 		return creditcard.LineCreateResult{}, err
 	}
 	command, err := t.tx.Exec(ctx, `
-		update private.bulk_import_candidates
+		update private.source_candidates
 		set status = 'created', transaction_id = $4, account_id = $5,
 			reconciliation_reason = 'Created from reviewed Credit Card bill line'
 		where id = $1 and user_id = $2 and document_id = $3
