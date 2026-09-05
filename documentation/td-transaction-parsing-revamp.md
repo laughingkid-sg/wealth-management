@@ -378,6 +378,31 @@ pages either redirect into the relevant stage or are removed once parity is reac
 - Prompt v3 assertions.
 - Full: `go build ./... && go vet ./... && go test ./...`; `npm run lint && npm run build`.
 
+## Implementation status (2026-09-05)
+
+Done + validated on branch `codex/transaction-parsing-revamp` (PR #22):
+- **P0–P4** backend: schema/rename + `script_definitions`, batch decode + `script:`
+  provenance, `scriptstore`, Tengo pre/post-process, N-candidate persistence +
+  per-candidate reconcile + rollup, prompt v3. Live dev-DB integration tests pass.
+- **P3c cardinality fix** (migration `20260905150000`): per-candidate link cardinality
+  so one email can link to many transactions.
+- **P5 backend**: per-candidate `attach` / `create-transaction` + `candidates` list API.
+- **P6 backend**: script management API (CRUD + activate + dry-run).
+- **P6 frontend**: Parser Scripts page + candidate/script API+model layer (tsc/lint/build).
+
+Remaining (need visual QA — best done interactively):
+- **P5 frontend**: `SourceInspector` per-candidate resolve. ⚠️ **Important:** the old
+  per-source `create-transaction` endpoint now reads the batch audit JSON and is
+  effectively broken for Gmail; the inspector must switch to the per-candidate
+  endpoints (`/candidates/{id}/…`, already built) for the review/dangling queues to
+  work in the UI.
+- **P7**: unified pipeline settings view.
+- **P8**: seed initial scripts + enable + end-to-end acceptance.
+- **T1 cleanup**: remove `applyDeterministicRule`/`ExtractionConfig` + drop the
+  `extraction_config` column. Note this is a real refactor: `parserrules.applyOne`
+  currently *requires* `extraction_config` to match a global rule, so global-rule
+  matching must be reworked to match on sender/content alone before the column is dropped.
+
 ## 11. Build order (phased; each phase validated before the next)
 
 Standard per-phase validation gate (run the narrowest relevant subset, then the whole):
