@@ -545,7 +545,6 @@ function parseGlobalSourceParserRule(
     sender_matcher: optionalString(item.sender_matcher, `${field}.sender_matcher`),
     content_matcher: optionalString(item.content_matcher, `${field}.content_matcher`),
     prompt_fragment: stringValue(item.prompt_fragment, `${field}.prompt_fragment`),
-    extraction_config: jsonObject(item.extraction_config, `${field}.extraction_config`),
     version: requiredInteger(item.version, `${field}.version`, 1),
     priority: requiredInt32(item.priority, `${field}.priority`),
     active: requiredBoolean(item.active, `${field}.active`),

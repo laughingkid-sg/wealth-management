@@ -232,7 +232,6 @@ export interface GlobalSourceParserRule {
   sender_matcher: string | null;
   content_matcher: string | null;
   prompt_fragment: string;
-  extraction_config: { [key: string]: JsonValue };
   version: number;
   priority: number;
   active: boolean;
