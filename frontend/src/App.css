@@ -344,6 +344,24 @@ textarea {
   font-size: 0.72rem;
   font-weight: 700;
 }
+.account-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.account-tag {
+  border-radius: 99px;
+  padding: 2px 9px;
+  border: 1px solid color-mix(in srgb, var(--brand) 28%, var(--border));
+  background: color-mix(in srgb, var(--brand) 9%, var(--surface));
+  color: var(--brand-deep);
+  font-size: 0.74rem;
+  font-weight: 600;
+  line-height: 1.5;
+}
 .row-actions {
   display: flex;
   gap: 6px;
@@ -476,6 +494,64 @@ textarea {
   grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) auto;
   gap: 8px;
   align-items: center;
+}
+.tag-editor {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.tag-editor legend {
+  padding: 0 5px;
+  color: var(--ink);
+  font-size: 0.9rem;
+  font-weight: 700;
+}
+.tag-editor p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+  line-height: 1.45;
+}
+.tag-editor-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.tag-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border-radius: 99px;
+  padding: 3px 4px 3px 10px;
+  border: 1px solid color-mix(in srgb, var(--brand) 28%, var(--border));
+  background: color-mix(in srgb, var(--brand) 9%, var(--surface));
+  color: var(--brand-deep);
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+.tag-chip-remove {
+  display: inline-grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: 99px;
+  background: transparent;
+  color: var(--brand-deep);
+  cursor: pointer;
+}
+.tag-chip-remove:hover {
+  background: color-mix(in srgb, var(--brand) 18%, var(--surface));
+}
+.tag-editor-input input {
+  width: 100%;
 }
 .modal-actions {
   display: flex;
