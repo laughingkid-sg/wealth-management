@@ -38,6 +38,9 @@ type Repository interface {
 	ListTransactionSources(context.Context, uuid.UUID, uuid.UUID) ([]transactionstore.SourceEvidence, error)
 	AttachSource(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (uuid.UUID, error)
 	CreateTransactionFromSource(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (transactionstore.Transaction, error)
+	ListSourceCandidates(context.Context, uuid.UUID, uuid.UUID) ([]transactionstore.SourceCandidateSummary, error)
+	AttachSourceCandidate(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID) (uuid.UUID, error)
+	CreateTransactionFromSourceCandidate(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID) (transactionstore.Transaction, error)
 	UnmatchSourceLink(context.Context, uuid.UUID, uuid.UUID) error
 	PatchTransaction(context.Context, uuid.UUID, uuid.UUID, transactionstore.TransactionPatch) (transactionstore.Transaction, error)
 	CreateInternalTransfer(context.Context, uuid.UUID, transactionstore.InternalTransferInput) (transactionstore.InternalTransfer, error)
@@ -123,6 +126,9 @@ func (h *Handler) Register(mux *http.ServeMux, verifier auth.Verifier) {
 	mux.Handle("GET /v1/transactions/", requireUser(h.transactionSubroute))
 	mux.Handle("POST /v1/transactions/sources/{id}/attach", requireUser(h.attachSource))
 	mux.Handle("POST /v1/transactions/sources/{id}/create-transaction", requireUser(h.createTransactionFromSource))
+	mux.Handle("GET /v1/transactions/sources/{id}/candidates", requireUser(h.listSourceCandidates))
+	mux.Handle("POST /v1/transactions/sources/{id}/candidates/{candidate_id}/attach", requireUser(h.attachSourceCandidate))
+	mux.Handle("POST /v1/transactions/sources/{id}/candidates/{candidate_id}/create-transaction", requireUser(h.createTransactionFromSourceCandidate))
 	mux.Handle("POST /v1/transactions/sources/{id}/retry", requireUser(h.retrySourceParse))
 	mux.Handle("POST /v1/transactions/source-links/{id}/unmatch", requireUser(h.unmatchSourceLink))
 	mux.Handle("POST /v1/transactions/internal-transfers", requireUser(h.createInternalTransfer))
@@ -807,6 +813,95 @@ func (h *Handler) createTransactionFromSource(w http.ResponseWriter, r *http.Req
 	writeJSON(w, http.StatusCreated, transactionResponse(transaction))
 }
 
+func (h *Handler) listSourceCandidates(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	sourceID, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, "Source not found.")
+		return
+	}
+	candidates, err := h.repository.ListSourceCandidates(r.Context(), user.ID, sourceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Could not load source candidates.")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"candidates": candidates})
+}
+
+func (h *Handler) attachSourceCandidate(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	sourceID, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, "Source not found.")
+		return
+	}
+	candidateID, err := uuid.Parse(r.PathValue("candidate_id"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, "Candidate not found.")
+		return
+	}
+	var request struct {
+		TransactionID string `json:"transaction_id"`
+	}
+	if err := decodeRequestJSON(w, r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, "transaction_id is required.")
+		return
+	}
+	transactionID, err := uuid.Parse(request.TransactionID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "transaction_id must be a UUID.")
+		return
+	}
+	linkID, err := h.repository.AttachSourceCandidate(r.Context(), user.ID, sourceID, candidateID, transactionID)
+	if writeActionError(w, err, "Candidate", "Could not attach candidate.") {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"source_link_id": linkID.String()})
+}
+
+func (h *Handler) createTransactionFromSourceCandidate(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	sourceID, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, "Source not found.")
+		return
+	}
+	candidateID, err := uuid.Parse(r.PathValue("candidate_id"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, "Candidate not found.")
+		return
+	}
+	var request struct {
+		AccountID string `json:"account_id"`
+	}
+	if err := decodeRequestJSON(w, r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, "account_id is required.")
+		return
+	}
+	accountID, err := uuid.Parse(request.AccountID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "account_id must be a UUID.")
+		return
+	}
+	transaction, err := h.repository.CreateTransactionFromSourceCandidate(r.Context(), user.ID, sourceID, candidateID, accountID)
+	if writeActionError(w, err, "Candidate", "Could not create transaction from candidate.") {
+		return
+	}
+	writeJSON(w, http.StatusCreated, transactionResponse(transaction))
+}
+
 func (h *Handler) unmatchSourceLink(w http.ResponseWriter, r *http.Request) {
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
@@ -906,7 +1001,7 @@ func writeActionError(w http.ResponseWriter, err error, resource, fallback strin
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, transactionstore.ErrSourceNotFound) || errors.Is(err, transactionstore.ErrTransactionNotFound) || errors.Is(err, transactionstore.ErrSourceLinkNotFound) {
+	if errors.Is(err, transactionstore.ErrSourceNotFound) || errors.Is(err, transactionstore.ErrTransactionNotFound) || errors.Is(err, transactionstore.ErrSourceLinkNotFound) || errors.Is(err, transactionstore.ErrCandidateNotFound) {
 		writeError(w, http.StatusNotFound, resource+" not found.")
 		return true
 	}

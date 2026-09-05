@@ -648,9 +648,9 @@ func (s *Store) PersistReconciliation(ctx context.Context, userID uuid.UUID, res
 			return errors.New("reconciliation selected an invalid transaction")
 		}
 		command, cerr := tx.Exec(ctx, `
-			insert into private.transaction_data_sources (user_id, transaction_id, data_source_id, role, match_confidence, matched_by)
-			select $1, transaction.id, $2, 'other', $3, 'automatic'
-			from public.transactions transaction where transaction.id = $4 and transaction.user_id = $1`, userID, result.SourceID, score, transactionID)
+			insert into private.transaction_data_sources (user_id, transaction_id, data_source_id, bulk_import_candidate_id, role, match_confidence, matched_by)
+			select $1, transaction.id, $2, $5, 'other', $3, 'automatic'
+			from public.transactions transaction where transaction.id = $4 and transaction.user_id = $1`, userID, result.SourceID, score, transactionID, result.CandidateID)
 		if cerr != nil {
 			return cerr
 		}
@@ -689,7 +689,7 @@ func (s *Store) PersistReconciliation(ctx context.Context, userID uuid.UUID, res
 			result.Candidate.SGDAmountMinor, result.Candidate.OccurredAt, categoryID, string(lineItems), string(details), confidence).Scan(&transactionID); err != nil {
 			return err
 		}
-		if _, err = tx.Exec(ctx, `insert into private.transaction_data_sources (user_id, transaction_id, data_source_id, role, match_confidence, matched_by) values ($1, $2, $3, 'other', $4, 'automatic')`, userID, transactionID, result.SourceID, confidence); err != nil {
+		if _, err = tx.Exec(ctx, `insert into private.transaction_data_sources (user_id, transaction_id, data_source_id, bulk_import_candidate_id, role, match_confidence, matched_by) values ($1, $2, $3, $4, 'other', $5, 'automatic')`, userID, transactionID, result.SourceID, result.CandidateID, confidence); err != nil {
 			return err
 		}
 		if _, err = tx.Exec(ctx, `update private.source_candidates set status = 'created', transaction_id = $3, account_id = $4, match_confidence = $5, suggested_account_id = null, suggested_transaction_id = null, reconciliation_reason = null where id = $1 and user_id = $2`, result.CandidateID, userID, transactionID, accountID, confidence); err != nil {
@@ -710,17 +710,7 @@ func (s *Store) PersistReconciliation(ctx context.Context, userID uuid.UUID, res
 		return fmt.Errorf("unsupported reconciliation outcome %q", result.Decision.Outcome)
 	}
 	// Recompute the source rollup from all its candidates.
-	if _, err = tx.Exec(ctx, `
-		update private.data_sources d set parse_status = (
-			select case
-				when count(*) filter (where status = 'failed') > 0 then 'failed'
-				when count(*) filter (where status = 'review_required') > 0 then 'review_required'
-				when count(*) filter (where status = 'dangling') > 0 then 'dangling'
-				else 'parsed'
-			end
-			from private.source_candidates where data_source_id = d.id and user_id = d.user_id
-		), parse_error = null
-		where d.id = $1 and d.user_id = $2`, result.SourceID, userID); err != nil {
+	if err = recomputeSourceParseRollup(ctx, tx, userID, result.SourceID); err != nil {
 		return err
 	}
 	if result.SyncRunID != nil {

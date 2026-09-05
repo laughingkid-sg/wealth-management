@@ -164,6 +164,19 @@ func (r *repositoryStub) CreateTransactionFromSource(_ context.Context, _ uuid.U
 	r.createdSourceID, r.createdAccountID = sourceID, accountID
 	return r.transaction, r.actionErr
 }
+func (r *repositoryStub) ListSourceCandidates(context.Context, uuid.UUID, uuid.UUID) ([]transactionstore.SourceCandidateSummary, error) {
+	return nil, r.actionErr
+}
+func (r *repositoryStub) AttachSourceCandidate(_ context.Context, _ uuid.UUID, sourceID, _, transactionID uuid.UUID) (uuid.UUID, error) {
+	r.mutationCalls++
+	r.attachedSourceID, r.attachedToID = sourceID, transactionID
+	return uuid.New(), r.actionErr
+}
+func (r *repositoryStub) CreateTransactionFromSourceCandidate(_ context.Context, _ uuid.UUID, sourceID, _, accountID uuid.UUID) (transactionstore.Transaction, error) {
+	r.mutationCalls++
+	r.createdSourceID, r.createdAccountID = sourceID, accountID
+	return r.transaction, r.actionErr
+}
 func (r *repositoryStub) UnmatchSourceLink(_ context.Context, _ uuid.UUID, linkID uuid.UUID) error {
 	r.mutationCalls++
 	r.unmatchedLinkID = linkID
